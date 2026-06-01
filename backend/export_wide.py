@@ -387,59 +387,68 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     n_daily = len([c for c in daily_signal if c in df.columns])
     n_weekly = len([c for c in weekly_signal if f"__w__{c}" in df.columns])
 
-    # ── Styles ──
-    group_fill = PatternFill(start_color="E8E8ED", end_color="E8E8ED", fill_type="solid")
-    group_font = Font(name="微软雅黑", bold=True, color="1D1D1F", size=10)
-    basic_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
-    header_font_white = Font(name="微软雅黑", color="FFFFFF", size=10)
-    header_font_dark = Font(name="微软雅黑", color="1D1D1F", size=10)
+    # ── UED Styles ──
+    # Row 1 group labels
+    group_font = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
+    group_fill_daily = PatternFill(start_color="1A5276", end_color="1A5276", fill_type="solid")
+    group_fill_weekly = PatternFill(start_color="1A5276", end_color="1A5276", fill_type="solid")
+    # Row 2 column names
+    col_font = Font(name="微软雅黑", color="FFFFFF", size=10)
+    # Data
     data_font = Font(name="微软雅黑", size=10, color="1D1D1F")
+    # Basic info header
+    basic_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    # Separator between groups
+    sep_left = Side(style="medium", color="FFFFFF")
+    # Data borders
     thin_border = Border(
         left=Side(style="thin", color="E5E5EA"), right=Side(style="thin", color="E5E5EA"),
         top=Side(style="thin", color="E5E5EA"), bottom=Side(style="thin", color="E5E5EA"),
     )
-    header_border = Border(bottom=Side(style="medium", color="8E8E93"))
+    header_bottom = Border(bottom=Side(style="thin", color="5D6D7E"))
     white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-    stripe_fill = PatternFill(start_color="FAFAFA", end_color="FAFAFA", fill_type="solid")
+    stripe_fill = PatternFill(start_color="F7F8FA", end_color="F7F8FA", fill_type="solid")
+
+    # Signal highlight colors
     green = PatternFill(start_color="D4EDDA", end_color="D4EDDA", fill_type="solid")
     red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
     blue = PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
 
-    # Group header tints (dark business-style)
+    # Indicator group tints
     _TINTS = {"MACD": "6C3483", "MA": "117864", "DDE": "7D6608", "K线": "922B21", "量": "935116", "default": "1A5276"}
 
-    # ── Row 1: Group headers ──
+    # ── Row 1: Group labels ──
     daily_start = n_basic + 1
     weekly_start = n_basic + n_daily + 1
     weekly_end = n_basic + n_daily + n_weekly
 
-    for col_idx in range(1, len(df.columns) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.fill = group_fill
-        cell.font = group_font
-        cell.border = header_border
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+    # Daily group label
+    if n_daily > 0:
+        ws.merge_cells(start_row=1, start_column=daily_start, end_row=1, end_column=daily_start + n_daily - 1)
+        c = ws.cell(row=1, column=daily_start, value="日 线 指 标")
+        c.fill = group_fill_daily; c.font = group_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = header_bottom
 
-    # Basic info columns span both rows
+    # Weekly group label
+    if n_weekly > 0:
+        ws.merge_cells(start_row=1, start_column=weekly_start, end_row=1, end_column=weekly_end)
+        c = ws.cell(row=1, column=weekly_start, value="周 线 指 标")
+        c.fill = group_fill_weekly; c.font = group_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = header_bottom
+
+    # Basic info columns: merged rows 1-2 with dark header
     for i in range(1, n_basic + 1):
         ws.merge_cells(start_row=1, start_column=i, end_row=2, end_column=i)
         ws.cell(row=1, column=i, value=basic_names[i - 1])
-        c2 = ws.cell(row=2, column=i)
-        c2.fill = basic_fill
-        c2.font = header_font_white
-        c2.border = header_border
+        for r in (1, 2):
+            c2 = ws.cell(row=r, column=i)
+            c2.fill = basic_fill; c2.font = col_font
+            c2.alignment = Alignment(horizontal="center", vertical="center")
+            c2.border = header_bottom
 
-    # Daily group
-    if n_daily > 0:
-        ws.merge_cells(start_row=1, start_column=daily_start, end_row=1, end_column=daily_start + n_daily - 1)
-        ws.cell(row=1, column=daily_start, value="日线指标")
-
-    # Weekly group
-    if n_weekly > 0:
-        ws.merge_cells(start_row=1, start_column=weekly_start, end_row=1, end_column=weekly_end)
-        ws.cell(row=1, column=weekly_start, value="周线指标")
-
-    # ── Row 2: Individual column names with group colors ──
+    # ── Row 2: Indicator column names ──
     for i, name in enumerate(daily_names):
         c = daily_start + i
         tint = _TINTS["default"]
@@ -447,10 +456,10 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
             if key != "default" and (name.startswith(key) or key in name):
                 tint = color; break
         cell = ws.cell(row=2, column=c, value=name)
-        cell.font = header_font_white
+        cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
-        cell.border = header_border
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = header_bottom
 
     for i, name in enumerate(weekly_names):
         c = weekly_start + i
@@ -459,14 +468,20 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
             if key != "default" and (name.startswith(key) or key in name):
                 tint = color; break
         cell = ws.cell(row=2, column=c, value=name)
-        cell.font = header_font_white
+        cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
-        cell.border = header_border
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = header_bottom
 
-    # ── Freeze: basic columns + 2 header rows ──
-    freeze_letter = get_column_letter(n_basic + 1) if n_basic > 0 else "A"
+    # ── Freeze: 股票名称 column + 2 header rows ──
+    stock_name_idx = 1
+    for i, c in enumerate(basic_cols):
+        if c == "stock_name" and c in df.columns:
+            stock_name_idx = i + 2  # +1 for 1-indexed, +1 for next column
+            break
+    freeze_letter = get_column_letter(stock_name_idx)
     ws.freeze_panes = f"{freeze_letter}3"
+    ws.sheet_properties.tabColor = "1A5276"
 
     # ── Auto-fit column widths ──
     for col_idx in range(1, len(df.columns) + 1):
