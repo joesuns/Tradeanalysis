@@ -19,7 +19,7 @@ _COL_NAMES = {
     "freq": "周期", "trade_date": "交易日期", "ts_code": "股票代码",
     "stock_code": "代码", "stock_name": "股票名称", "exchange": "交易所",
     "sector": "板块", "industry": "行业", "is_st": "ST",
-    "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量(手)", "amount": "成交额(万元)",
+    "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量(万手)", "amount": "成交额(万元)",
     "total_mv": "总市值(亿)", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
     "kpattern": "K线形态", "kpattern_strength": "形态强度",
     "ema_12": "EMA12", "ema_26": "EMA26", "dif": "DIF", "dea": "DEA",
@@ -31,7 +31,7 @@ _COL_NAMES = {
     "ma_alignment": "均线形态", "ma_turning_point": "均线转折",
     "net_mf_amount": "主力净流入(万元)", "ddx": "DDX", "ddx2": "DDX2",
     "dde_trend": "DDE趋势", "dde_alert": "DDE警惕", "dde_divergence": "DDE背离",
-    "ma_vol_5": "5日均量(手)", "pct_vol_rank": "量能百分位",
+    "ma_vol_5": "5日均量(万手)", "pct_vol_rank": "量能百分位",
     "vol_zone": "量能区域", "vol_trend": "量能趋势",
 }
 
@@ -66,7 +66,7 @@ _SIGNAL_COLS = {"kpattern", "kpattern_strength", "macd_divergence", "macd_turnin
 _ROUND_2DP = {"close", "pct_chg", "pe_ttm", "turnover_rate", "net_mf_amount"}
 
 # Columns to convert 万元 → 亿 (divide by 10000)
-_CONVERT_TO_YI = {"total_mv"}
+_CONVERT_DIV10000 = {"total_mv", "vol", "ma_vol_5"}  # → 万 (or 亿 for mv)
 _CONVERT_DIV10 = {"amount"}  # 千元 → 万元
 
 
@@ -133,7 +133,7 @@ def _format_numbers(df: "pd.DataFrame") -> "pd.DataFrame":
     for col in _ROUND_2DP:
         if col in df.columns:
             df[col] = df[col].apply(lambda x: round(float(x), 2) if pd.notna(x) else x)
-    for col in _CONVERT_TO_YI:
+    for col in _CONVERT_DIV10000:
         if col in df.columns:
             df[col] = df[col].apply(lambda x: round(float(x) / 10000, 2) if pd.notna(x) else x)
     for col in _CONVERT_DIV10:
@@ -177,11 +177,11 @@ def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
 # Column groups for subtle header tinting
 _COL_GROUPS = {
     "identity": {"周期", "交易日期", "股票代码", "代码", "股票名称", "交易所", "板块", "行业", "ST"},
-    "price":   {"收盘价", "涨跌幅%", "成交量(手)", "成交额(万元)", "总市值(亿)", "市盈率", "换手率%"},
+    "price":   {"收盘价", "涨跌幅%", "成交量(万手)", "成交额(万元)", "总市值(亿)", "市盈率", "换手率%"},
     "macd":    {"EMA12", "EMA26", "DIF", "DEA", "MACD柱", "MACD背离", "MACD区域", "MACD转折", "MACD警惕", "MACD趋势"},
     "ma":      {"MA5", "MA10", "MA5乖离率", "MA10乖离率", "MA5斜率", "MA10斜率", "均线形态", "均线转折"},
     "dde":     {"主力净流入(万元)", "DDX", "DDX2", "DDE趋势", "DDE警惕", "DDE背离"},
-    "volume":  {"5日均量(手)", "量能百分位", "量能区域", "量能趋势"},
+    "volume":  {"5日均量(万手)", "量能百分位", "量能区域", "量能趋势"},
     "kline":   {"K线形态", "形态强度"},
 }
 
