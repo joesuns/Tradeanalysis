@@ -85,17 +85,12 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
 
 
 def build_dwd_weekly_quote(con, ts_codes=None) -> int:
-    """Aggregate dwd_daily_quote into weekly bars.
+    """Build rolling weekly bars: each trading day gets a week-to-date bar.
 
-    Rules:
-    - Week end date = the last trading day of each week (dim_date.is_week_end=1)
-    - open_qfq = first day's open, close_qfq = last day's close
-    - high_qfq = MAX, low_qfq = MIN
-    - vol / amount normalized to 5-day equivalent: SUM(vol) / active_days * 5
-    - pct_chg = SUM(pct_chg) (log-return accumulation, NOT price ratio)
-    - total_mv, pe_ttm, turnover_rate, volume_ratio = last day's values
-    - Only is_suspended=0 rows counted
-    - Exclude weeks with active_days < 3
+    Uses DuckDB window functions partitioned by ISO week. Each day aggregates
+    all non-suspended days in the same week up to and including the current day.
+    open uses FIRST_VALUE (Monday's open), close uses current day's close.
+    vol/amount normalized to 5-day equivalent (SUM/active_days*5).
     """
     if ts_codes is None:
         con.execute("DELETE FROM dwd_weekly_quote")
@@ -105,11 +100,8 @@ def build_dwd_weekly_quote(con, ts_codes=None) -> int:
         return 0
     else:
         placeholders = ",".join(["?" for _ in ts_codes])
-        con.execute(
-            f"DELETE FROM dwd_weekly_quote WHERE ts_code IN ({placeholders})",
-            ts_codes,
-        )
-        ts_code_filter = f"AND q.ts_code IN ({placeholders})"
+        con.execute(f"DELETE FROM dwd_weekly_quote WHERE ts_code IN ({placeholders})", ts_codes)
+        ts_code_filter = f"AND d.ts_code IN ({placeholders})"
         params = ts_codes
 
     con.execute(
@@ -117,42 +109,24 @@ def build_dwd_weekly_quote(con, ts_codes=None) -> int:
             (ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq,
              vol, amount, pct_chg, total_mv, pe_ttm, turnover_rate, volume_ratio,
              active_days)
-        WITH week_ends AS (
-            SELECT year, week_of_year, trade_date AS week_end_date
-            FROM dim_date
-            WHERE is_trade_day = 1 AND is_week_end = 1
-        ),
-        daily_with_week AS (
-            SELECT q.*, d.year, d.week_of_year
-            FROM dwd_daily_quote q
-            JOIN dim_date d ON q.trade_date = d.trade_date
-            WHERE q.is_suspended = 0
-              {ts_code_filter}
-        ),
-        daily_with_week_end AS (
-            SELECT d.*, w.week_end_date
-            FROM daily_with_week d
-            JOIN week_ends w
-                ON d.year = w.year AND d.week_of_year = w.week_of_year
-        )
         SELECT
-            ts_code,
-            week_end_date,
-            arg_min(open_qfq, trade_date)  AS open_qfq,
-            MAX(high_qfq)                   AS high_qfq,
-            MIN(low_qfq)                    AS low_qfq,
-            arg_max(close_qfq, trade_date)  AS close_qfq,
-            SUM(vol) / COUNT(*) * 5         AS vol,
-            SUM(amount) / COUNT(*) * 5      AS amount,
-            SUM(pct_chg)                    AS pct_chg,
-            arg_max(total_mv, trade_date)      AS total_mv,
-            arg_max(pe_ttm, trade_date)        AS pe_ttm,
-            arg_max(turnover_rate, trade_date) AS turnover_rate,
-            arg_max(volume_ratio, trade_date)  AS volume_ratio,
-            COUNT(*)                        AS active_days
-        FROM daily_with_week_end
-        GROUP BY ts_code, week_end_date
-        HAVING COUNT(*) >= 3""",
+            d.ts_code,
+            d.trade_date,
+            FIRST_VALUE(d.open_qfq) OVER w AS open_qfq,
+            MAX(d.high_qfq) OVER w AS high_qfq,
+            MIN(d.low_qfq) OVER w AS low_qfq,
+            d.close_qfq AS close_qfq,
+            SUM(d.vol) OVER w / COUNT(*) OVER w * 5 AS vol,
+            SUM(d.amount) OVER w / COUNT(*) OVER w * 5 AS amount,
+            SUM(d.pct_chg) OVER w AS pct_chg,
+            d.total_mv, d.pe_ttm, d.turnover_rate, d.volume_ratio,
+            COUNT(*) OVER w AS active_days
+        FROM dwd_daily_quote d
+        WHERE d.is_suspended = 0 {ts_code_filter}
+        WINDOW w AS (PARTITION BY d.ts_code,
+                     strftime(CAST(substr(d.trade_date,1,4)||'-'||substr(d.trade_date,5,2)||'-'||substr(d.trade_date,7,2) AS DATE), '%Y-%W')
+                     ORDER BY d.trade_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)""",
         params,
     )
 

@@ -75,50 +75,73 @@ def export_wide_to_excel(
     db_path: str,
     trade_date: str,       # YYYYMMDD
     output_path: str = "",  # .xlsx path (auto-timestamped if empty)
-    freq: str = "daily",   # "daily" | "weekly"
     filter_st: bool = True,
     include_index: bool = True,
 ) -> int:
-    """Export analysis wide table to Excel. Returns total rows written."""
-    if freq not in VIEW_MAP:
-        raise ValueError(f"Unsupported freq: {freq}. Use 'daily' or 'weekly'.")
+    """Export horizontal daily+weekly merged analysis to Excel.
 
-    view = VIEW_MAP[freq]
+    Each row = one stock on trade_date, with daily indicators on the left
+    and weekly (week-to-date) indicators on the right. Two-row header:
+    Row 1 merges group labels (日线指标/周线指标), Row 2 has individual column names.
+    Returns total rows written.
+    """
     con = duckdb.connect(db_path)
 
-    # ---- Sheet 1: Individual stocks ----
-    sql_stocks = f"SELECT * FROM {view} WHERE trade_date = ?"
-    params = [trade_date]
-    if filter_st:
-        sql_stocks += " AND is_st = 0"
-    df_stocks = con.execute(sql_stocks, params).df()
-    df_stocks = _format_numbers(df_stocks)
-    df_stocks = _translate_df(df_stocks)
-    df_stocks = _reorder_signal_first(df_stocks)
+    # ---- Daily data ----
+    daily = con.execute(
+        f"SELECT * FROM {VIEW_MAP['daily']} WHERE trade_date = ?"
+        + (" AND is_st = 0" if filter_st else ""),
+        [trade_date]
+    ).df()
+    if daily.empty:
+        con.close()
+        return 0
+    daily = _format_numbers(daily)
 
-    # ---- Sheet 2: SH Index (optional) ----
-    df_index = None
-    if include_index:
-        index_view = INDEX_VIEW_MAP[freq]
-        df_index = con.execute(
-            f"SELECT * FROM {index_view} WHERE trade_date = ?", [trade_date]
-        ).df()
-        df_index = _format_numbers(df_index)
-        df_index = _translate_df(df_index)
-        df_index = _reorder_signal_first(df_index)
+    # ---- Weekly data (rolling: same trade_date) ----
+    weekly = con.execute(
+        f"SELECT * FROM {VIEW_MAP['weekly']} WHERE trade_date = ?"
+        + (" AND is_st = 0" if filter_st else ""),
+        [trade_date]
+    ).df()
+    weekly = _format_numbers(weekly)
 
-    con.close()
+    # Drop redundant identity columns from weekly (kept in daily)
+    id_cols_drop = ["freq", "trade_date", "stock_code", "stock_name",
+                    "exchange", "sector", "industry", "is_st"]
+    # Keep ts_code for merge; drop after
+    weekly = weekly.drop(columns=[c for c in id_cols_drop if c in weekly.columns], errors="ignore")
+
+    # Track which columns are daily vs weekly
+    daily_cols = [c for c in daily.columns if c != "freq"]
+    weekly_cols = list(weekly.columns)
+
+    # Add __w__ prefix to weekly indicator columns (not ts_code — needed for merge)
+    weekly_indicator_cols = [c for c in weekly_cols if c != "ts_code"]
+    weekly_renamed = weekly.rename(columns={c: f"__w__{c}" for c in weekly_indicator_cols})
+
+    # LEFT JOIN on ts_code
+    merged = daily.merge(weekly_renamed, on="ts_code", how="left")
+    weekly_cols = weekly_indicator_cols  # for header building, exclude ts_code
 
     # ---- Write to Excel ----
     wb = Workbook()
     wb.remove(wb.active)
+    _write_sheet_merged(wb, "个股分析", merged, daily_cols, weekly_cols)
 
-    _write_sheet(wb, f"个股_{freq}", df_stocks)
-    if df_index is not None and len(df_index) > 0:
-        _write_sheet(wb, "上证指数", df_index)
+    # ---- SH Index ----
+    if include_index:
+        idx_daily = con.execute(
+            f"SELECT * FROM {INDEX_VIEW_MAP['daily']} WHERE trade_date = ?", [trade_date]
+        ).df()
+        idx_daily = _format_numbers(idx_daily)
+        if not idx_daily.empty:
+            idx_daily = idx_daily.drop(columns=[c for c in id_cols_drop if c in idx_daily.columns], errors="ignore")
+            _write_sheet_merged(wb, "上证指数", idx_daily, list(idx_daily.columns), [])
+
+    con.close()
 
     import os
-    # Auto-timestamp filename if not specified
     if not output_path or output_path == "analysis.xlsx":
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = "exports"
@@ -126,7 +149,7 @@ def export_wide_to_excel(
         output_path = f"{output_dir}/analysis_{ts}.xlsx"
 
     wb.save(output_path)
-    return len(df_stocks) + (len(df_index) if df_index is not None else 0)
+    return len(merged)
 
 
 def _format_numbers(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -310,3 +333,164 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
                 val = ws.cell(row=row_idx, column=col_idx).value
                 if val in value_colors:
                     ws.cell(row=row_idx, column=col_idx).fill = value_colors[val]
+
+
+def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
+    """Write merged daily+weekly DataFrame with two-row header and signal highlights."""
+    ws = wb.create_sheet(title=sheet_name)
+
+    # ── Build display column names ──
+    # Identity columns: translate to Chinese
+    id_cols = ["ts_code", "trade_date", "stock_code", "stock_name", "exchange", "sector", "industry", "is_st"]
+    id_names = [_COL_NAMES.get(c, c) for c in id_cols if c in df.columns]
+
+    # Daily signal columns (excluding freq and identity)
+    daily_signal = [c for c in daily_cols if c not in id_cols and c != "freq"]
+    daily_names = [_COL_NAMES.get(c, c) for c in daily_signal]
+
+    # Weekly columns (strip __w__ prefix, then translate)
+    weekly_signal = weekly_cols
+    weekly_names = [_COL_NAMES.get(c, c) for c in weekly_signal]
+
+    # ── Translate data values (enum + NULL) ──
+    # Daily enum translation
+    for col, mapping in _ENUM_VALUES.items():
+        if col in df.columns:
+            df[col] = df[col].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
+    # Weekly enum translation (columns have __w__ prefix in df)
+    for col, mapping in _ENUM_VALUES.items():
+        wcol = f"__w__{col}"
+        if wcol in df.columns:
+            df[wcol] = df[wcol].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
+    # NULL signals → "-"
+    for col in _SIGNAL_COLS:
+        if col in df.columns:
+            df[col] = df[col].fillna("-")
+        wcol = f"__w__{col}"
+        if wcol in df.columns:
+            df[wcol] = df[wcol].fillna("-")
+
+    # Build final display column order: id_cols → daily_signal → weekly_signal
+    display_order = [c for c in id_cols if c in df.columns] \
+                  + [c for c in daily_signal if c in df.columns] \
+                  + [f"__w__{c}" for c in weekly_signal if f"__w__{c}" in df.columns]
+    df = df[display_order]
+
+    # Column positions in the worksheet
+    n_id = len([c for c in id_cols if c in df.columns])
+    n_daily = len([c for c in daily_signal if c in df.columns])
+    n_weekly = len([c for c in weekly_signal if f"__w__{c}" in df.columns])
+
+    # ── Styles ──
+    header_fill = PatternFill(start_color="F5F5F7", end_color="F5F5F7", fill_type="solid")
+    group_fill = PatternFill(start_color="E8E8ED", end_color="E8E8ED", fill_type="solid")
+    header_font = Font(name="微软雅黑", color="1D1D1F", size=10)
+    group_font = Font(name="微软雅黑", bold=True, color="1D1D1F", size=10)
+    data_font = Font(name="微软雅黑", size=10, color="1D1D1F")
+    thin_border = Border(
+        left=Side(style="thin", color="E5E5EA"), right=Side(style="thin", color="E5E5EA"),
+        top=Side(style="thin", color="E5E5EA"), bottom=Side(style="thin", color="E5E5EA"),
+    )
+    header_border = Border(bottom=Side(style="medium", color="8E8E93"))
+    white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    stripe_fill = PatternFill(start_color="FAFAFA", end_color="FAFAFA", fill_type="solid")
+    green = PatternFill(start_color="D4EDDA", end_color="D4EDDA", fill_type="solid")
+    red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+    blue = PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
+
+    # ── Row 1: Group headers ──
+    daily_start = n_id + 1
+    weekly_start = n_id + n_daily + 1
+    weekly_end = n_id + n_daily + n_weekly
+
+    for col_idx in range(1, len(df.columns) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = group_fill
+        cell.font = group_font
+        cell.border = header_border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Identity columns span both rows
+    for i in range(1, n_id + 1):
+        ws.merge_cells(start_row=1, start_column=i, end_row=2, end_column=i)
+        ws.cell(row=1, column=i, value=id_names[i - 1])
+
+    # Daily group
+    if n_daily > 0:
+        ws.merge_cells(start_row=1, start_column=daily_start, end_row=1, end_column=daily_start + n_daily - 1)
+        ws.cell(row=1, column=daily_start, value="日线指标")
+
+    # Weekly group
+    if n_weekly > 0:
+        ws.merge_cells(start_row=1, start_column=weekly_start, end_row=1, end_column=weekly_end)
+        ws.cell(row=1, column=weekly_start, value="周线指标")
+
+    # ── Row 2: Individual column names ──
+    for i, name in enumerate(daily_names):
+        c = daily_start + i
+        cell = ws.cell(row=2, column=c, value=name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = header_border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for i, name in enumerate(weekly_names):
+        c = weekly_start + i
+        cell = ws.cell(row=2, column=c, value=name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = header_border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # ── Freeze: identity columns + 2 header rows ──
+    freeze_letter = get_column_letter(n_id + 1) if n_id > 0 else "A"
+    ws.freeze_panes = f"{freeze_letter}3"
+
+    # ── Auto-fit column widths ──
+    for col_idx in range(1, len(df.columns) + 1):
+        header_name = ws.cell(row=2, column=col_idx).value or ""
+        header_len = sum(2.2 if '一' <= c <= '鿿' else 1.0 for c in str(header_name))
+        width = max(header_len + 2, 8)
+        for row_idx in range(3, min(len(df) + 3, 23)):
+            val = ws.cell(row=row_idx, column=col_idx).value
+            if val is not None:
+                val_len = sum(2.2 if '一' <= c <= '鿿' else 1.0 for c in str(val))
+                width = max(width, min(val_len + 2, 30))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(width, 22)
+
+    # ── Data rows ──
+    for row_idx, row in enumerate(df.itertuples(index=False), 3):
+        row_fill = stripe_fill if row_idx % 2 == 1 else white_fill
+        for col_idx, value in enumerate(row, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = data_font
+            cell.border = thin_border
+            cell.fill = row_fill
+
+    # ── Signal highlights ──
+    kpattern_colors = {"阳包阴": green, "阳克阴": green, "墓碑线": red, "避雷针": red,
+                       "高开长阴": red, "阴包阳": red, "阴克阳": red}
+    text_signal_cols = {
+        "MACD转折": {"金叉": green, "死叉": red}, "MACD区域": {"多头": green, "空头": red},
+        "MACD背离": {"顶背离": red, "底背离": green},
+        "均线形态": {"多头强势": green, "多头初建": green, "多头衰竭": blue, "多头翻转": blue,
+                     "空头强势": red, "空头初建": red, "空头衰竭": blue, "空头翻转": blue, "均线缠绕": blue},
+        "均线转折": {"金叉": green, "死叉": red}, "DDE趋势": {"上升": green, "下降": red},
+        "DDE背离": {"顶背离": red, "底背离": green}, "量能区域": {"爆量": red, "地量": blue},
+        "量能趋势": {"放量": green, "缩量": red},
+    }
+    for col_name, value_colors in text_signal_cols.items():
+        for prefix in ("", "__w__"):
+            cn = col_name if not prefix else col_name  # same Chinese name for weekly
+            lookup = col_name if not prefix else f"__w__{col_name}"
+            if lookup in df.columns:
+                col_idx = list(df.columns).index(lookup) + 1
+                for row_idx in range(3, len(df) + 3):
+                    val = ws.cell(row=row_idx, column=col_idx).value
+                    if val in value_colors:
+                        ws.cell(row=row_idx, column=col_idx).fill = value_colors[val]
+    if "K线形态" in df.columns:
+        col_idx = list(df.columns).index("K线形态") + 1
+        for row_idx in range(3, len(df) + 3):
+            val = ws.cell(row=row_idx, column=col_idx).value
+            if val in kpattern_colors:
+                ws.cell(row=row_idx, column=col_idx).fill = kpattern_colors[val]
