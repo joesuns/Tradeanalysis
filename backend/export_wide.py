@@ -167,13 +167,42 @@ def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
     return df[ordered]
 
 
+# Column groups for subtle header tinting
+_COL_GROUPS = {
+    "identity": {"周期", "交易日期", "股票代码", "代码", "股票名称", "交易所", "板块", "行业", "ST"},
+    "price":   {"收盘价", "涨跌幅%", "成交量(手)", "成交额(千元)", "总市值(亿)", "市盈率", "换手率%"},
+    "macd":    {"EMA12", "EMA26", "DIF", "DEA", "MACD柱", "MACD背离", "MACD区域", "MACD转折", "MACD警惕", "MACD趋势"},
+    "ma":      {"MA5", "MA10", "MA5乖离率", "MA10乖离率", "MA5斜率", "MA10斜率", "均线形态", "均线转折"},
+    "dde":     {"主力净流入(万元)", "DDX", "DDX2", "DDE趋势", "DDE警惕", "DDE背离"},
+    "volume":  {"5日均量", "量能百分位", "量能区域", "量能趋势"},
+    "kline":   {"K线形态", "形态强度"},
+}
+
+def _get_col_group(col_name: str):
+    for group, names in _COL_GROUPS.items():
+        if col_name in names:
+            return group
+    return None
+
+# Apple-style subtle group header tints (very light, low saturation)
+_GROUP_TINTS = {
+    "identity": "EBF0FA",  # barely-blue
+    "price":    "EBF5EE",  # barely-green
+    "macd":     "FFF2E5",  # barely-warm
+    "ma":       "F2EDF7",  # barely-purple
+    "dde":      "E5F2F2",  # barely-teal
+    "volume":   "FDF0E5",  # barely-brown
+    "kline":    "FDEAEA",  # barely-rose
+}
+
+
 def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
     """Write a DataFrame to a sheet with Apple-style clean header, auto-fit widths,
     row striping, borders, frozen identity columns, and signal color highlights."""
     ws = wb.create_sheet(title=sheet_name)
 
     # ── Apple-style clean design ──
-    header_fill = PatternFill(start_color="F5F5F7", end_color="F5F5F7", fill_type="solid")
+    default_fill = PatternFill(start_color="F5F5F7", end_color="F5F5F7", fill_type="solid")
     header_font = Font(bold=True, color="1D1D1F", size=10)
     header_border = Border(bottom=Side(style="medium", color="8E8E93"))
     data_font = Font(size=10, color="1D1D1F")
@@ -190,10 +219,15 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
     red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
     blue = PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
 
-    # ── Header row ──
+    # ── Header row with subtle group tints ──
     for col_idx, col_name in enumerate(df.columns, 1):
         cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.fill = header_fill
+        grp = _get_col_group(col_name)
+        tint = _GROUP_TINTS.get(grp) if grp else None
+        if tint:
+            cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
+        else:
+            cell.fill = default_fill
         cell.font = header_font
         cell.border = header_border
         cell.alignment = Alignment(horizontal="center", vertical="center")
