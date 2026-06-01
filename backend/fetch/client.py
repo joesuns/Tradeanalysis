@@ -7,10 +7,14 @@ logger = logging.getLogger(__name__)
 
 
 class TushareClient:
-    """tushare API wrapper with rate limiting (200 calls/min) and exponential backoff retry."""
+    """tushare API wrapper with rate limiting and exponential backoff retry.
+
+    Rate limit: 400 calls/min (conservative for 6200-point Pro tier; tested 500/min w/o throttle).
+    """
 
     MAX_RETRIES = 3
     BASE_DELAY = 2  # seconds
+    RATE_LIMIT = 400  # calls per minute
 
     def __init__(self):
         ts.set_token(TUSHARE_TOKEN)
@@ -19,12 +23,12 @@ class TushareClient:
         self._window_start = time.time()
 
     def _rate_limit(self):
-        """Enforce 200 calls per minute rate limit."""
+        """Enforce calls-per-minute rate limit."""
         self._calls += 1
         elapsed = time.time() - self._window_start
-        if elapsed < 60 and self._calls >= 200:
+        if elapsed < 60 and self._calls >= self.RATE_LIMIT:
             wait = 60 - elapsed + 1
-            logger.info(f"Rate limit approaching, sleeping {wait:.0f}s")
+            logger.info(f"Rate limit: {self._calls} calls in {elapsed:.0f}s, sleeping {wait:.0f}s")
             time.sleep(wait)
             self._calls = 0
             self._window_start = time.time()

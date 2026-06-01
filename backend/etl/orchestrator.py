@@ -14,8 +14,7 @@ from datetime import datetime
 from backend.db.connection import get_connection, check_connectivity, run_checkpoint
 from backend.etl.error_handler import log_etl, check_data_completeness
 from backend.fetch.client import TushareClient
-from backend.fetch.ods_daily import fetch_daily_batch, get_all_active_codes
-from backend.fetch.ods_moneyflow import fetch_moneyflow_batch
+from backend.fetch.ods_daily import fetch_by_date_range, get_all_active_codes
 from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
 from backend.etl.build_dwd import build_dwd_daily_quote, build_dwd_daily_moneyflow, build_dwd_weekly_quote
 from backend.etl.calc_macd import MACDCalculator
@@ -74,28 +73,12 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             codes = ts_codes or get_all_active_codes(con)
             n = fetch_concept_detail(client, con, ts_codes=codes)
             log_etl(con, "fetch_concept_detail", "success", row_count=n)
-            for i in range(0, len(codes), batch_size):
-                batch = codes[i:i + batch_size]
-                rows, failed = fetch_daily_batch(
-                    client, con, batch,
-                    start or "20150101",
-                    end or "20991231",
-                )
-                log_etl(con, "fetch_daily",
-                        "success" if not failed else "degraded",
-                        row_count=rows,
-                        error_msg=f"Failed: {failed}" if failed else "")
-
-                # Also fetch moneyflow for the same batch
-                mf_rows, mf_failed = fetch_moneyflow_batch(
-                    client, con, batch,
-                    start or "20150101",
-                    end or "20991231",
-                )
-                log_etl(con, "fetch_moneyflow",
-                        "success" if not mf_failed else "degraded",
-                        row_count=mf_rows,
-                        error_msg=f"Failed: {mf_failed}" if mf_failed else "")
+            # Date-based batch fetch: 4 API calls per trading day for ALL stocks
+            rows = fetch_by_date_range(client, con,
+                                       start or "20150101",
+                                       end or "20991231")
+            log_etl(con, "fetch_market_data",
+                    "success", row_count=rows)
 
         if step in ("build-dim", "build-all"):
             n = build_dim_stock(con)
