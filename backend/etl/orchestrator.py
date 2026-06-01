@@ -1,0 +1,116 @@
+"""ETL orchestrator — wires together fetch, DIM, DWD, and DWS steps.
+
+Usage:
+    from backend.etl.orchestrator import run_etl
+    run_etl()                             # full pipeline
+    run_etl(step="fetch-ods")             # fetch only
+    run_etl(step="calc-dws", ts_codes=["000001.SZ"])  # specific stocks
+"""
+
+import logging
+from datetime import datetime
+
+from backend.db.connection import get_connection, check_connectivity, run_checkpoint
+from backend.etl.error_handler import log_etl, check_data_completeness
+from backend.fetch.client import TushareClient
+from backend.fetch.ods_daily import fetch_daily_batch, get_all_active_codes
+from backend.fetch.ods_moneyflow import fetch_moneyflow_batch
+from backend.etl.build_dim import build_dim_stock, build_dim_date
+from backend.etl.build_dwd import build_dwd_daily_quote, build_dwd_daily_moneyflow
+from backend.etl.calc_macd import MACDCalculator
+from backend.etl.calc_ma import MACalculator
+from backend.etl.calc_kpattern import KPatternCalculator
+from backend.etl.calc_dde import DDECalculator
+from backend.etl.calc_volume import VolumeCalculator
+
+logger = logging.getLogger(__name__)
+
+CALCULATORS = [MACDCalculator, MACalculator, KPatternCalculator,
+               DDECalculator, VolumeCalculator]
+
+
+def run_etl(step: str = "build-all", ts_codes: list[str] | None = None,
+            start: str | None = None, end: str | None = None,
+            batch_size: int = 100, force_full: bool = False):
+    """Run the ETL pipeline.
+
+    Parameters
+    ----------
+    step : str
+        One of "fetch-ods", "build-dim", "build-dwd", "calc-dws", "build-all".
+    ts_codes : list[str] | None
+        Stock codes to process. If None, all active codes are used.
+    start, end : str | None
+        Date range in YYYYMMDD format for fetch step.
+    batch_size : int
+        Number of stocks per batch (default 100).
+    force_full : bool
+        Currently unused — reserved for future forced-full-recalc logic.
+    """
+    con = get_connection()
+    try:
+        # 0. Self-check
+        health = check_connectivity()
+        if "fatal" in health.get("duckdb", ""):
+            log_etl(con, "health_check", "failed",
+                    error_msg=health["duckdb"])
+            raise RuntimeError(health["duckdb"])
+        log_etl(con, "health_check", "success",
+                error_msg=f"DuckDB v{health['version']}, "
+                          f"{health['disk_free_mb']}MB free")
+
+        # 1. Determine what to run
+        if step in ("fetch-ods", "build-all"):
+            client = TushareClient()
+            codes = ts_codes or get_all_active_codes(con)
+            for i in range(0, len(codes), batch_size):
+                batch = codes[i:i + batch_size]
+                rows, failed = fetch_daily_batch(
+                    client, con, batch,
+                    start or "20150101",
+                    end or "20991231",
+                )
+                log_etl(con, "fetch_daily",
+                        "success" if not failed else "degraded",
+                        row_count=rows,
+                        error_msg=f"Failed: {failed}" if failed else "")
+
+                # Also fetch moneyflow for the same batch
+                mf_rows, mf_failed = fetch_moneyflow_batch(
+                    client, con, batch,
+                    start or "20150101",
+                    end or "20991231",
+                )
+                log_etl(con, "fetch_moneyflow",
+                        "success" if not mf_failed else "degraded",
+                        row_count=mf_rows,
+                        error_msg=f"Failed: {mf_failed}" if mf_failed else "")
+
+        if step in ("build-dim", "build-all"):
+            n = build_dim_stock(con)
+            log_etl(con, "build_dim_stock", "success", row_count=n)
+            n = build_dim_date(con)
+            log_etl(con, "build_dim_date", "success", row_count=n)
+
+        if step in ("build-dwd", "build-all"):
+            codes = ts_codes or get_all_active_codes(con)
+            n = build_dwd_daily_quote(con, codes)
+            log_etl(con, "build_dwd_daily", "success", row_count=n)
+            n = build_dwd_daily_moneyflow(con, codes)
+            log_etl(con, "build_dwd_moneyflow", "success", row_count=n)
+
+        if step in ("calc-dws", "build-all"):
+            codes = ts_codes or get_all_active_codes(con)
+            calc_date = datetime.now().strftime("%Y%m%d")
+            for i in range(0, len(codes), batch_size):
+                batch = codes[i:i + batch_size]
+                for CalcCls in CALCULATORS:
+                    for freq in ("daily", "weekly"):
+                        calc = CalcCls(con, freq)
+                        calc.calculate(batch, calc_date)
+            log_etl(con, "calc_dws", "success", row_count=len(codes))
+
+        # Final checkpoint
+        run_checkpoint(con)
+    finally:
+        con.close()
