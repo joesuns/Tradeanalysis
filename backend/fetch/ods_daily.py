@@ -10,12 +10,16 @@ def fetch_daily_batch(client, con, ts_codes: list[str], start: str, end: str) ->
         try:
             # Fetch daily OHLCV
             recs = client.call("daily", ts_code=ts_code, start_date=start, end_date=end)
+            # Fetch adj_factor separately (tushare daily API doesn't include it)
+            adj_recs = client.call("adj_factor", ts_code=ts_code, start_date=start, end_date=end)
+            adj_map = {a["trade_date"]: a.get("adj_factor") for a in adj_recs}
             for r in recs:
+                adj = adj_map.get(r["trade_date"])
                 con.execute("""INSERT OR REPLACE INTO ods_daily
                     (ts_code, trade_date, open, high, low, close, vol, amount, pct_chg, adj_factor, fetched_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,now())""",
                     (r["ts_code"], r["trade_date"], r["open"], r["high"], r["low"],
-                     r["close"], r["vol"], r["amount"], r["pct_chg"], r.get("adj_factor")))
+                     r["close"], r["vol"], r["amount"], r["pct_chg"], adj))
                 rows += 1
 
             # Fetch daily_basic (PE, market cap, etc.)
