@@ -15,11 +15,19 @@ class MACDCalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate MACD for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
-            df = self.con.execute(f"""
-                SELECT trade_date, close_qfq FROM {self.src_table}
-                WHERE ts_code = ? {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}
-                ORDER BY trade_date
-            """, (ts_code,)).df()
+            if self.freq == "weekly":
+                df = self.con.execute(f"""
+                    SELECT d.trade_date, d.close_qfq FROM {self.src_table} d
+                    JOIN dim_date dd ON d.trade_date = dd.trade_date
+                    WHERE d.ts_code = ? AND dd.is_week_end = 1
+                    ORDER BY d.trade_date
+                """, (ts_code,)).df()
+            else:
+                df = self.con.execute(f"""
+                    SELECT trade_date, close_qfq FROM {self.src_table}
+                    WHERE ts_code = ? AND is_suspended = 0
+                    ORDER BY trade_date
+                """, (ts_code,)).df()
             if df.empty or len(df) < 27:
                 continue
             df = self._compute_indicators(df)

@@ -47,12 +47,13 @@ class DDECalculator:
         """, (ts_code,)).df()
 
     def _load_weekly(self, ts_code: str) -> pd.DataFrame:
-        """Aggregate daily moneyflow to weekly granularity using weekly trade dates."""
-        # Get weekly trade dates for this stock
+        """Aggregate daily moneyflow to weekly granularity using week-end trade dates."""
+        # Get week-end dates for this stock
         weeks = self.con.execute(f"""
-            SELECT trade_date FROM {self.quote_table}
-            WHERE ts_code = ? {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}
-            ORDER BY trade_date
+            SELECT d.trade_date FROM {self.quote_table} d
+            JOIN dim_date dd ON d.trade_date = dd.trade_date
+            WHERE d.ts_code = ? AND dd.is_week_end = 1
+            ORDER BY d.trade_date
         """, (ts_code,)).df()
         if weeks.empty:
             return weeks
