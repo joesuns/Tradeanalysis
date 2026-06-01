@@ -46,15 +46,22 @@ def sma(series: np.ndarray, period: int) -> np.ndarray:
     return result
 
 
-def linear_regression_slope(y: np.ndarray) -> float:
-    """Slope of log(y) regression. Returns percent/day in log space (>0 = expanding, <0 = shrinking)."""
+def linear_regression_slope(y: np.ndarray, use_log: bool = True) -> float:
+    """Linear regression slope.
+    - use_log=True: ln(y) regression (for MACD bar / volume — large value ranges)
+    - use_log=False: raw regression (for DDX2 — small value range, may be negative)
+    Returns slope in original (or log) units per bar.
+    """
     y = np.array(y, dtype=float)
-    mask = ~np.isnan(y) & (y > 0)
+    if use_log:
+        mask = ~np.isnan(y) & (y > 0)
+    else:
+        mask = ~np.isnan(y)
     if mask.sum() < 2:
         return 0.0
     x = np.arange(len(y), dtype=float)[mask]
-    log_y = np.log(y[mask])
-    slope = np.polyfit(x, log_y, 1)[0]
+    y_vals = np.log(y[mask]) if use_log else y[mask]
+    slope = np.polyfit(x, y_vals, 1)[0]
     return float(slope)
 
 

@@ -128,7 +128,7 @@ class DDECalculator:
         df["net_mf_amount"] = df["net_mf_amount"].values.astype(float)
 
         # Trend: linear regression slope on DDX2
-        trend_window = 4  # daily: 4 bars, weekly: 4 bars
+        trend_window = 10 if self.freq == "daily" else 4
         df["trend"] = self._compute_trend(df["ddx2"].values.astype(float), window=trend_window)
 
         # Divergence: same logic as MACD but using DDX2 instead of DIF
@@ -153,10 +153,10 @@ class DDECalculator:
             valid = segment[~np.isnan(segment)]
             if len(valid) < window:
                 continue
-            slope = linear_regression_slope(valid)
-            if slope > 0.0005:
+            slope = linear_regression_slope(valid, use_log=False)
+            if slope > 0.0001:
                 result[i] = "up"
-            elif slope < -0.0005:
+            elif slope < -0.0001:
                 result[i] = "down"
             else:
                 result[i] = "flat"
