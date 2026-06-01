@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import ema
+from backend.etl.base import ema, to_float_safe
 
 
 class DDECalculator:
@@ -205,19 +205,6 @@ class DDECalculator:
                 result[i] = "downturn_reverse"
         return result
 
-    @staticmethod
-    def _to_float(val):
-        """Convert numpy float/NaN to Python float or None for DuckDB compatibility."""
-        if val is None:
-            return None
-        try:
-            f = float(val)
-            if pd.isna(f):
-                return None
-            return f
-        except (ValueError, TypeError):
-            return None
-
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
         for _, row in df.iterrows():
             self.con.execute(
@@ -228,9 +215,9 @@ class DDECalculator:
                 (
                     ts_code,
                     row["trade_date"],
-                    self._to_float(row.get("net_mf_amount")),
-                    self._to_float(row.get("ddx")),
-                    self._to_float(row.get("ddx2")),
+                    to_float_safe(row.get("net_mf_amount")),
+                    to_float_safe(row.get("ddx")),
+                    to_float_safe(row.get("ddx2")),
                     row.get("trend"),
                     row.get("alert"),
                     row.get("divergence"),

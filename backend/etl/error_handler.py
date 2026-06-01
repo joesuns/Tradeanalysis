@@ -1,30 +1,27 @@
 import logging
 import json
+import uuid
 from datetime import datetime
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 def log_etl(con, step_name: str, status: str, row_count: int = 0,
-            error_msg: str = "", data_completeness: dict | None = None):
+            error_msg: str = "", data_completeness: Optional[dict] = None):
     """Log an ETL step execution to ods_etl_log.
 
-    DuckDB's INTEGER PRIMARY KEY does not auto-increment, so we generate
-    the id manually via COALESCE(MAX(id), 0) + 1.
+    Uses UUID for id to avoid race conditions with concurrent ETL processes.
     """
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     comp = json.dumps(data_completeness) if data_completeness else None
-
-    max_id = con.execute(
-        "SELECT COALESCE(MAX(id), 0) FROM ods_etl_log"
-    ).fetchone()[0]
 
     con.execute(
         """INSERT INTO ods_etl_log
            (id, step_name, started_at, finished_at, status, row_count,
             error_msg, data_completeness)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (max_id + 1, step_name, now, now, status, row_count,
+        (str(uuid.uuid4()), step_name, now, now, status, row_count,
          error_msg or "", comp or ""),
     )
 

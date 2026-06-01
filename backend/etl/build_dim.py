@@ -3,47 +3,37 @@
 
 def build_dim_stock(con) -> int:
     """Build dim_stock from ods_stock_basic. Full refresh (DELETE + INSERT).
-    Maps exchange codes to Chinese names, derives sector from ts_code prefix,
-    detects ST/*ST from name. Returns row count."""
-    con.execute("DELETE FROM dim_stock")
-    con.execute("""
-    INSERT INTO dim_stock (ts_code, stock_code, symbol, name, exchange, sector, industry,
-                           list_date, delist_date, is_active, is_st)
-    SELECT
-        ts_code,
-        symbol AS stock_code,
-        symbol,
-        name,
-        CASE exchange
-            WHEN 'SSE'  THEN '上海'
-            WHEN 'SZSE' THEN '深圳'
-            WHEN 'BSE'  THEN '北京'
-            ELSE exchange
-        END AS exchange,
-        CASE
-            WHEN ts_code LIKE '60%' THEN '主板'
-            WHEN ts_code LIKE '00%' THEN '主板'
-            WHEN ts_code LIKE '30%' THEN '创业板'
-            WHEN ts_code LIKE '68%' THEN '科创板'
-            ELSE '北交所'
-        END AS sector,
-        industry,
-        list_date,
-        delist_date,
-        CASE WHEN delist_date IS NULL OR delist_date = '' THEN 1 ELSE 0 END AS is_active,
-        CASE WHEN name LIKE '%ST%' OR name LIKE '%*ST%' THEN 1 ELSE 0 END AS is_st
-    FROM ods_stock_basic
-    """)
+    Wrapped in transaction for atomicity — INSERT failure rolls back DELETE."""
+    con.execute("BEGIN TRANSACTION")
+    try:
+        # Delete FK-referencing rows first, then the dimension table
+        con.execute("DELETE FROM dim_concept_stock")
+        con.execute("DELETE FROM dim_stock")
+        con.execute("""
+        INSERT INTO dim_stock (ts_code, stock_code, symbol, name, exchange, sector, industry,
+                               list_date, delist_date, is_active, is_st)
+        SELECT
+            ts_code, symbol AS stock_code, symbol, name,
+            CASE exchange WHEN 'SSE' THEN '上海' WHEN 'SZSE' THEN '深圳' WHEN 'BSE' THEN '北京' ELSE exchange END,
+            CASE WHEN ts_code LIKE '60%' THEN '主板' WHEN ts_code LIKE '00%' THEN '主板'
+                 WHEN ts_code LIKE '30%' THEN '创业板' WHEN ts_code LIKE '68%' THEN '科创板' ELSE '北交所' END,
+            industry, list_date, delist_date,
+            CASE WHEN delist_date IS NULL OR delist_date = '' THEN 1 ELSE 0 END,
+            CASE WHEN name LIKE '%ST%' OR name LIKE '%*ST%' THEN 1 ELSE 0 END
+        FROM ods_stock_basic
+        """)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
     return con.execute("SELECT COUNT(*) FROM dim_stock").fetchone()[0]
 
 
 def build_dim_date(con) -> int:
     """Build dim_date from ods_trade_cal. Trading days only.
-    Computes is_week_end, is_month_end, is_year_end, year, quarter, month, week_of_year."""
-    con.execute("DELETE FROM dim_date")
+    Uses CREATE OR REPLACE for atomic swap — no empty-table window on failure."""
     con.execute("""
-    INSERT INTO dim_date (trade_date, is_trade_day, is_week_end, is_month_end, is_year_end,
-                          year, quarter, month, week_of_year)
+    CREATE OR REPLACE TABLE dim_date AS
     WITH dates AS (
         SELECT
             cal_date,

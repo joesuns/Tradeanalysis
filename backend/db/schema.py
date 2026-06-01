@@ -99,9 +99,9 @@ _ODS_DDL = [
         PRIMARY KEY (concept_name, ts_code)
     )""",
 
-    # 12.2 ods_etl_log
+    # 12.2 ods_etl_log — UUID primary key avoids race conditions with concurrent ETL
     """CREATE TABLE IF NOT EXISTS ods_etl_log (
-        id                INTEGER PRIMARY KEY,
+        id                TEXT PRIMARY KEY,
         step_name         TEXT,
         started_at        TEXT,
         finished_at       TEXT,

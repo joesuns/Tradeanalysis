@@ -1,11 +1,27 @@
 from fastapi import APIRouter, Query, HTTPException
 from backend.db.connection import get_connection
-from backend.api.models import FreshnessInfo, ErrorResponse
+from backend.api.models import (
+    FreshnessInfo, ErrorResponse, AnalysisResponse, MACDData,
+    ScreeningResult, HealthResponse,
+)
 
 router = APIRouter(prefix="/api/v1")
 
+# Whitelist of allowed field names for dynamic SELECT (prevents SQL injection)
+_ALLOWED_FIELDS = {
+    "trade_date", "close", "open_qfq", "high_qfq", "low_qfq", "close_qfq",
+    "vol", "amount", "pct_chg", "total_mv", "pe_ttm", "turnover_rate",
+    "ema_12", "ema_26", "dif", "dea", "macd_bar",
+    "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
+    "ma_5", "ma_10", "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope",
+    "ma_alignment", "ma_turning_point",
+    "net_mf_amount", "ddx", "ddx2", "dde_trend", "dde_alert", "dde_divergence",
+    "ma_vol_5", "pct_vol_rank", "vol_zone", "vol_trend",
+    "kpattern", "kpattern_strength",
+}
 
-@router.get("/health")
+
+@router.get("/health", response_model=HealthResponse)
 def health():
     """Health check endpoint returning database connectivity and stats."""
     con = get_connection(read_only=True)
@@ -31,7 +47,7 @@ def health():
         con.close()
 
 
-@router.get("/analysis/{ts_code}")
+@router.get("/analysis/{ts_code}", response_model=AnalysisResponse)
 def analysis(
     ts_code: str,
     freq: str = Query("daily", pattern="^(daily|weekly)$"),
@@ -64,26 +80,21 @@ def analysis(
                     "fix": "请使用 tushare 标准代码格式（如 000001.SZ）",
                 },
             )
-        return {
-            "ts_code": ts_code,
-            "stock_code": row[1],
-            "stock_name": row[2],
-            "trade_date": row[0],
-            "freq": freq,
-            "close": row[3],
-            "pct_chg": row[4],
-            "macd": {
-                "dif": row[5],
-                "dea": row[6],
-                "macd_bar": row[7],
-                "zone": row[8],
-                "trend": row[9],
-                "divergence": row[10],
-                "turning_point": row[11],
-                "alert": row[12],
-            },
-            "freshness": {"age_days": 0, "status": "fresh"},
-        }
+        return AnalysisResponse(
+            ts_code=ts_code,
+            stock_code=row[1],
+            stock_name=row[2],
+            trade_date=row[0],
+            freq=freq,
+            close=row[3],
+            pct_chg=row[4],
+            macd=MACDData(
+                dif=row[5], dea=row[6], macd_bar=row[7],
+                zone=row[8], trend=row[9], divergence=row[10],
+                turning_point=row[11], alert=row[12],
+            ),
+            freshness=FreshnessInfo(age_days=0, status="fresh"),
+        )
     finally:
         con.close()
 
@@ -92,22 +103,50 @@ def analysis(
 def analysis_history(
     ts_code: str,
     freq: str = Query("daily", pattern="^(daily|weekly)$"),
-    fields: str = Query("close,dif,dea,macd_bar"),
+    fields: str = Query("trade_date,dif,dea,macd_bar"),
     from_date: str = Query(None, alias="from"),
     to: str = Query(None),
 ):
-    """Get historical MACD analysis for a single stock."""
+    """Get historical MACD analysis for a single stock with field selection and date filtering."""
     con = get_connection(read_only=True)
     try:
         view = f"v_dws_macd_{freq}_latest"
-        rows = con.execute(
-            f"SELECT trade_date FROM {view} WHERE ts_code = ? ORDER BY trade_date",
-            (ts_code,),
-        ).fetchall()
+
+        # Parse and validate requested fields
+        requested = [f.strip() for f in fields.split(",") if f.strip() in _ALLOWED_FIELDS]
+        if not requested:
+            requested = ["trade_date", "close", "dif", "dea", "macd_bar"]
+
+        # Ensure trade_date is always first for ordering
+        if "trade_date" not in requested:
+            requested = ["trade_date"] + requested
+        select_clause = ", ".join(requested)
+
+        # Build query with optional date filters
+        query = f"SELECT {select_clause} FROM {view} WHERE ts_code = ?"
+        params = [ts_code]
+        if from_date:
+            query += " AND trade_date >= ?"
+            params.append(from_date)
+        if to:
+            query += " AND trade_date <= ?"
+            params.append(to)
+        query += " ORDER BY trade_date"
+
+        rows = con.execute(query, params).fetchall()
+        cols = [d[0] for d in con.description]
+
+        # Build row dicts keyed by field name
+        data = []
+        for row in rows:
+            data.append({cols[j]: row[j] for j in range(len(cols))})
+
         return {
             "ts_code": ts_code,
             "freq": freq,
-            "count": len(rows),
+            "fields": requested,
+            "count": len(data),
+            "rows": data,
             "freshness": {"age_days": 0, "status": "fresh"},
         }
     finally:
@@ -123,14 +162,67 @@ def screening(
     limit: int = Query(50, ge=1, le=500),
 ):
     """Screen stocks by technical indicator conditions."""
-    return {
-        "conditions": {
-            "freq": freq,
-            "macd_zone": macd_zone,
-            "ma_alignment": ma_alignment,
-            "min_ddx": min_ddx,
-        },
-        "count": 0,
-        "results": [],
-        "freshness": {"age_days": 0, "status": "fresh"},
-    }
+    con = get_connection(read_only=True)
+    try:
+        macd_view = f"v_dws_macd_{freq}_latest"
+        ma_view = f"v_dws_ma_{freq}_latest"
+        dde_view = f"v_dws_dde_{freq}_latest"
+        quote_table = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
+
+        query = f"""
+            SELECT q.ts_code, s.stock_code, s.name, q.close_qfq, q.pct_chg,
+                   m.zone AS macd_zone, ma.alignment AS ma_alignment, d.ddx
+            FROM {quote_table} q
+            JOIN dim_stock s ON q.ts_code = s.ts_code
+            JOIN {macd_view} m ON q.ts_code = m.ts_code AND q.trade_date = m.trade_date
+            JOIN {ma_view} ma ON q.ts_code = ma.ts_code AND q.trade_date = ma.trade_date
+            JOIN {dde_view} d ON q.ts_code = d.ts_code AND q.trade_date = d.trade_date
+            WHERE q.trade_date = (SELECT MAX(trade_date) FROM {quote_table})
+              AND q.is_suspended = 0
+        """
+        conditions = []
+        params = []
+
+        if macd_zone:
+            conditions.append("m.zone = ?")
+            params.append(macd_zone)
+        if ma_alignment:
+            conditions.append("ma.alignment = ?")
+            params.append(ma_alignment)
+        if min_ddx is not None:
+            conditions.append("d.ddx >= ?")
+            params.append(min_ddx)
+
+        if conditions:
+            query += " AND " + " AND ".join(conditions)
+
+        query += " ORDER BY d.ddx DESC LIMIT ?"
+        params.append(limit)
+
+        rows = con.execute(query, params).fetchall()
+        results = []
+        for row in rows:
+            results.append({
+                "ts_code": row[0],
+                "stock_code": row[1],
+                "stock_name": row[2],
+                "close": row[3],
+                "pct_chg": row[4],
+                "macd_zone": row[5],
+                "ma_alignment": row[6],
+                "ddx": row[7],
+            })
+
+        return {
+            "conditions": {
+                "freq": freq,
+                "macd_zone": macd_zone,
+                "ma_alignment": ma_alignment,
+                "min_ddx": min_ddx,
+            },
+            "count": len(results),
+            "results": results,
+            "freshness": {"age_days": 0, "status": "fresh"},
+        }
+    finally:
+        con.close()

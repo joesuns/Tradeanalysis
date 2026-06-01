@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import sma, linear_regression_slope
+from backend.etl.base import sma, linear_regression_slope, to_float_safe
 
 
 class VolumeCalculator:
@@ -61,8 +61,8 @@ class VolumeCalculator:
             cur = ma_vol_5[i]
             if pd.isna(cur):
                 continue
-            # Percentile rank: fraction of values strictly less than current
-            rank = np.sum(valid < cur) / len(valid) * 100.0
+            # Percentile rank: fraction of values <= current (mid-rank for ties)
+            rank = np.sum(valid <= cur) / len(valid) * 100.0
             result[i] = rank
 
         return result
@@ -151,19 +151,6 @@ class VolumeCalculator:
 
         return result
 
-    @staticmethod
-    def _to_float(val):
-        """Convert numpy float/NaN to Python float or None for DuckDB compatibility."""
-        if val is None:
-            return None
-        try:
-            f = float(val)
-            if pd.isna(f):
-                return None
-            return f
-        except (ValueError, TypeError):
-            return None
-
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
         for _, row in df.iterrows():
             self.con.execute(
@@ -173,8 +160,8 @@ class VolumeCalculator:
                 (
                     ts_code,
                     row["trade_date"],
-                    self._to_float(row.get("ma_vol_5")),
-                    self._to_float(row.get("pct_vol_rank")),
+                    to_float_safe(row.get("ma_vol_5")),
+                    to_float_safe(row.get("pct_vol_rank")),
                     row.get("zone"),
                     row.get("trend"),
                     calc_date,

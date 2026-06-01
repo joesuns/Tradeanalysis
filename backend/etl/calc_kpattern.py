@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import sma
+from backend.etl.base import sma, to_float_safe
 
 
 class KPatternCalculator:
@@ -58,8 +58,9 @@ class KPatternCalculator:
         is_bear = c < o
         body_pct = body / np.where(full_range > 0, full_range, np.nan)
 
-        # Volume MA5 for gao_kai_chang_yin filter
+        # Volume MA5 for gao_kai_chang_yin filter + strength score
         ma_vol_5 = sma(v, 5)
+        df["_ma5_vol"] = ma_vol_5  # populate for _compute_strength
 
         # Initialize pattern columns and strength
         df["yang_bao_yin"] = 0
@@ -77,8 +78,8 @@ class KPatternCalculator:
         uptrend_10d_gain = np.zeros(n, dtype=bool)
 
         for i in range(n):
-            # 60-day high position: is current close in the top 10%?
-            if i >= 10:
+            # 60-day high position: require full 60-day lookback (i >= 59)
+            if i >= 59:
                 lookback_60 = max(0, i - 59)
                 h60 = h[lookback_60:i + 1].max()
                 if h60 > 0:
@@ -240,19 +241,6 @@ class KPatternCalculator:
 
         return result
 
-    @staticmethod
-    def _to_float(val):
-        """Convert numpy float/NaN to Python float or None for DuckDB compatibility."""
-        if val is None:
-            return None
-        try:
-            f = float(val)
-            if pd.isna(f):
-                return None
-            return f
-        except (ValueError, TypeError):
-            return None
-
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
         for _, row in df.iterrows():
             self.con.execute(
@@ -271,7 +259,7 @@ class KPatternCalculator:
                     int(row.get("gao_kai_chang_yin", 0)),
                     int(row.get("yin_bao_yang", 0)),
                     int(row.get("yin_ke_yang", 0)),
-                    self._to_float(row.get("strength")),
+                    to_float_safe(row.get("strength")),
                     calc_date,
                 ),
             )

@@ -2,57 +2,57 @@
 
 
 def build_dwd_daily_quote(con, ts_codes=None) -> int:
-    """Build dwd_daily_quote from ods_daily + ods_daily_basic.
+    """Build dwd_daily_quote: single-pass batch 前复权 for all stocks.
 
-    For each stock:
-    1. Compute 前复权 (forward-adjusted) prices:
-       price_qfq = price * adj_factor / latest_adj_factor
-    2. LEFT JOIN ods_daily_basic for PE, market cap, turnover
-    3. Detect suspension days: trading days in dim_date with no ods_daily row
-       → fill with previous close, vol=0, amount=0, is_suspended=1
+    Uses a window-function subquery to compute latest_adj_factor per stock
+    in one pass, then joins against ods_daily + ods_daily_basic for a single
+    mass INSERT. Suspension days are filled in a separate batch pass using
+    LATERAL JOIN per stock (necessary because prev-close is stock-specific).
     """
     if ts_codes is None:
         con.execute("DELETE FROM dwd_daily_quote")
-        ts_codes = [row[0] for row in con.execute(
-            "SELECT ts_code FROM dim_stock"
-        ).fetchall()]
+        code_filter = ""
+        params = []
     else:
-        for ts_code in ts_codes:
-            con.execute("DELETE FROM dwd_daily_quote WHERE ts_code = ?", [ts_code])
+        placeholders = ",".join(["?" for _ in ts_codes])
+        con.execute(f"DELETE FROM dwd_daily_quote WHERE ts_code IN ({placeholders})", ts_codes)
+        code_filter = f"AND d.ts_code IN ({placeholders})"
+        params = ts_codes
 
-    for ts_code in ts_codes:
-        # Get latest_adj_factor (from most recent trade_date in ods_daily)
-        row = con.execute(
-            "SELECT adj_factor FROM ods_daily WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
-            [ts_code],
-        ).fetchone()
-        if row is None:
-            # Stock has no daily price data in ODS — skip
-            continue
-        latest_adj_factor = row[0]
+    # Step 1: Single-pass batch 前复权 for ALL stocks
+    # latest_adj factor computed via correlated max-date subquery per stock
+    con.execute(
+        f"""INSERT OR REPLACE INTO dwd_daily_quote
+            (ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq,
+             vol, amount, pct_chg, total_mv, pe_ttm, turnover_rate, volume_ratio, is_suspended)
+        SELECT d.ts_code, d.trade_date,
+            d.open  * d.adj_factor / la.latest_adj,
+            d.high  * d.adj_factor / la.latest_adj,
+            d.low   * d.adj_factor / la.latest_adj,
+            d.close * d.adj_factor / la.latest_adj,
+            d.vol, d.amount, d.pct_chg,
+            b.total_mv, b.pe_ttm, b.turnover_rate, b.volume_ratio,
+            0
+        FROM ods_daily d
+        JOIN (
+            SELECT ts_code, adj_factor AS latest_adj
+            FROM ods_daily
+            WHERE (ts_code, trade_date) IN (
+                SELECT ts_code, MAX(trade_date) FROM ods_daily GROUP BY ts_code
+            )
+        ) la ON d.ts_code = la.ts_code
+        LEFT JOIN ods_daily_basic b
+            ON d.ts_code = b.ts_code AND d.trade_date = b.trade_date
+        WHERE 1=1 {code_filter}""",
+        params,
+    )
 
-        # Step 1: INSERT OR REPLACE 前复权 prices + basic data
-        con.execute(
-            """INSERT OR REPLACE INTO dwd_daily_quote
-                (ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq,
-                 vol, amount, pct_chg, total_mv, pe_ttm, turnover_rate, volume_ratio, is_suspended)
-            SELECT d.ts_code, d.trade_date,
-                d.open  * d.adj_factor / ?,
-                d.high  * d.adj_factor / ?,
-                d.low   * d.adj_factor / ?,
-                d.close * d.adj_factor / ?,
-                d.vol, d.amount, d.pct_chg,
-                b.total_mv, b.pe_ttm, b.turnover_rate, b.volume_ratio,
-                0
-            FROM ods_daily d
-            LEFT JOIN ods_daily_basic b
-                ON d.ts_code = b.ts_code AND d.trade_date = b.trade_date
-            WHERE d.ts_code = ?""",
-            [latest_adj_factor, latest_adj_factor, latest_adj_factor, latest_adj_factor,
-             ts_code],
-        )
-
-        # Step 2: Detect and fill suspension days
+    # Step 2: Batch suspension detection (per-stock LATERAL is unavoidable
+    # for correct prev-close lookup, but at least precomputed in one pass)
+    codes_to_fill = ts_codes if ts_codes else [
+        r[0] for r in con.execute("SELECT ts_code FROM dim_stock").fetchall()
+    ]
+    for ts_code in codes_to_fill:
         con.execute(
             """INSERT OR REPLACE INTO dwd_daily_quote
                 (ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq,
@@ -74,9 +74,7 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
                   SELECT 1 FROM dwd_daily_quote q
                   WHERE q.ts_code = ? AND q.trade_date = cal.trade_date
               )
-              AND cal.trade_date <= (
-                  SELECT MAX(trade_date) FROM dim_date
-              )
+              AND cal.trade_date <= (SELECT MAX(trade_date) FROM dim_date)
               AND prev.close_qfq IS NOT NULL""",
             [ts_code, ts_code, ts_code],
         )

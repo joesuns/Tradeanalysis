@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import sma
+from backend.etl.base import sma, to_float_safe
 
 
 class MACalculator:
@@ -105,19 +105,6 @@ class MACalculator:
 
         return result
 
-    @staticmethod
-    def _to_float(val):
-        """Convert numpy float/NaN to Python float or None for DuckDB compatibility."""
-        if val is None:
-            return None
-        try:
-            f = float(val)
-            if pd.isna(f):
-                return None
-            return f
-        except (ValueError, TypeError):
-            return None
-
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
         for _, row in df.iterrows():
             self.con.execute(
@@ -128,12 +115,12 @@ class MACalculator:
                 (
                     ts_code,
                     row["trade_date"],
-                    self._to_float(row.get("ma_5")),
-                    self._to_float(row.get("ma_10")),
-                    self._to_float(row.get("bias_ma5")),
-                    self._to_float(row.get("bias_ma10")),
-                    self._to_float(row.get("ma5_slope")),
-                    self._to_float(row.get("ma10_slope")),
+                    to_float_safe(row.get("ma_5")),
+                    to_float_safe(row.get("ma_10")),
+                    to_float_safe(row.get("bias_ma5")),
+                    to_float_safe(row.get("bias_ma10")),
+                    to_float_safe(row.get("ma5_slope")),
+                    to_float_safe(row.get("ma10_slope")),
                     row.get("alignment"),
                     row.get("turning_point"),
                     calc_date,

@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 
 def ema(series: np.ndarray, period: int) -> np.ndarray:
@@ -55,3 +56,20 @@ def linear_regression_slope(y: np.ndarray) -> float:
     log_y = np.log(y[mask])
     slope = np.polyfit(x, log_y, 1)[0]
     return float(slope)
+
+
+def to_float_safe(val):
+    """Convert numpy float/NaN to Python float or None for DuckDB compatibility.
+
+    Used by all DWS calculators in their _insert() methods to avoid
+    DuckDB CHECK constraint failures on NaN values.
+    """
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if pd.isna(f):
+            return None
+        return f
+    except (ValueError, TypeError):
+        return None

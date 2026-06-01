@@ -116,7 +116,8 @@ def test_analysis_history_returns_count(temp_db):
 
 
 def test_screening_returns_empty_results(temp_db):
-    """Screening endpoint returns empty result set with conditions."""
+    """Screening endpoint returns empty result set when no data matches conditions."""
+    create_all_tables(temp_db)
     import backend.api.router as router_module
 
     original = router_module.get_connection
