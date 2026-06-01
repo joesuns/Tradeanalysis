@@ -137,17 +137,18 @@ def export_wide_to_excel(
     # ---- Write to Excel ----
     wb = Workbook()
     wb.remove(wb.active)
-    _write_sheet_merged(wb, "个股分析", merged, daily_cols, weekly_cols)
-
-    # ---- Signal-only analysis sheet ----
+    # ---- Signal-only analysis sheet (first sheet) ----
     _SIGNAL_ONLY = {"kpattern", "kpattern_strength",
                     "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
-                    "ma_alignment", "ma_turning_point",
+                    "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
                     "dde_trend", "dde_alert", "dde_divergence",
                     "vol_zone", "vol_trend"}
     daily_signal_only = [c for c in daily_cols if c in _SIGNAL_ONLY or c in basic_cols_outer]
     weekly_signal_only = [c for c in weekly_cols if c in _SIGNAL_ONLY]
     _write_sheet_merged(wb, "综合分析", merged, daily_signal_only, weekly_signal_only)
+
+    # ---- Full analysis sheet ----
+    _write_sheet_merged(wb, "个股分析", merged, daily_cols, weekly_cols)
 
     # ---- SH Index ----
     if include_index:
