@@ -1,5 +1,6 @@
 import duckdb
 import pandas as pd
+from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
@@ -13,13 +14,13 @@ INDEX_VIEW_MAP = {
     "weekly": "v_ads_index_wide_weekly",
 }
 
-# Column name translations (English → Chinese)
+# Column name translations (English → Chinese) — with units where applicable
 _COL_NAMES = {
     "freq": "周期", "trade_date": "交易日期", "ts_code": "股票代码",
     "stock_code": "代码", "stock_name": "股票名称", "exchange": "交易所",
     "sector": "板块", "industry": "行业", "is_st": "ST",
-    "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量", "amount": "成交额",
-    "total_mv": "总市值", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
+    "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量(手)", "amount": "成交额(千元)",
+    "total_mv": "总市值(亿)", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
     "kpattern": "K线形态", "kpattern_strength": "形态强度",
     "ema_12": "EMA12", "ema_26": "EMA26", "dif": "DIF", "dea": "DEA",
     "macd_bar": "MACD柱", "macd_divergence": "MACD背离", "macd_zone": "MACD区域",
@@ -28,7 +29,7 @@ _COL_NAMES = {
     "bias_ma5": "MA5乖离率", "bias_ma10": "MA10乖离率",
     "ma5_slope": "MA5斜率", "ma10_slope": "MA10斜率",
     "ma_alignment": "均线形态", "ma_turning_point": "均线转折",
-    "net_mf_amount": "主力净流入", "ddx": "DDX", "ddx2": "DDX2",
+    "net_mf_amount": "主力净流入(万元)", "ddx": "DDX", "ddx2": "DDX2",
     "dde_trend": "DDE趋势", "dde_alert": "DDE警惕", "dde_divergence": "DDE背离",
     "ma_vol_5": "5日均量", "pct_vol_rank": "量能百分位",
     "vol_zone": "量能区域", "vol_trend": "量能趋势",
@@ -61,24 +62,26 @@ _ENUM_VALUES = {
 _SIGNAL_COLS = {"kpattern", "kpattern_strength", "macd_divergence", "macd_turning_point",
                 "macd_alert", "ma_turning_point", "dde_alert", "dde_divergence"}
 
+# Columns to round to 2 decimal places
+_ROUND_2DP = {"close", "pct_chg", "pe_ttm", "turnover_rate", "net_mf_amount"}
+
+# Columns to convert 万元 → 亿 (divide by 10000)
+_CONVERT_TO_YI = {"total_mv"}
+
 
 def export_wide_to_excel(
     db_path: str,
     trade_date: str,       # YYYYMMDD
-    output_path: str,      # .xlsx path
+    output_path: str = "",  # .xlsx path (auto-timestamped if empty)
     freq: str = "daily",   # "daily" | "weekly"
     filter_st: bool = True,
     include_index: bool = True,
 ) -> int:
-    """Export analysis wide table to Excel. Individual stocks and SH index in separate sheets.
-
-    Returns the total number of rows written across all sheets.
-    """
+    """Export analysis wide table to Excel. Returns total rows written."""
     if freq not in VIEW_MAP:
         raise ValueError(f"Unsupported freq: {freq}. Use 'daily' or 'weekly'.")
 
     view = VIEW_MAP[freq]
-
     con = duckdb.connect(db_path)
 
     # ---- Sheet 1: Individual stocks ----
@@ -87,6 +90,7 @@ def export_wide_to_excel(
     if filter_st:
         sql_stocks += " AND is_st = 0"
     df_stocks = con.execute(sql_stocks, params).df()
+    df_stocks = _format_numbers(df_stocks)
     df_stocks = _translate_df(df_stocks)
     df_stocks = _reorder_signal_first(df_stocks)
 
@@ -97,6 +101,7 @@ def export_wide_to_excel(
         df_index = con.execute(
             f"SELECT * FROM {index_view} WHERE trade_date = ?", [trade_date]
         ).df()
+        df_index = _format_numbers(df_index)
         df_index = _translate_df(df_index)
         df_index = _reorder_signal_first(df_index)
 
@@ -104,56 +109,57 @@ def export_wide_to_excel(
 
     # ---- Write to Excel ----
     wb = Workbook()
-    # Remove default empty sheet
     wb.remove(wb.active)
 
     _write_sheet(wb, f"个股_{freq}", df_stocks)
     if df_index is not None and len(df_index) > 0:
         _write_sheet(wb, "上证指数", df_index)
 
+    # Auto-timestamp filename if not specified
+    if not output_path or output_path == "analysis.xlsx":
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"analysis_{ts}.xlsx"
+
     wb.save(output_path)
     return len(df_stocks) + (len(df_index) if df_index is not None else 0)
 
 
+def _format_numbers(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Round numeric columns + convert 万元→亿 for market cap."""
+    for col in _ROUND_2DP:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: round(float(x), 2) if pd.notna(x) else x)
+    for col in _CONVERT_TO_YI:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: round(float(x) / 10000, 2) if pd.notna(x) else x)
+    return df
+
+
 def _translate_df(df: "pd.DataFrame") -> "pd.DataFrame":
     """Translate column names to Chinese, enum values to Chinese, NULL signals to '-'."""
-    # 1. Rename columns
     df = df.rename(columns={c: _COL_NAMES.get(c, c) for c in df.columns})
-
-    # 2. Translate enum values
     for col, mapping in _ENUM_VALUES.items():
         cn_col = _COL_NAMES.get(col, col)
         if cn_col in df.columns:
             df[cn_col] = df[cn_col].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
-
-    # 3. NULL in signal columns → "-" (means "no signal today")
     for col in _SIGNAL_COLS:
         cn_col = _COL_NAMES.get(col, col)
         if cn_col in df.columns:
             df[cn_col] = df[cn_col].fillna("-")
-
     return df
 
 
 def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
-    """Reorder columns: signal columns follow identity columns, numeric columns behind.
-
-    User opens Excel and immediately sees signals without scrolling right.
-    """
+    """Reorder columns: signal columns follow identity columns, numeric columns behind."""
     head = [
         "freq", "trade_date", "ts_code", "stock_code", "stock_name", "exchange",
         "sector", "industry", "is_st", "close", "pct_chg",
     ]
     signals = [
-        # K-line patterns
         "kpattern", "kpattern_strength",
-        # MACD signals
         "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
-        # MA signals
         "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope",
-        # DDE signals
         "dde_trend", "dde_alert", "dde_divergence",
-        # Volume signals
         "vol_zone", "vol_trend",
     ]
     tail = [c for c in df.columns if c not in head and c not in signals]
@@ -161,80 +167,56 @@ def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
     return df[ordered]
 
 
-# Column groups for header coloring
-_COL_GROUPS = {
-    "identity": {"周期", "交易日期", "股票代码", "代码", "股票名称", "交易所", "板块", "行业", "ST"},
-    "price":   {"收盘价", "涨跌幅%", "成交量", "成交额", "总市值", "市盈率", "换手率%"},
-    "macd":    {"EMA12", "EMA26", "DIF", "DEA", "MACD柱", "MACD背离", "MACD区域", "MACD转折", "MACD警惕", "MACD趋势"},
-    "ma":      {"MA5", "MA10", "MA5乖离率", "MA10乖离率", "MA5斜率", "MA10斜率", "均线形态", "均线转折"},
-    "dde":     {"主力净流入", "DDX", "DDX2", "DDE趋势", "DDE警惕", "DDE背离"},
-    "volume":  {"5日均量", "量能百分位", "量能区域", "量能趋势"},
-    "kline":   {"K线形态", "形态强度"},
-}
-
-_GROUP_FILLS = {
-    "identity": PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid"),
-    "price":    PatternFill(start_color="375623", end_color="375623", fill_type="solid"),
-    "macd":     PatternFill(start_color="BF5700", end_color="BF5700", fill_type="solid"),
-    "ma":       PatternFill(start_color="5B2C6F", end_color="5B2C6F", fill_type="solid"),
-    "dde":      PatternFill(start_color="0D6B6B", end_color="0D6B6B", fill_type="solid"),
-    "volume":   PatternFill(start_color="7B4B1E", end_color="7B4B1E", fill_type="solid"),
-    "kline":    PatternFill(start_color="8B0000", end_color="8B0000", fill_type="solid"),
-}
-
-
-def _get_col_group(col_name: str):
-    for group, names in _COL_GROUPS.items():
-        if col_name in names:
-            return group
-    return None
-
-
 def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
-    """Write a DataFrame to a sheet with grouped colored headers, auto-fit widths,
-    row striping, borders, and signal color highlights."""
+    """Write a DataFrame to a sheet with Apple-style clean header, auto-fit widths,
+    row striping, borders, frozen identity columns, and signal color highlights."""
     ws = wb.create_sheet(title=sheet_name)
 
-    # ── Style constants ──
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    data_font = Font(size=10)
+    # ── Apple-style clean design ──
+    header_fill = PatternFill(start_color="F5F5F7", end_color="F5F5F7", fill_type="solid")
+    header_font = Font(bold=True, color="1D1D1F", size=10)
+    header_border = Border(bottom=Side(style="medium", color="8E8E93"))
+    data_font = Font(size=10, color="1D1D1F")
     thin_border = Border(
-        left=Side(style="thin", color="D0D0D0"),
-        right=Side(style="thin", color="D0D0D0"),
-        top=Side(style="thin", color="D0D0D0"),
-        bottom=Side(style="thin", color="D0D0D0"),
+        left=Side(style="thin", color="E5E5EA"),
+        right=Side(style="thin", color="E5E5EA"),
+        top=Side(style="thin", color="E5E5EA"),
+        bottom=Side(style="thin", color="E5E5EA"),
     )
-    stripe_fill = PatternFill(start_color="F5F7FA", end_color="F5F7FA", fill_type="solid")
+    stripe_fill = PatternFill(start_color="FAFAFA", end_color="FAFAFA", fill_type="solid")
     white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
 
-    green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    blue = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    green = PatternFill(start_color="D4EDDA", end_color="D4EDDA", fill_type="solid")
+    red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+    blue = PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
 
-    # ── Header row with group colors ──
+    # ── Header row ──
     for col_idx, col_name in enumerate(df.columns, 1):
         cell = ws.cell(row=1, column=col_idx, value=col_name)
-        grp = _get_col_group(col_name)
-        cell.fill = _GROUP_FILLS.get(grp, _GROUP_FILLS["identity"])
+        cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = header_border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    ws.freeze_panes = "A2"
+    # ── Freeze: header row + identity columns (up to 股票名称) ──
+    freeze_col = "A"
+    if "股票名称" in df.columns:
+        idx = list(df.columns).index("股票名称") + 2  # +1 for 1-indexed, +1 for next col
+        freeze_col = get_column_letter(idx)
+    ws.freeze_panes = f"{freeze_col}2"
 
     # ── Auto-fit column widths ──
     for col_idx, col_name in enumerate(df.columns, 1):
-        # Chinese chars ≈ 2.2x width, header takes priority
         header_len = sum(2.2 if '一' <= c <= '鿿' else 1.0 for c in str(col_name))
         width = max(header_len + 2, 8)
-        # Sample first 20 data rows for width
         for row_idx in range(2, min(len(df) + 2, 22)):
             val = ws.cell(row=row_idx, column=col_idx).value
             if val is not None:
                 val_len = sum(2.2 if '一' <= c <= '鿿' else 1.0 for c in str(val))
-                width = max(width, min(val_len + 2, 25))
+                width = max(width, min(val_len + 2, 30))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(width, 22)
 
-    # ── Data rows with borders + row striping ──
+    # ── Data rows ──
     for row_idx, row in enumerate(df.itertuples(index=False), 2):
         row_fill = stripe_fill if row_idx % 2 == 0 else white_fill
         for col_idx, value in enumerate(row, 1):
