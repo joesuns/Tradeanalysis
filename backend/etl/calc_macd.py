@@ -103,6 +103,19 @@ class MACDCalculator:
                 result[i] = "downturn_reverse"
         return result
 
+    @staticmethod
+    def _to_float(val):
+        """Convert numpy float/NaN to Python float or None for DuckDB compatibility."""
+        if val is None:
+            return None
+        try:
+            f = float(val)
+            if pd.isna(f):
+                return None
+            return f
+        except (ValueError, TypeError):
+            return None
+
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
         for _, row in df.iterrows():
             self.con.execute(
@@ -113,11 +126,11 @@ class MACDCalculator:
                 (
                     ts_code,
                     row["trade_date"],
-                    row.get("ema_12"),
-                    row.get("ema_26"),
-                    row.get("dif"),
-                    row.get("dea"),
-                    row.get("macd_bar"),
+                    self._to_float(row.get("ema_12")),
+                    self._to_float(row.get("ema_26")),
+                    self._to_float(row.get("dif")),
+                    self._to_float(row.get("dea")),
+                    self._to_float(row.get("macd_bar")),
                     row.get("divergence"),
                     row.get("zone"),
                     row.get("turning_point"),
