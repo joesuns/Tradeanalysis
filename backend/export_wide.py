@@ -391,7 +391,7 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
 
     # ── UED Styles ──
     # Row 1 group labels
-    group_font = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
+    group_font = Font(name="微软雅黑", color="FFFFFF", size=11)
     group_fill_daily = PatternFill(start_color="1A5276", end_color="1A5276", fill_type="solid")
     group_fill_weekly = PatternFill(start_color="0D6B6B", end_color="0D6B6B", fill_type="solid")
     # Row 2 column names
