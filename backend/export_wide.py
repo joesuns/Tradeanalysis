@@ -70,6 +70,9 @@ _CONVERT_DIV10000 = {"total_mv", "vol", "ma_vol_5"}  # → 万 (or 亿 for mv)
 _CONVERT_DIV10 = set()  # unused, kept for clarity
 _CONVERT_AMOUNT = {"amount"}  # 千元 → 亿 (/100000)
 
+# Weekly column name overrides
+_WEEKLY_OVERRIDE = {"ma_vol_5": "5周均量(万手)"}
+
 
 def export_wide_to_excel(
     db_path: str,
@@ -353,9 +356,9 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     daily_signal = [c for c in daily_cols if c not in basic_cols and c != "freq"]
     daily_names = [_COL_NAMES.get(c, c) for c in daily_signal]
 
-    # Weekly technical indicator columns
+    # Weekly technical indicator columns (with weekly-specific name overrides)
     weekly_signal = weekly_cols
-    weekly_names = [_COL_NAMES.get(c, c) for c in weekly_signal]
+    weekly_names = [_WEEKLY_OVERRIDE.get(c, _COL_NAMES.get(c, c)) for c in weekly_signal]
 
     # ── Translate data values (enum + NULL) ──
     # Daily enum translation
@@ -390,7 +393,7 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     # Row 1 group labels
     group_font = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
     group_fill_daily = PatternFill(start_color="1A5276", end_color="1A5276", fill_type="solid")
-    group_fill_weekly = PatternFill(start_color="1A5276", end_color="1A5276", fill_type="solid")
+    group_fill_weekly = PatternFill(start_color="0D6B6B", end_color="0D6B6B", fill_type="solid")
     # Row 2 column names
     col_font = Font(name="微软雅黑", color="FFFFFF", size=10)
     # Data
@@ -417,9 +420,10 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     _GROUP_COLORS = {
         "kpattern": "C0392B",
         "ema_": "8E44AD", "macd_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
+        "ma_vol_": "27AE60",  # before ma_ to avoid false match
         "ma_": "2980B9", "bias_": "2980B9", "ma5_": "2980B9", "ma10_": "2980B9",
         "dde_": "D35400", "ddx": "D35400", "net_mf": "D35400",
-        "vol_": "27AE60", "pct_vol": "27AE60", "ma_vol_": "27AE60",
+        "vol_": "27AE60", "pct_vol": "27AE60",
     }
     _DEFAULT_COLOR = "7F8C8D"
 
