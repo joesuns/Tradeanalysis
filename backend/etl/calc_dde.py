@@ -128,7 +128,8 @@ class DDECalculator:
         df["net_mf_amount"] = df["net_mf_amount"].values.astype(float)
 
         # Trend: linear regression slope on DDX2
-        df["trend"] = self._compute_trend(df["ddx2"].values.astype(float))
+        trend_window = 4  # daily: 4 bars, weekly: 4 bars
+        df["trend"] = self._compute_trend(df["ddx2"].values.astype(float), window=trend_window)
 
         # Divergence: same logic as MACD but using DDX2 instead of DIF
         df["divergence"] = self._compute_divergence(df)
@@ -150,7 +151,7 @@ class DDECalculator:
                 continue
             segment = ddx2[i - window + 1:i + 1]
             valid = segment[~np.isnan(segment)]
-            if len(valid) < 10:
+            if len(valid) < window:
                 continue
             slope = linear_regression_slope(valid)
             if slope > 0.0005:
@@ -198,16 +199,15 @@ class DDECalculator:
         return result
 
     def _compute_alerts(self, df: pd.DataFrame) -> list:
-        """Upturn/downturn reverse alerts using DDX."""
+        """Upturn/downturn reverse alerts using DDX — 2 consecutive comparisons."""
         result = [None] * len(df)
         ddx = df["ddx"].values
-        for i in range(4, len(df)):
-            # Check if previous 3 days were trending up
-            prev = ddx[i - 4:i]
+        for i in range(3, len(df)):
+            prev = ddx[i - 3:i]
             if any(pd.isna(x) for x in prev):
                 continue
-            prev_up = all(prev[j + 1] > prev[j] for j in range(3))
-            prev_down = all(prev[j + 1] < prev[j] for j in range(3))
+            prev_up = all(prev[j + 1] > prev[j] for j in range(2))
+            prev_down = all(prev[j + 1] < prev[j] for j in range(2))
             if prev_up and ddx[i] < ddx[i - 1]:
                 result[i] = "upturn_reverse"
             elif prev_down and ddx[i] > ddx[i - 1]:
