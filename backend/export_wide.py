@@ -1,7 +1,7 @@
 import duckdb
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font
+from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
 VIEW_MAP = {
@@ -161,29 +161,89 @@ def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
     return df[ordered]
 
 
+# Column groups for header coloring
+_COL_GROUPS = {
+    "identity": {"周期", "交易日期", "股票代码", "代码", "股票名称", "交易所", "板块", "行业", "ST"},
+    "price":   {"收盘价", "涨跌幅%", "成交量", "成交额", "总市值", "市盈率", "换手率%"},
+    "macd":    {"EMA12", "EMA26", "DIF", "DEA", "MACD柱", "MACD背离", "MACD区域", "MACD转折", "MACD警惕", "MACD趋势"},
+    "ma":      {"MA5", "MA10", "MA5乖离率", "MA10乖离率", "MA5斜率", "MA10斜率", "均线形态", "均线转折"},
+    "dde":     {"主力净流入", "DDX", "DDX2", "DDE趋势", "DDE警惕", "DDE背离"},
+    "volume":  {"5日均量", "量能百分位", "量能区域", "量能趋势"},
+    "kline":   {"K线形态", "形态强度"},
+}
+
+_GROUP_FILLS = {
+    "identity": PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid"),
+    "price":    PatternFill(start_color="375623", end_color="375623", fill_type="solid"),
+    "macd":     PatternFill(start_color="BF5700", end_color="BF5700", fill_type="solid"),
+    "ma":       PatternFill(start_color="5B2C6F", end_color="5B2C6F", fill_type="solid"),
+    "dde":      PatternFill(start_color="0D6B6B", end_color="0D6B6B", fill_type="solid"),
+    "volume":   PatternFill(start_color="7B4B1E", end_color="7B4B1E", fill_type="solid"),
+    "kline":    PatternFill(start_color="8B0000", end_color="8B0000", fill_type="solid"),
+}
+
+
+def _get_col_group(col_name: str):
+    for group, names in _COL_GROUPS.items():
+        if col_name in names:
+            return group
+    return None
+
+
 def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
-    """Write a DataFrame to a sheet with frozen header and K-line signal color highlights."""
+    """Write a DataFrame to a sheet with grouped colored headers, auto-fit widths,
+    row striping, borders, and signal color highlights."""
     ws = wb.create_sheet(title=sheet_name)
+
+    # ── Style constants ──
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    data_font = Font(size=10)
+    thin_border = Border(
+        left=Side(style="thin", color="D0D0D0"),
+        right=Side(style="thin", color="D0D0D0"),
+        top=Side(style="thin", color="D0D0D0"),
+        bottom=Side(style="thin", color="D0D0D0"),
+    )
+    stripe_fill = PatternFill(start_color="F5F7FA", end_color="F5F7FA", fill_type="solid")
+    white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
 
     green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     blue = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF", size=10)
 
-    # Header row
+    # ── Header row with group colors ──
     for col_idx, col_name in enumerate(df.columns, 1):
         cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.fill = header_fill
+        grp = _get_col_group(col_name)
+        cell.fill = _GROUP_FILLS.get(grp, _GROUP_FILLS["identity"])
         cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
     ws.freeze_panes = "A2"
 
-    # Data rows
-    for row_idx, row in enumerate(df.itertuples(index=False), 2):
-        for col_idx, value in enumerate(row, 1):
-            ws.cell(row=row_idx, column=col_idx, value=value)
+    # ── Auto-fit column widths ──
+    for col_idx, col_name in enumerate(df.columns, 1):
+        # Chinese chars ≈ 2.2x width, header takes priority
+        header_len = sum(2.2 if '一' <= c <= '鿿' else 1.0 for c in str(col_name))
+        width = max(header_len + 2, 8)
+        # Sample first 20 data rows for width
+        for row_idx in range(2, min(len(df) + 2, 22)):
+            val = ws.cell(row=row_idx, column=col_idx).value
+            if val is not None:
+                val_len = sum(2.2 if '一' <= c <= '鿿' else 1.0 for c in str(val))
+                width = max(width, min(val_len + 2, 25))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(width, 22)
 
-    # Signal highlights: K-line pattern (by Chinese value)
+    # ── Data rows with borders + row striping ──
+    for row_idx, row in enumerate(df.itertuples(index=False), 2):
+        row_fill = stripe_fill if row_idx % 2 == 0 else white_fill
+        for col_idx, value in enumerate(row, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = data_font
+            cell.border = thin_border
+            cell.fill = row_fill
+
+    # ── Signal highlights: K-line pattern ──
     kpattern_colors = {
         "阳包阴": green, "阳克阴": green,
         "墓碑线": red, "避雷针": red, "高开长阴": red,
@@ -196,7 +256,7 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
             if val in kpattern_colors:
                 ws.cell(row=row_idx, column=col_idx).fill = kpattern_colors[val]
 
-    # Signal highlights: by Chinese column name + Chinese value
+    # ── Signal highlights: text enum columns ──
     text_signal_cols = {
         "MACD转折": {"金叉": green, "死叉": red},
         "MACD区域": {"多头": green, "空头": red},
@@ -221,7 +281,3 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
                 val = ws.cell(row=row_idx, column=col_idx).value
                 if val in value_colors:
                     ws.cell(row=row_idx, column=col_idx).fill = value_colors[val]
-
-    # Column widths
-    for col_idx in range(1, len(df.columns) + 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 14
