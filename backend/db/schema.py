@@ -3,7 +3,7 @@ Complete DDL for the stock analysis data model.
 
 Tables: ODS(7) + DIM(4) + DWD(3) + DWS(10) = 24
 Views: 10 latest views + 4 ADS wide views = 14
-Indexes: DWS(20) + DWD(3) + ODS(3) = 26
+Indexes: DWS(20) + DWD(3) + ODS(3) + DIM(1) = 27
 
 Usage:
     from backend.db.schema import create_all_tables, drop_all_tables
