@@ -3,5 +3,7 @@ data/
 __pycache__/
 *.pyc
 *.duckdb
+*.duckdb.wal
 *.xlsx
+.pytest_cache/
 venv/

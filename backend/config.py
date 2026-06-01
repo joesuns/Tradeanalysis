@@ -10,5 +10,3 @@ if not TUSHARE_TOKEN:
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "./data/tradeanalysis.duckdb")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 ETL_WORKERS = int(os.getenv("ETL_WORKERS", "1"))
-
-os.makedirs(os.path.dirname(DUCKDB_PATH) or ".", exist_ok=True)
