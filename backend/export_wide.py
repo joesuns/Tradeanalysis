@@ -349,11 +349,8 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     basic_cols = id_cols + [c for c in fund_cols if c in daily_cols]
     basic_names = [_COL_NAMES.get(c, c) for c in basic_cols if c in df.columns]
 
-    # Daily technical indicator columns (everything else)
-    daily_signal = [c for c in daily_cols if c not in basic_cols and c != "freq" and c != "kpattern_strength" and c != "kpattern"]
-    # Put kpattern at the end of daily signal
-    daily_signal = [c for c in daily_signal if c not in ("kpattern", "kpattern_strength")] + \
-                   [c for c in ("kpattern", "kpattern_strength") if c in daily_cols]
+    # Daily technical indicator columns (same order as weekly — K-line first)
+    daily_signal = [c for c in daily_cols if c not in basic_cols and c != "freq"]
     daily_names = [_COL_NAMES.get(c, c) for c in daily_signal]
 
     # Weekly technical indicator columns
