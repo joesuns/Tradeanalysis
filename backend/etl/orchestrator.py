@@ -14,7 +14,7 @@ from datetime import datetime
 from backend.db.connection import get_connection, check_connectivity, run_checkpoint
 from backend.etl.error_handler import log_etl, check_data_completeness
 from backend.fetch.client import TushareClient
-from backend.fetch.ods_daily import fetch_by_date_range, get_all_active_codes
+from backend.fetch.ods_daily import fetch_by_date_range_parallel, get_all_active_codes
 from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
 from backend.etl.build_dwd import build_dwd_daily_quote, build_dwd_daily_moneyflow, build_dwd_weekly_quote
 from backend.etl.calc_macd import MACDCalculator
@@ -74,9 +74,8 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             n = fetch_concept_detail(client, con, ts_codes=codes)
             log_etl(con, "fetch_concept_detail", "success", row_count=n)
             # Date-based batch fetch: 4 API calls per trading day for ALL stocks
-            rows = fetch_by_date_range(client, con,
-                                       start or "20150101",
-                                       end or "20991231")
+            rows = fetch_by_date_range_parallel(
+                start or "20150101", end or "20991231", workers=3)
             log_etl(con, "fetch_market_data",
                     "success", row_count=rows)
 
