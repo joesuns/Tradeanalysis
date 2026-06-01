@@ -186,13 +186,13 @@ def _get_col_group(col_name: str):
 
 # Apple-style subtle group header tints (very light, low saturation)
 _GROUP_TINTS = {
-    "identity": "EBF0FA",  # barely-blue
-    "price":    "EBF5EE",  # barely-green
-    "macd":     "FFF2E5",  # barely-warm
-    "ma":       "F2EDF7",  # barely-purple
-    "dde":      "E5F2F2",  # barely-teal
-    "volume":   "FDF0E5",  # barely-brown
-    "kline":    "FDEAEA",  # barely-rose
+    "identity": "D6E4F0",  # light blue
+    "price":    "D5ECD5",  # light green
+    "macd":     "FDE4C8",  # light warm
+    "ma":       "E3D7ED",  # light purple
+    "dde":      "C5E2E2",  # light teal
+    "volume":   "FADCC8",  # light brown
+    "kline":    "F8D0D0",  # light rose
 }
 
 
