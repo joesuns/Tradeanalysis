@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import ema, to_float_safe
+from backend.etl.base import ema, to_float_safe, linear_regression_slope
 
 
 class DDECalculator:
@@ -126,8 +126,8 @@ class DDECalculator:
         # net_mf_amount: direct copy
         df["net_mf_amount"] = df["net_mf_amount"].values.astype(float)
 
-        # Trend: 3 consecutive days same direction in DDX
-        df["trend"] = self._compute_trend(ddx)
+        # Trend: linear regression slope on DDX2
+        df["trend"] = self._compute_trend(df["ddx2"].values.astype(float))
 
         # Divergence: same logic as MACD but using DDX2 instead of DIF
         df["divergence"] = self._compute_divergence(df)
@@ -137,16 +137,24 @@ class DDECalculator:
 
         return df
 
-    def _compute_trend(self, ddx: np.ndarray) -> list:
-        """DDX 3 consecutive days same direction -> trend."""
-        result = [None] * len(ddx)
-        for i in range(3, len(ddx)):
-            b = ddx[i - 3:i + 1]
-            if any(pd.isna(x) for x in b):
+    def _compute_trend(self, ddx2: np.ndarray, window: int = 20) -> list:
+        """DDX2 trend via linear regression slope (same method as volume trend).
+        - up: slope > 0.0005
+        - down: slope < -0.0005
+        - flat: otherwise
+        """
+        result = [None] * len(ddx2)
+        for i in range(len(ddx2)):
+            if i < window - 1:
                 continue
-            if all(b[j] > b[j - 1] for j in range(1, 4)):
+            segment = ddx2[i - window + 1:i + 1]
+            valid = segment[~np.isnan(segment)]
+            if len(valid) < 10:
+                continue
+            slope = linear_regression_slope(valid)
+            if slope > 0.0005:
                 result[i] = "up"
-            elif all(b[j] < b[j - 1] for j in range(1, 4)):
+            elif slope < -0.0005:
                 result[i] = "down"
             else:
                 result[i] = "flat"
