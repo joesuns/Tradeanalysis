@@ -340,15 +340,21 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     ws = wb.create_sheet(title=sheet_name)
 
     # ── Build display column names ──
-    # Identity columns: translate to Chinese
+    # Identity columns: pure identification
     id_cols = ["ts_code", "trade_date", "stock_code", "stock_name", "exchange", "sector", "industry", "is_st"]
-    id_names = [_COL_NAMES.get(c, c) for c in id_cols if c in df.columns]
+    # Fundamental columns (price/volume/valuation — not technical indicators)
+    fund_cols = ["close", "pct_chg", "vol", "amount", "total_mv", "pe_ttm", "turnover_rate", "volume_ratio"]
+    basic_cols = id_cols + [c for c in fund_cols if c in daily_cols]
+    basic_names = [_COL_NAMES.get(c, c) for c in basic_cols if c in df.columns]
 
-    # Daily signal columns (excluding freq and identity)
-    daily_signal = [c for c in daily_cols if c not in id_cols and c != "freq"]
+    # Daily technical indicator columns (everything else)
+    daily_signal = [c for c in daily_cols if c not in basic_cols and c != "freq" and c != "kpattern_strength" and c != "kpattern"]
+    # Put kpattern at the end of daily signal
+    daily_signal = [c for c in daily_signal if c not in ("kpattern", "kpattern_strength")] + \
+                   [c for c in ("kpattern", "kpattern_strength") if c in daily_cols]
     daily_names = [_COL_NAMES.get(c, c) for c in daily_signal]
 
-    # Weekly columns (strip __w__ prefix, then translate)
+    # Weekly technical indicator columns
     weekly_signal = weekly_cols
     weekly_names = [_COL_NAMES.get(c, c) for c in weekly_signal]
 
@@ -370,22 +376,23 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         if wcol in df.columns:
             df[wcol] = df[wcol].fillna("-")
 
-    # Build final display column order: id_cols → daily_signal → weekly_signal
-    display_order = [c for c in id_cols if c in df.columns] \
+    # Build final display column order: basic → daily_signal → weekly_signal
+    display_order = [c for c in basic_cols if c in df.columns] \
                   + [c for c in daily_signal if c in df.columns] \
                   + [f"__w__{c}" for c in weekly_signal if f"__w__{c}" in df.columns]
     df = df[display_order]
 
     # Column positions in the worksheet
-    n_id = len([c for c in id_cols if c in df.columns])
+    n_basic = len([c for c in basic_cols if c in df.columns])
     n_daily = len([c for c in daily_signal if c in df.columns])
     n_weekly = len([c for c in weekly_signal if f"__w__{c}" in df.columns])
 
     # ── Styles ──
-    header_fill = PatternFill(start_color="F5F5F7", end_color="F5F5F7", fill_type="solid")
     group_fill = PatternFill(start_color="E8E8ED", end_color="E8E8ED", fill_type="solid")
-    header_font = Font(name="微软雅黑", color="1D1D1F", size=10)
     group_font = Font(name="微软雅黑", bold=True, color="1D1D1F", size=10)
+    basic_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    header_font_white = Font(name="微软雅黑", color="FFFFFF", size=10)
+    header_font_dark = Font(name="微软雅黑", color="1D1D1F", size=10)
     data_font = Font(name="微软雅黑", size=10, color="1D1D1F")
     thin_border = Border(
         left=Side(style="thin", color="E5E5EA"), right=Side(style="thin", color="E5E5EA"),
@@ -398,10 +405,13 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
     blue = PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
 
+    # Group header tints (dark business-style)
+    _TINTS = {"MACD": "6C3483", "MA": "117864", "DDE": "7D6608", "K线": "922B21", "量": "935116", "default": "1A5276"}
+
     # ── Row 1: Group headers ──
-    daily_start = n_id + 1
-    weekly_start = n_id + n_daily + 1
-    weekly_end = n_id + n_daily + n_weekly
+    daily_start = n_basic + 1
+    weekly_start = n_basic + n_daily + 1
+    weekly_end = n_basic + n_daily + n_weekly
 
     for col_idx in range(1, len(df.columns) + 1):
         cell = ws.cell(row=1, column=col_idx)
@@ -410,10 +420,14 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         cell.border = header_border
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Identity columns span both rows
-    for i in range(1, n_id + 1):
+    # Basic info columns span both rows
+    for i in range(1, n_basic + 1):
         ws.merge_cells(start_row=1, start_column=i, end_row=2, end_column=i)
-        ws.cell(row=1, column=i, value=id_names[i - 1])
+        ws.cell(row=1, column=i, value=basic_names[i - 1])
+        c2 = ws.cell(row=2, column=i)
+        c2.fill = basic_fill
+        c2.font = header_font_white
+        c2.border = header_border
 
     # Daily group
     if n_daily > 0:
@@ -425,24 +439,33 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         ws.merge_cells(start_row=1, start_column=weekly_start, end_row=1, end_column=weekly_end)
         ws.cell(row=1, column=weekly_start, value="周线指标")
 
-    # ── Row 2: Individual column names ──
+    # ── Row 2: Individual column names with group colors ──
     for i, name in enumerate(daily_names):
         c = daily_start + i
+        tint = _TINTS["default"]
+        for key, color in _TINTS.items():
+            if key != "default" and (name.startswith(key) or key in name):
+                tint = color; break
         cell = ws.cell(row=2, column=c, value=name)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.border = header_border
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    for i, name in enumerate(weekly_names):
-        c = weekly_start + i
-        cell = ws.cell(row=2, column=c, value=name)
-        cell.font = header_font
-        cell.fill = header_fill
+        cell.font = header_font_white
+        cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
         cell.border = header_border
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # ── Freeze: identity columns + 2 header rows ──
-    freeze_letter = get_column_letter(n_id + 1) if n_id > 0 else "A"
+    for i, name in enumerate(weekly_names):
+        c = weekly_start + i
+        tint = _TINTS["default"]
+        for key, color in _TINTS.items():
+            if key != "default" and (name.startswith(key) or key in name):
+                tint = color; break
+        cell = ws.cell(row=2, column=c, value=name)
+        cell.font = header_font_white
+        cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
+        cell.border = header_border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # ── Freeze: basic columns + 2 header rows ──
+    freeze_letter = get_column_letter(n_basic + 1) if n_basic > 0 else "A"
     ws.freeze_panes = f"{freeze_letter}3"
 
     # ── Auto-fit column widths ──
