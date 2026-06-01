@@ -76,9 +76,9 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
                   SELECT 1 FROM dwd_daily_quote q
                   WHERE q.ts_code = ? AND q.trade_date = cal.trade_date
               )
-              AND cal.trade_date <= (SELECT MAX(trade_date) FROM dim_date)
+              AND cal.trade_date <= (SELECT MAX(trade_date) FROM ods_daily WHERE ts_code = ?)
               AND prev.close_qfq IS NOT NULL""",
-            [ts_code, ts_code, ts_code],
+            [ts_code, ts_code, ts_code, ts_code],
         )
 
     return con.execute("SELECT COUNT(*) FROM dwd_daily_quote").fetchone()[0]
