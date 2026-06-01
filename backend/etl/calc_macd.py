@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import ema, to_float_safe
+from backend.etl.base import ema, to_float_safe, linear_regression_slope
 
 
 class MACDCalculator:
@@ -41,14 +41,24 @@ class MACDCalculator:
         df["alert"] = self._compute_alerts(df)
         return df
 
-    def _compute_trend(self, bar: np.ndarray) -> list:
-        """MACD bar 3 consecutive days same direction -> trend."""
+    def _compute_trend(self, bar: np.ndarray, window: int = 20) -> list:
+        """MACD bar trend via linear regression slope (same method as DDE/Volume).
+        - up: slope > 0.0005
+        - down: slope < -0.0005
+        - flat: otherwise
+        """
         result = [None] * len(bar)
-        for i in range(3, len(bar)):
-            b = bar[i - 3 : i + 1]
-            if all(b[j] > b[j - 1] for j in range(1, 4)):
+        for i in range(len(bar)):
+            if i < window - 1:
+                continue
+            segment = bar[i - window + 1:i + 1]
+            valid = segment[~np.isnan(segment)]
+            if len(valid) < 10:
+                continue
+            slope = linear_regression_slope(valid)
+            if slope > 0.0005:
                 result[i] = "up"
-            elif all(b[j] < b[j - 1] for j in range(1, 4)):
+            elif slope < -0.0005:
                 result[i] = "down"
             else:
                 result[i] = "flat"
