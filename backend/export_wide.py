@@ -106,10 +106,12 @@ def export_wide_to_excel(
     ).df()
     weekly = _format_numbers(weekly)
 
-    # Drop redundant identity columns from weekly (kept in daily)
+    # Drop identity + fundamental columns from weekly (already in basic section from daily)
     id_cols_drop = ["freq", "trade_date", "stock_code", "stock_name",
-                    "exchange", "sector", "industry", "is_st"]
-    # Keep ts_code for merge; drop after
+                    "exchange", "sector", "industry", "is_st",
+                    "close", "pct_chg", "vol", "amount", "total_mv",
+                    "pe_ttm", "turnover_rate", "volume_ratio"]
+    # Keep ts_code for merge
     weekly = weekly.drop(columns=[c for c in id_cols_drop if c in weekly.columns], errors="ignore")
 
     # Track which columns are daily vs weekly
@@ -414,8 +416,8 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
     blue = PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
 
-    # Indicator group tints
-    _TINTS = {"MACD": "6C3483", "MA": "117864", "DDE": "7D6608", "K线": "922B21", "量": "935116", "default": "1A5276"}
+    # Indicator group tints — high contrast, medium brightness, business palette
+    _TINTS = {"MACD": "8E44AD", "MA": "2980B9", "DDE": "D35400", "K线": "C0392B", "量": "27AE60", "default": "7F8C8D"}
 
     # ── Row 1: Group labels ──
     daily_start = n_basic + 1
@@ -458,7 +460,7 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         cell = ws.cell(row=2, column=c, value=name)
         cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = header_bottom
 
     for i, name in enumerate(weekly_names):
@@ -470,7 +472,7 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         cell = ws.cell(row=2, column=c, value=name)
         cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = header_bottom
 
     # ── Freeze: 股票名称 column + 2 header rows ──
