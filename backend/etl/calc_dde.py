@@ -25,6 +25,8 @@ class DDECalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate DDE indicators for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
+            # Delete old data for this stock+freq to avoid stale non-weekend rows
+            self.con.execute(f"DELETE FROM {self.dws_table} WHERE ts_code = ?", (ts_code,))
             if self.freq == "daily":
                 df = self._load_daily(ts_code)
             else:
