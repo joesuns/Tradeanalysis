@@ -65,9 +65,9 @@ class MACDCalculator:
             if len(valid) < window:
                 continue
             slope = linear_regression_slope(valid, use_log=False)
-            if slope > 0.5:
+            if slope > 0.2:
                 result[i] = "up"
-            elif slope < -0.5:
+            elif slope < -0.2:
                 result[i] = "down"
             else:
                 result[i] = "flat"
