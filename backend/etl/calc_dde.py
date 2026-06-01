@@ -42,7 +42,7 @@ class DDECalculator:
                    m.net_mf_amount, q.close_qfq
             FROM {self.src_table} m
             JOIN {self.quote_table} q ON m.ts_code = q.ts_code AND m.trade_date = q.trade_date
-            WHERE m.ts_code = ? AND q.is_suspended = 0
+            WHERE m.ts_code = ? {'' if self.freq == 'weekly' else 'AND q.is_suspended = 0'}
             ORDER BY m.trade_date
         """, (ts_code,)).df()
 
@@ -51,7 +51,7 @@ class DDECalculator:
         # Get weekly trade dates for this stock
         weeks = self.con.execute(f"""
             SELECT trade_date FROM {self.quote_table}
-            WHERE ts_code = ? AND is_suspended = 0
+            WHERE ts_code = ? {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}
             ORDER BY trade_date
         """, (ts_code,)).df()
         if weeks.empty:

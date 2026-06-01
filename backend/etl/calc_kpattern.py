@@ -22,7 +22,7 @@ class KPatternCalculator:
         for ts_code in ts_codes:
             df = self.con.execute(f"""
                 SELECT trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, pct_chg
-                FROM {self.src_table} WHERE ts_code = ? AND is_suspended = 0
+                FROM {self.src_table} WHERE ts_code = ? {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}
                 ORDER BY trade_date
             """, (ts_code,)).df()
             if df.empty or len(df) < 30:

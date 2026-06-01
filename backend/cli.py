@@ -39,8 +39,10 @@ def cmd_etl(args):
     """Run the ETL pipeline."""
     from backend.etl.orchestrator import run_etl
 
+    ts_codes = [args.ts_code] if args.ts_code else None
     run_etl(
         step=args.step,
+        ts_codes=ts_codes,
         start=args.start,
         end=args.end,
         batch_size=args.batch_size,
@@ -122,6 +124,7 @@ def main():
     )
     ep.add_argument("--start")
     ep.add_argument("--end")
+    ep.add_argument("--ts-code", help="Process only this stock (e.g. 000001.SZ)")
     ep.add_argument("--batch-size", type=int, default=100)
     ep.add_argument("--force-full", action="store_true")
 

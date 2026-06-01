@@ -22,7 +22,7 @@ class VolumeCalculator:
         for ts_code in ts_codes:
             df = self.con.execute(f"""
                 SELECT trade_date, vol FROM {self.src_table}
-                WHERE ts_code = ? AND is_suspended = 0
+                WHERE ts_code = ? {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}
                 ORDER BY trade_date
             """, (ts_code,)).df()
             if df.empty or len(df) < 5:

@@ -13,6 +13,8 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
         con.execute("DELETE FROM dwd_daily_quote")
         code_filter = ""
         params = []
+    elif len(ts_codes) == 0:
+        return 0  # nothing to do
     else:
         placeholders = ",".join(["?" for _ in ts_codes])
         con.execute(f"DELETE FROM dwd_daily_quote WHERE ts_code IN ({placeholders})", ts_codes)
@@ -99,6 +101,8 @@ def build_dwd_weekly_quote(con, ts_codes=None) -> int:
         con.execute("DELETE FROM dwd_weekly_quote")
         ts_code_filter = ""
         params = []
+    elif len(ts_codes) == 0:
+        return 0
     else:
         placeholders = ",".join(["?" for _ in ts_codes])
         con.execute(
@@ -167,6 +171,8 @@ def build_dwd_daily_moneyflow(con, ts_codes=None) -> int:
         con.execute("DELETE FROM dwd_daily_moneyflow")
         ts_code_filter = ""
         params = []
+    elif len(ts_codes) == 0:
+        return 0
     else:
         placeholders = ",".join(["?" for _ in ts_codes])
         con.execute(

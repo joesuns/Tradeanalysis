@@ -8,6 +8,7 @@ Usage:
 """
 
 import logging
+from typing import Optional
 from datetime import datetime
 
 from backend.db.connection import get_connection, check_connectivity, run_checkpoint
@@ -29,8 +30,8 @@ CALCULATORS = [MACDCalculator, MACalculator, KPatternCalculator,
                DDECalculator, VolumeCalculator]
 
 
-def run_etl(step: str = "build-all", ts_codes: list[str] | None = None,
-            start: str | None = None, end: str | None = None,
+def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
+            start: Optional[str] = None, end: Optional[str] = None,
             batch_size: int = 100, force_full: bool = False):
     """Run the ETL pipeline.
 
@@ -38,9 +39,9 @@ def run_etl(step: str = "build-all", ts_codes: list[str] | None = None,
     ----------
     step : str
         One of "fetch-ods", "build-dim", "build-dwd", "calc-dws", "build-all".
-    ts_codes : list[str] | None
+    ts_codes : Optional[list[str]]
         Stock codes to process. If None, all active codes are used.
-    start, end : str | None
+    start, end : Optional[str]
         Date range in YYYYMMDD format for fetch step.
     batch_size : int
         Number of stocks per batch (default 100).
@@ -62,6 +63,14 @@ def run_etl(step: str = "build-all", ts_codes: list[str] | None = None,
         # 1. Determine what to run
         if step in ("fetch-ods", "build-all"):
             client = TushareClient()
+            # Fetch stock_basic first (needed for get_all_active_codes)
+            from backend.fetch.ods_stock_basic import fetch_stock_basic
+            from backend.fetch.ods_trade_cal import fetch_trade_cal
+            if ts_codes is None:
+                n = fetch_stock_basic(client, con)
+                log_etl(con, "fetch_stock_basic", "success", row_count=n)
+                n = fetch_trade_cal(client, con)
+                log_etl(con, "fetch_trade_cal", "success", row_count=n)
             codes = ts_codes or get_all_active_codes(con)
             for i in range(0, len(codes), batch_size):
                 batch = codes[i:i + batch_size]
