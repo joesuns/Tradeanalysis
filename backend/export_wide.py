@@ -116,10 +116,13 @@ def export_wide_to_excel(
     if df_index is not None and len(df_index) > 0:
         _write_sheet(wb, "上证指数", df_index)
 
+    import os
     # Auto-timestamp filename if not specified
     if not output_path or output_path == "analysis.xlsx":
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"analysis_{ts}.xlsx"
+        output_dir = "exports"
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = f"{output_dir}/analysis_{ts}.xlsx"
 
     wb.save(output_path)
     return len(df_stocks) + (len(df_index) if df_index is not None else 0)

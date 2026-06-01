@@ -7,3 +7,4 @@ __pycache__/
 *.xlsx
 .pytest_cache/
 venv/
+exports/*.xlsx
