@@ -16,8 +16,8 @@ from backend.etl.error_handler import log_etl, check_data_completeness
 from backend.fetch.client import TushareClient
 from backend.fetch.ods_daily import fetch_daily_batch, get_all_active_codes
 from backend.fetch.ods_moneyflow import fetch_moneyflow_batch
-from backend.etl.build_dim import build_dim_stock, build_dim_date
-from backend.etl.build_dwd import build_dwd_daily_quote, build_dwd_daily_moneyflow
+from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
+from backend.etl.build_dwd import build_dwd_daily_quote, build_dwd_daily_moneyflow, build_dwd_weekly_quote
 from backend.etl.calc_macd import MACDCalculator
 from backend.etl.calc_ma import MACalculator
 from backend.etl.calc_kpattern import KPatternCalculator
@@ -63,14 +63,20 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
         # 1. Determine what to run
         if step in ("fetch-ods", "build-all"):
             client = TushareClient()
-            # Fetch stock_basic first (needed for get_all_active_codes)
+            # Global dimension data — always needed regardless of --ts-code
             from backend.fetch.ods_stock_basic import fetch_stock_basic
             from backend.fetch.ods_trade_cal import fetch_trade_cal
-            if ts_codes is None:
-                n = fetch_stock_basic(client, con)
-                log_etl(con, "fetch_stock_basic", "success", row_count=n)
-                n = fetch_trade_cal(client, con)
-                log_etl(con, "fetch_trade_cal", "success", row_count=n)
+            from backend.fetch.ods_concept import fetch_concept_detail
+            n = fetch_stock_basic(client, con)
+            log_etl(con, "fetch_stock_basic", "success", row_count=n)
+            n = fetch_trade_cal(client, con)
+            log_etl(con, "fetch_trade_cal", "success", row_count=n)
+            try:
+                n = fetch_concept_detail(client, con)
+                log_etl(con, "fetch_concept_detail", "success", row_count=n)
+            except Exception as e:
+                log_etl(con, "fetch_concept_detail", "degraded",
+                        error_msg=f"concept_detail requires per-concept calls, skipped: {e}")
             codes = ts_codes or get_all_active_codes(con)
             for i in range(0, len(codes), batch_size):
                 batch = codes[i:i + batch_size]
@@ -100,11 +106,15 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             log_etl(con, "build_dim_stock", "success", row_count=n)
             n = build_dim_date(con)
             log_etl(con, "build_dim_date", "success", row_count=n)
+            nc, nm = build_dim_concept(con)
+            log_etl(con, "build_dim_concept", "success", row_count=nc + nm)
 
         if step in ("build-dwd", "build-all"):
             codes = ts_codes or get_all_active_codes(con)
             n = build_dwd_daily_quote(con, codes)
             log_etl(con, "build_dwd_daily", "success", row_count=n)
+            n = build_dwd_weekly_quote(con, codes)
+            log_etl(con, "build_dwd_weekly", "success", row_count=n)
             n = build_dwd_daily_moneyflow(con, codes)
             log_etl(con, "build_dwd_moneyflow", "success", row_count=n)
 
