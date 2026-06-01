@@ -1,0 +1,45 @@
+from backend.db.schema import create_all_tables
+
+
+def test_build_dim_stock_exchange_mapping(temp_db):
+    create_all_tables(temp_db)
+    temp_db.execute("INSERT INTO ods_stock_basic (ts_code,symbol,name,exchange) VALUES ('000001.SZ','000001','平安银行','SZSE')")
+    temp_db.execute("INSERT INTO ods_stock_basic (ts_code,symbol,name,exchange) VALUES ('600001.SH','600001','上证测试','SSE')")
+
+    from backend.etl.build_dim import build_dim_stock
+    n = build_dim_stock(temp_db)
+    assert n == 2
+    row = temp_db.execute("SELECT exchange, sector, stock_code FROM dim_stock WHERE ts_code='000001.SZ'").fetchone()
+    assert row[0] == "深圳"
+    assert row[1] == "主板"
+    assert row[2] == "000001"
+
+
+def test_build_dim_stock_st_detection(temp_db):
+    create_all_tables(temp_db)
+    temp_db.execute("INSERT INTO ods_stock_basic (ts_code,symbol,name,exchange) VALUES ('000001.SZ','000001','*ST平安','SZSE')")
+
+    from backend.etl.build_dim import build_dim_stock
+    build_dim_stock(temp_db)
+    row = temp_db.execute("SELECT is_st FROM dim_stock WHERE ts_code='000001.SZ'").fetchone()
+    assert row[0] == 1
+
+
+def test_build_dim_date(temp_db):
+    create_all_tables(temp_db)
+    temp_db.execute("INSERT INTO ods_trade_cal (cal_date,is_open) VALUES ('20260101',1),('20260102',1)")
+
+    from backend.etl.build_dim import build_dim_date
+    n = build_dim_date(temp_db)
+    assert n == 2
+
+
+def test_build_dim_concept(temp_db):
+    create_all_tables(temp_db)
+    temp_db.execute("INSERT INTO dim_stock (ts_code,stock_code,symbol,name,exchange) VALUES ('000001.SZ','000001','000001','平安银行','深圳')")
+    temp_db.execute("INSERT INTO ods_concept_detail (concept_name,ts_code) VALUES ('人工智能','000001.SZ')")
+
+    from backend.etl.build_dim import build_dim_concept
+    c, m = build_dim_concept(temp_db)
+    assert c == 1
+    assert m == 1
