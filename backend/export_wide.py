@@ -193,13 +193,13 @@ def _get_col_group(col_name: str):
 
 # Apple-style subtle group header tints (very light, low saturation)
 _GROUP_TINTS = {
-    "identity": "D6E4F0",  # light blue
-    "price":    "D5ECD5",  # light green
-    "macd":     "FDE4C8",  # light warm
-    "ma":       "E3D7ED",  # light purple
-    "dde":      "C5E2E2",  # light teal
-    "volume":   "FADCC8",  # light brown
-    "kline":    "F8D0D0",  # light rose
+    "identity": "2C3E50",  # dark navy
+    "price":    "1A5276",  # deep blue
+    "macd":     "6C3483",  # deep purple
+    "ma":       "117864",  # dark green
+    "dde":      "7D6608",  # dark gold
+    "volume":   "935116",  # dark amber
+    "kline":    "922B21",  # dark burgundy
 }
 
 
@@ -209,9 +209,9 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
     ws = wb.create_sheet(title=sheet_name)
 
     # ── Apple-style clean design ──
-    default_fill = PatternFill(start_color="F5F5F7", end_color="F5F5F7", fill_type="solid")
-    header_font = Font(name="微软雅黑", bold=True, color="1D1D1F", size=10)
-    header_border = Border(bottom=Side(style="medium", color="8E8E93"))
+    default_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    header_font = Font(name="微软雅黑", color="FFFFFF", size=10)
+    header_border = Border(bottom=Side(style="medium", color="5D6D7E"))
     data_font = Font(name="微软雅黑", size=10, color="1D1D1F")
     thin_border = Border(
         left=Side(style="thin", color="E5E5EA"),
