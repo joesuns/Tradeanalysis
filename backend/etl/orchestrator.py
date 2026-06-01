@@ -71,13 +71,9 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             log_etl(con, "fetch_stock_basic", "success", row_count=n)
             n = fetch_trade_cal(client, con)
             log_etl(con, "fetch_trade_cal", "success", row_count=n)
-            try:
-                n = fetch_concept_detail(client, con)
-                log_etl(con, "fetch_concept_detail", "success", row_count=n)
-            except Exception as e:
-                log_etl(con, "fetch_concept_detail", "degraded",
-                        error_msg=f"concept_detail requires per-concept calls, skipped: {e}")
             codes = ts_codes or get_all_active_codes(con)
+            n = fetch_concept_detail(client, con, ts_codes=codes)
+            log_etl(con, "fetch_concept_detail", "success", row_count=n)
             for i in range(0, len(codes), batch_size):
                 batch = codes[i:i + batch_size]
                 rows, failed = fetch_daily_batch(

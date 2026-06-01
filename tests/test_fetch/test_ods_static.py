@@ -59,5 +59,5 @@ def test_fetch_concept_detail(db_with_schema, monkeypatch):
         from backend.fetch.client import TushareClient
         from backend.db.schema import create_all_tables
         create_all_tables(db_with_schema)
-        n = fetch_concept_detail(TushareClient(), db_with_schema)
+        n = fetch_concept_detail(TushareClient(), db_with_schema, ts_codes=["000001.SZ"])
         assert n == 1
