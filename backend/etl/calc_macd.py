@@ -43,7 +43,8 @@ class MACDCalculator:
         df["zone"] = df["macd_bar"].apply(
             lambda x: "bull" if x > 0 else ("bear" if x < 0 else None)
         )
-        df["trend"] = self._compute_trend(df["macd_bar"].values)
+        window = 4 if self.freq == "weekly" else 20
+        df["trend"] = self._compute_trend(df["macd_bar"].values, window=window)
         df["divergence"] = self._compute_divergence(df)
         df["turning_point"] = self._compute_turning_points(df)
         df["alert"] = self._compute_alerts(df)
@@ -61,7 +62,7 @@ class MACDCalculator:
                 continue
             segment = bar[i - window + 1:i + 1]
             valid = segment[~np.isnan(segment)]
-            if len(valid) < 10:
+            if len(valid) < window:
                 continue
             slope = linear_regression_slope(valid)
             if slope > 0.0005:
