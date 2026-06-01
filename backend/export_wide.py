@@ -413,8 +413,21 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
     blue = PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
 
-    # Indicator group tints — high contrast, medium brightness, business palette
-    _TINTS = {"MACD": "8E44AD", "MA": "2980B9", "DDE": "D35400", "K线": "C0392B", "量": "27AE60", "default": "7F8C8D"}
+    # Indicator group colors — precise prefix match on English column names
+    _GROUP_COLORS = {
+        "kpattern": "C0392B",
+        "ema_": "8E44AD", "macd_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
+        "ma_": "2980B9", "bias_": "2980B9", "ma5_": "2980B9", "ma10_": "2980B9",
+        "dde_": "D35400", "ddx": "D35400", "net_mf": "D35400",
+        "vol_": "27AE60", "pct_vol": "27AE60", "ma_vol_": "27AE60",
+    }
+    _DEFAULT_COLOR = "7F8C8D"
+
+    def _color_for(col_eng: str) -> str:
+        for prefix, color in _GROUP_COLORS.items():
+            if col_eng.startswith(prefix):
+                return color
+        return _DEFAULT_COLOR
 
     # ── Row 1: Group labels ──
     daily_start = n_basic + 1
@@ -450,10 +463,8 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     # ── Row 2: Indicator column names ──
     for i, name in enumerate(daily_names):
         c = daily_start + i
-        tint = _TINTS["default"]
-        for key, color in _TINTS.items():
-            if key != "default" and (name.startswith(key) or key in name):
-                tint = color; break
+        eng = daily_signal[i]  # original English name for precise color matching
+        tint = _color_for(eng)
         cell = ws.cell(row=2, column=c, value=name)
         cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
@@ -462,10 +473,8 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
 
     for i, name in enumerate(weekly_names):
         c = weekly_start + i
-        tint = _TINTS["default"]
-        for key, color in _TINTS.items():
-            if key != "default" and (name.startswith(key) or key in name):
-                tint = color; break
+        eng = weekly_signal[i]  # original English name for precise color matching
+        tint = _color_for(eng)
         cell = ws.cell(row=2, column=c, value=name)
         cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
