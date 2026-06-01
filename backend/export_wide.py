@@ -121,6 +121,11 @@ def export_wide_to_excel(
     daily_cols = [c for c in daily.columns if c != "freq"]
     weekly_cols = list(weekly.columns)
 
+    # Basic info columns (for both sheets)
+    _ID_COLS = ["ts_code", "trade_date", "stock_code", "stock_name", "exchange", "sector", "industry", "is_st"]
+    _FUND_COLS = ["close", "pct_chg", "vol", "amount", "total_mv", "pe_ttm", "turnover_rate", "volume_ratio"]
+    basic_cols_outer = _ID_COLS + [c for c in _FUND_COLS if c in daily_cols]
+
     # Add __w__ prefix to weekly indicator columns (not ts_code — needed for merge)
     weekly_indicator_cols = [c for c in weekly_cols if c != "ts_code"]
     weekly_renamed = weekly.rename(columns={c: f"__w__{c}" for c in weekly_indicator_cols})
@@ -133,6 +138,16 @@ def export_wide_to_excel(
     wb = Workbook()
     wb.remove(wb.active)
     _write_sheet_merged(wb, "个股分析", merged, daily_cols, weekly_cols)
+
+    # ---- Signal-only analysis sheet ----
+    _SIGNAL_ONLY = {"kpattern", "kpattern_strength",
+                    "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
+                    "ma_alignment", "ma_turning_point",
+                    "dde_trend", "dde_alert", "dde_divergence",
+                    "vol_zone", "vol_trend"}
+    daily_signal_only = [c for c in daily_cols if c in _SIGNAL_ONLY or c in basic_cols_outer]
+    weekly_signal_only = [c for c in weekly_cols if c in _SIGNAL_ONLY]
+    _write_sheet_merged(wb, "综合分析", merged, daily_signal_only, weekly_signal_only)
 
     # ---- SH Index ----
     if include_index:
