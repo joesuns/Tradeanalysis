@@ -14,7 +14,7 @@ class TushareClient:
 
     MAX_RETRIES = 3
     BASE_DELAY = 2  # seconds
-    RATE_LIMIT = 500  # calls per minute
+    RATE_LIMIT = 600  # calls per minute (tested 645/min w/o throttle on 6200pt tier)
 
     def __init__(self):
         ts.set_token(TUSHARE_TOKEN)

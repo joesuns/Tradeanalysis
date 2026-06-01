@@ -71,13 +71,17 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             n = fetch_trade_cal(client, con)
             log_etl(con, "fetch_trade_cal", "success", row_count=n)
             codes = ts_codes or get_all_active_codes(con)
-            n = fetch_concept_detail(client, con, ts_codes=codes)
-            log_etl(con, "fetch_concept_detail", "success", row_count=n)
-            # Date-based batch fetch: 4 API calls per trading day for ALL stocks
+            # Date-based batch fetch FIRST — 4 API calls/day for ALL stocks (~30s)
             rows = fetch_by_date_range_parallel(
                 start or "20150101", end or "20991231", workers=3)
-            log_etl(con, "fetch_market_data",
-                    "success", row_count=rows)
+            log_etl(con, "fetch_market_data", "success", row_count=rows)
+            # Concept detail LAST — per-stock calls, low priority, skip on failure
+            try:
+                n = fetch_concept_detail(client, con, ts_codes=codes)
+                log_etl(con, "fetch_concept_detail", "success", row_count=n)
+            except Exception as e:
+                log_etl(con, "fetch_concept_detail", "degraded",
+                        error_msg=f"skipped (rate limited): {e}")
 
         if step in ("build-dim", "build-all"):
             n = build_dim_stock(con)
