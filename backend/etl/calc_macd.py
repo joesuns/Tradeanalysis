@@ -64,10 +64,10 @@ class MACDCalculator:
             valid = segment[~np.isnan(segment)]
             if len(valid) < window:
                 continue
-            slope = linear_regression_slope(valid)
-            if slope > 0.0005:
+            slope = linear_regression_slope(valid, use_log=False)
+            if slope > 0.5:
                 result[i] = "up"
-            elif slope < -0.0005:
+            elif slope < -0.5:
                 result[i] = "down"
             else:
                 result[i] = "flat"
