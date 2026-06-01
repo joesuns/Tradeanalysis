@@ -90,13 +90,13 @@ class MACDCalculator:
         return result
 
     def _compute_alerts(self, df: pd.DataFrame) -> list:
-        """Upturn/downturn reverse and flat alerts."""
+        """Upturn/downturn reverse alerts based on most recent 3 comparisons."""
         result = [None] * len(df)
         bar = df["macd_bar"].values
         for i in range(4, len(df)):
-            # Check if previous 3 days were trending up
-            prev_up = all(bar[i - 3 - j] > bar[i - 4 - j] for j in range(3))
-            prev_down = all(bar[i - 3 - j] < bar[i - 4 - j] for j in range(3))
+            # Check the most recent 3 consecutive comparisons
+            prev_up = all(bar[i - 1 - j] > bar[i - 2 - j] for j in range(3))
+            prev_down = all(bar[i - 1 - j] < bar[i - 2 - j] for j in range(3))
             if prev_up and bar[i] < bar[i - 1]:
                 result[i] = "upturn_reverse"
             elif prev_down and bar[i] > bar[i - 1]:

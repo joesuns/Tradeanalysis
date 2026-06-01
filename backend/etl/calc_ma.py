@@ -34,9 +34,9 @@ class MACalculator:
         # Bias (乖离率): (close - MA) / MA * 100
         df["bias_ma5"] = (c - df["ma_5"].values) / df["ma_5"].values * 100.0
         df["bias_ma10"] = (c - df["ma_10"].values) / df["ma_10"].values * 100.0
-        # Slope: 3-day rate of change of the MA line
-        df["ma5_slope"] = df["ma_5"].diff(3) / df["ma_5"].shift(3) * 100.0
-        df["ma10_slope"] = df["ma_10"].diff(3) / df["ma_10"].shift(3) * 100.0
+        # Slope: 2-day rate of change of the MA line
+        df["ma5_slope"] = df["ma_5"].diff(2) / df["ma_5"].shift(2) * 100.0
+        df["ma10_slope"] = df["ma_10"].diff(2) / df["ma_10"].shift(2) * 100.0
         df["alignment"] = self._compute_alignment(df)
         df["turning_point"] = self._compute_turning_points(df)
         return df
@@ -56,9 +56,9 @@ class MACalculator:
             if pd.isna(s5[i]) or pd.isna(s10[i]):
                 continue
 
-            # Tangle: near cross (gap < 3% of MA10)
+            # Tangle: near cross (gap < 3% of MA10, with epsilon for float boundary)
             gap = abs(ma5[i] - ma10[i]) / ma10[i] if ma10[i] != 0 else 0
-            if gap < 0.03:
+            if gap < 0.0299:
                 result[i] = "tangle"
                 continue
 

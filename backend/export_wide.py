@@ -163,7 +163,7 @@ def _translate_df(df: "pd.DataFrame") -> "pd.DataFrame":
 def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
     """Reorder columns: signal columns follow identity columns, numeric columns behind.
     Drops the 'freq' column (redundant — sheet name already indicates daily/weekly)."""
-    df = df.drop(columns=["freq"], errors="ignore")
+    df = df.drop(columns=["freq", "周期"], errors="ignore")
     head = [
         "trade_date", "ts_code", "stock_code", "stock_name", "exchange",
         "sector", "industry", "is_st", "close", "pct_chg",
