@@ -13,6 +13,54 @@ INDEX_VIEW_MAP = {
     "weekly": "v_ads_index_wide_weekly",
 }
 
+# Column name translations (English → Chinese)
+_COL_NAMES = {
+    "freq": "周期", "trade_date": "交易日期", "ts_code": "股票代码",
+    "stock_code": "代码", "stock_name": "股票名称", "exchange": "交易所",
+    "sector": "板块", "industry": "行业", "is_st": "ST",
+    "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量", "amount": "成交额",
+    "total_mv": "总市值", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
+    "kpattern": "K线形态", "kpattern_strength": "形态强度",
+    "ema_12": "EMA12", "ema_26": "EMA26", "dif": "DIF", "dea": "DEA",
+    "macd_bar": "MACD柱", "macd_divergence": "MACD背离", "macd_zone": "MACD区域",
+    "macd_turning_point": "MACD转折", "macd_alert": "MACD警惕", "macd_trend": "MACD趋势",
+    "ma_5": "MA5", "ma_10": "MA10",
+    "bias_ma5": "MA5乖离率", "bias_ma10": "MA10乖离率",
+    "ma5_slope": "MA5斜率", "ma10_slope": "MA10斜率",
+    "ma_alignment": "均线形态", "ma_turning_point": "均线转折",
+    "net_mf_amount": "主力净流入", "ddx": "DDX", "ddx2": "DDX2",
+    "dde_trend": "DDE趋势", "dde_alert": "DDE警惕", "dde_divergence": "DDE背离",
+    "ma_vol_5": "5日均量", "pct_vol_rank": "量能百分位",
+    "vol_zone": "量能区域", "vol_trend": "量能趋势",
+}
+
+# Enum value translations (English → Chinese). NULL = no signal, shown as "-"
+_ENUM_VALUES = {
+    "kpattern": {"yang_bao_yin": "阳包阴", "yang_ke_yin": "阳克阴",
+                 "yin_bao_yang": "阴包阳", "yin_ke_yang": "阴克阳",
+                 "mu_bei_xian": "墓碑线", "bi_lei_zhen": "避雷针",
+                 "gao_kai_chang_yin": "高开长阴"},
+    "macd_zone": {"bull": "多头", "bear": "空头"},
+    "macd_trend": {"up": "上升", "down": "下降", "flat": "走平"},
+    "macd_turning_point": {"golden_cross": "金叉", "dead_cross": "死叉",
+                           "near_golden": "近金叉", "near_dead": "近死叉"},
+    "macd_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
+    "macd_alert": {"upturn_reverse": "上升拐头", "downturn_reverse": "下降拐头",
+                   "upturn_flat": "上升走平", "downturn_flat": "下降走平"},
+    "ma_turning_point": {"golden_cross": "金叉", "dead_cross": "死叉",
+                         "near_golden": "近金叉", "near_dead": "近死叉"},
+    "dde_trend": {"up": "上升", "down": "下降", "flat": "走平"},
+    "dde_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
+    "dde_alert": {"upturn_reverse": "上升拐头", "downturn_reverse": "下降拐头",
+                  "upturn_flat": "上升走平", "downturn_flat": "下降走平"},
+    "vol_zone": {"explosive": "爆量", "low_volume": "地量", "normal": "正常"},
+    "vol_trend": {"expanding": "放量", "shrinking": "缩量", "flat": "平量"},
+}
+
+# Signal columns — NULL means "no signal today" (shown as "-")
+_SIGNAL_COLS = {"kpattern", "kpattern_strength", "macd_divergence", "macd_turning_point",
+                "macd_alert", "ma_turning_point", "dde_alert", "dde_divergence"}
+
 
 def export_wide_to_excel(
     db_path: str,
@@ -39,6 +87,7 @@ def export_wide_to_excel(
     if filter_st:
         sql_stocks += " AND is_st = 0"
     df_stocks = con.execute(sql_stocks, params).df()
+    df_stocks = _translate_df(df_stocks)
     df_stocks = _reorder_signal_first(df_stocks)
 
     # ---- Sheet 2: SH Index (optional) ----
@@ -48,6 +97,7 @@ def export_wide_to_excel(
         df_index = con.execute(
             f"SELECT * FROM {index_view} WHERE trade_date = ?", [trade_date]
         ).df()
+        df_index = _translate_df(df_index)
         df_index = _reorder_signal_first(df_index)
 
     con.close()
@@ -63,6 +113,26 @@ def export_wide_to_excel(
 
     wb.save(output_path)
     return len(df_stocks) + (len(df_index) if df_index is not None else 0)
+
+
+def _translate_df(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Translate column names to Chinese, enum values to Chinese, NULL signals to '-'."""
+    # 1. Rename columns
+    df = df.rename(columns={c: _COL_NAMES.get(c, c) for c in df.columns})
+
+    # 2. Translate enum values
+    for col, mapping in _ENUM_VALUES.items():
+        cn_col = _COL_NAMES.get(col, col)
+        if cn_col in df.columns:
+            df[cn_col] = df[cn_col].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
+
+    # 3. NULL in signal columns → "-" (means "no signal today")
+    for col in _SIGNAL_COLS:
+        cn_col = _COL_NAMES.get(col, col)
+        if cn_col in df.columns:
+            df[cn_col] = df[cn_col].fillna("-")
+
+    return df
 
 
 def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -113,44 +183,36 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
         for col_idx, value in enumerate(row, 1):
             ws.cell(row=row_idx, column=col_idx, value=value)
 
-    # Signal highlights: K-line pattern (single enum column)
+    # Signal highlights: K-line pattern (by Chinese value)
     kpattern_colors = {
-        "yang_bao_yin": green,
-        "yang_ke_yin": green,
-        "mu_bei_xian": red,
-        "bi_lei_zhen": red,
-        "gao_kai_chang_yin": red,
-        "yin_bao_yang": red,
-        "yin_ke_yang": red,
+        "阳包阴": green, "阳克阴": green,
+        "墓碑线": red, "避雷针": red, "高开长阴": red,
+        "阴包阳": red, "阴克阳": red,
     }
-    if "kpattern" in df.columns:
-        col_idx = list(df.columns).index("kpattern") + 1
+    if "K线形态" in df.columns:
+        col_idx = list(df.columns).index("K线形态") + 1
         for row_idx in range(2, len(df) + 2):
             val = ws.cell(row=row_idx, column=col_idx).value
             if val in kpattern_colors:
                 ws.cell(row=row_idx, column=col_idx).fill = kpattern_colors[val]
 
-    # Signal highlights: text enum columns (by value match)
+    # Signal highlights: by Chinese column name + Chinese value
     text_signal_cols = {
-        "macd_turning_point": {"golden_cross": green, "dead_cross": red},
-        "macd_zone": {"bull": green, "bear": red},
-        "macd_divergence": {"top_divergence": red, "bottom_divergence": green},
-        "ma_alignment": {
-            "多头强势": green,
-            "多头初建": green,
-            "多头衰竭": blue,
-            "多头翻转": blue,
-            "空头强势": red,
-            "空头初建": red,
-            "空头衰竭": blue,
-            "空头翻转": blue,
+        "MACD转折": {"金叉": green, "死叉": red},
+        "MACD区域": {"多头": green, "空头": red},
+        "MACD背离": {"顶背离": red, "底背离": green},
+        "均线形态": {
+            "多头强势": green, "多头初建": green,
+            "多头衰竭": blue, "多头翻转": blue,
+            "空头强势": red, "空头初建": red,
+            "空头衰竭": blue, "空头翻转": blue,
             "均线缠绕": blue,
         },
-        "ma_turning_point": {"golden_cross": green, "dead_cross": red},
-        "dde_trend": {"up": green, "down": red},
-        "dde_divergence": {"top_divergence": red, "bottom_divergence": green},
-        "vol_zone": {"explosive": red, "low_volume": blue},
-        "vol_trend": {"expanding": green, "shrinking": red},
+        "均线转折": {"金叉": green, "死叉": red},
+        "DDE趋势": {"上升": green, "下降": red},
+        "DDE背离": {"顶背离": red, "底背离": green},
+        "量能区域": {"爆量": red, "地量": blue},
+        "量能趋势": {"放量": green, "缩量": red},
     }
     for col_name, value_colors in text_signal_cols.items():
         if col_name in df.columns:
