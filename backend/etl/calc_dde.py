@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 from backend.etl.base import ema, to_float_safe, linear_regression_slope
@@ -65,7 +67,18 @@ class DDECalculator:
         for i, week_end in enumerate(week_dates):
             # Determine the start of this week's daily range
             if i == 0:
-                # First week: look back ~7 calendar days from week_end
+                week_start = week_end  # first week: just that day's range
+            else:
+                week_start = week_dates[i - 1]
+
+            # Compute 7-day lookback for first week's expected_days query
+            if i == 0:
+                we_dt = datetime.strptime(week_end, "%Y%m%d")
+                week_start_7d = (we_dt - timedelta(days=7)).strftime("%Y%m%d")
+            else:
+                week_start_7d = week_start
+
+            if i == 0:
                 agg = self.con.execute(f"""
                     SELECT
                         SUM(mf.buy_lg_vol) AS buy_lg_vol,
@@ -78,12 +91,11 @@ class DDECalculator:
                     FROM {self.src_table} mf
                     JOIN dwd_daily_quote q ON mf.ts_code = q.ts_code AND mf.trade_date = q.trade_date
                     WHERE mf.ts_code = ?
-                      AND mf.trade_date > (SELECT STRFTIME(CAST(? AS DATE) - INTERVAL 7 DAY))
+                      AND mf.trade_date > ?
                       AND mf.trade_date <= ?
                       AND q.is_suspended = 0
-                """, (ts_code, week_end, week_end)).fetchone()
+                """, (ts_code, week_start_7d, week_end)).fetchone()
             else:
-                week_start = week_dates[i - 1]
                 agg = self.con.execute(f"""
                     SELECT
                         SUM(mf.buy_lg_vol) AS buy_lg_vol,
@@ -109,17 +121,10 @@ class DDECalculator:
                 continue
 
             # 查该周应有交易日数（考虑假期），对比 moneyflow 覆盖
-            if i == 0:
-                expected_days = self.con.execute("""
-                    SELECT COUNT(*) FROM dim_date
-                    WHERE trade_date > (SELECT STRFTIME(CAST(? AS DATE) - INTERVAL 7 DAY))
-                      AND trade_date <= ? AND is_trade_day = 1
-                """, (week_end, week_end)).fetchone()[0]
-            else:
-                expected_days = self.con.execute("""
-                    SELECT COUNT(*) FROM dim_date
-                    WHERE trade_date > ? AND trade_date <= ? AND is_trade_day = 1
-                """, (week_start, week_end)).fetchone()[0]
+            expected_days = self.con.execute("""
+                SELECT COUNT(*) FROM dim_date
+                WHERE trade_date > ? AND trade_date <= ? AND is_trade_day = 1
+            """, (week_start_7d, week_end)).fetchone()[0]
 
             active_days = agg[6] if agg[6] else 0
             skip_dde = False
