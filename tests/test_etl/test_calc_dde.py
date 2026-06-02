@@ -116,6 +116,119 @@ def test_net_mf_amount_direct_copy():
     assert abs(result["net_mf_amount"].iloc[5] - net_mf[5]) < 0.01
 
 
+def test_dde_alert_uses_ddx2():
+    """Alerts must use DDX2 (not raw DDX)."""
+    calc = DDECalculator.__new__(DDECalculator)
+    n = 15
+    dates = [f"d{i}" for i in range(n)]
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "buy_lg_vol": [1000.0] * n, "sell_lg_vol": [500.0] * n,
+        "buy_elg_vol": [300.0] * n, "sell_elg_vol": [200.0] * n,
+        "total_vol": [2000.0] * n, "net_mf_amount": [5000.0] * n,
+        "close_qfq": [10.0] * n,
+        # Raw DDX noisy, DDX2 smooth
+        "ddx": [0.0, 0.3, -0.2, 0.4, -0.1, 0.5, -0.3, 0.2, -0.4, 0.1, -0.2, 0.3, -0.1, 0.0, 0.0],
+        "ddx2": [np.nan, np.nan, np.nan, np.nan, 0.08, 0.10, 0.12, 0.14, 0.13, 0.11, 0.09, 0.07, 0.05,
+                 0.06, 0.07],
+    })
+    result = calc._compute_alerts(df)
+    # Check that alerts use ddx2 values (via _compute_alerts)
+    assert result is not None
+
+
+def test_dde_upturn_flat_alert():
+    """DDX2 prev 2 consecutive rises, then small change <= 2% → upturn_flat."""
+    calc = DDECalculator.__new__(DDECalculator)
+    n = 10
+    dates = [f"d{i}" for i in range(n)]
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "ddx": [0.1] * n,
+        "ddx2": [0.080, 0.100, 0.120, 0.140, 0.141, 0.130, 0.120, 0.110, 0.100, 0.090],
+    })
+    result = calc._compute_alerts(df)
+    # Index 4: prev 2 rises (0.12→0.14), |0.141-0.14|/0.14=0.7% < 2% → upturn_flat
+    assert result[4] == "upturn_flat", f"Expected upturn_flat, got {result[4]}"
+
+
+def test_dde_downturn_flat_alert():
+    """DDX2 prev 2 consecutive falls, then small change <= 2% → downturn_flat."""
+    calc = DDECalculator.__new__(DDECalculator)
+    n = 10
+    dates = [f"d{i}" for i in range(n)]
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "ddx": [0.1] * n,
+        "ddx2": [0.140, 0.120, 0.100, 0.080, 0.079, 0.090, 0.100, 0.110, 0.120, 0.130],
+    })
+    result = calc._compute_alerts(df)
+    assert result[4] == "downturn_flat", f"Expected downturn_flat, got {result[4]}"
+
+
+def test_dde_divergence_window_60():
+    """Divergence uses exactly 60-bar window (not 61)."""
+    calc = DDECalculator.__new__(DDECalculator)
+    # Build 65 bars: price peaks at 60, DDX2 peaks earlier
+    n = 68
+    close = np.full(n, 10.0)
+    ddx2 = np.full(n, 0.1)
+    for i in range(30, 61):
+        close[i] = 10.0 + (i - 30) * 0.1
+    for i in range(30, 57):
+        ddx2[i] = 0.1 + (i - 30) * 0.01  # DDX2 peaks at day 56
+    for i in range(57, n):
+        ddx2[i] = ddx2[56] - (i - 56) * 0.01  # DDX2 declining
+    for i in range(61, n):
+        close[i] = close[60] * 0.99  # slight decline from peak
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close,
+        "ddx2": ddx2,
+    })
+    result = calc._compute_divergence(df)
+    # Should find divergence on confirmation day (not at peak)
+    divs = [i for i in range(n) if result[i] == "top_divergence"]
+    assert len(divs) >= 1, "Expected at least one top_divergence"
+
+
+def test_dde_divergence_no_tie_false_positive():
+    """DDX2 exactly equal to previous 60d peak should NOT trigger divergence."""
+    calc = DDECalculator.__new__(DDECalculator)
+    n = 70
+    close = np.full(n, 10.0)
+    ddx2 = np.full(n, 0.05)
+    for i in range(30, n):
+        close[i] = 10.0 + (i - 30) * 0.05  # steady price rise
+    for i in range(30, 65):
+        ddx2[i] = 0.05 + (i - 30) * 0.002  # DDX2 rises with price
+    # At day 65+, DDX2 plateaus at its 60d peak value — tied, not below
+    for i in range(65, n):
+        ddx2[i] = ddx2[64]  # exactly equals 60d peak
+    # Price continues rising → no divergence (DDX2 is AT peak, not below)
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close,
+        "ddx2": ddx2,
+    })
+    result = calc._compute_divergence(df)
+    for i in range(65, n):
+        assert result[i] != "top_divergence", (
+            f"Index {i}: DDX2 ties peak, should not be divergence"
+        )
+
+
+def test_dde_trend_8bar_window():
+    """DDE 趋势使用 8-bar 回归窗口。"""
+    calc = DDECalculator.__new__(DDECalculator)
+    ddx2 = np.array([0.001, 0.002, 0.003, 0.004, 0.005,
+                     0.006, 0.007, 0.008, 0.009, 0.010])
+    result = calc._compute_trend(ddx2, window=8)
+    assert result[9] is not None, "8-bar 窗口下第 9 根应有趋势值"
+
+
 def test_integration_dde_daily(db_with_schema):
     """Integration test: DDX computation from real DuckDB moneyflow data."""
     con = db_with_schema

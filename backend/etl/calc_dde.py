@@ -25,8 +25,6 @@ class DDECalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate DDE indicators for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
-            # Delete old data for this stock+freq to avoid stale non-weekend rows
-            self.con.execute(f"DELETE FROM {self.dws_table} WHERE ts_code = ?", (ts_code,))
             if self.freq == "daily":
                 df = self._load_daily(ts_code)
             else:
@@ -67,21 +65,37 @@ class DDECalculator:
         for i, week_end in enumerate(week_dates):
             # Determine the start of this week's daily range
             if i == 0:
-                week_start = week_end  # first week: just that day's range
+                # First week: look back ~7 calendar days from week_end
+                agg = self.con.execute(f"""
+                    SELECT
+                        SUM(mf.buy_lg_vol) AS buy_lg_vol,
+                        SUM(mf.sell_lg_vol) AS sell_lg_vol,
+                        SUM(mf.buy_elg_vol) AS buy_elg_vol,
+                        SUM(mf.sell_elg_vol) AS sell_elg_vol,
+                        SUM(mf.total_vol) AS total_vol,
+                        SUM(mf.net_mf_amount) AS net_mf_amount
+                    FROM {self.src_table} mf
+                    JOIN dwd_daily_quote q ON mf.ts_code = q.ts_code AND mf.trade_date = q.trade_date
+                    WHERE mf.ts_code = ?
+                      AND mf.trade_date > (SELECT STRFTIME(CAST(? AS DATE) - INTERVAL 7 DAY))
+                      AND mf.trade_date <= ?
+                      AND q.is_suspended = 0
+                """, (ts_code, week_end, week_end)).fetchone()
             else:
                 week_start = week_dates[i - 1]
-
-            agg = self.con.execute(f"""
-                SELECT
-                    SUM(buy_lg_vol) AS buy_lg_vol,
-                    SUM(sell_lg_vol) AS sell_lg_vol,
-                    SUM(buy_elg_vol) AS buy_elg_vol,
-                    SUM(sell_elg_vol) AS sell_elg_vol,
-                    SUM(total_vol) AS total_vol,
-                    SUM(net_mf_amount) AS net_mf_amount
-                FROM {self.src_table}
-                WHERE ts_code = ? AND trade_date > ? AND trade_date <= ?
-            """, (ts_code, week_start, week_end)).fetchone()
+                agg = self.con.execute(f"""
+                    SELECT
+                        SUM(mf.buy_lg_vol) AS buy_lg_vol,
+                        SUM(mf.sell_lg_vol) AS sell_lg_vol,
+                        SUM(mf.buy_elg_vol) AS buy_elg_vol,
+                        SUM(mf.sell_elg_vol) AS sell_elg_vol,
+                        SUM(mf.total_vol) AS total_vol,
+                        SUM(mf.net_mf_amount) AS net_mf_amount
+                    FROM {self.src_table} mf
+                    JOIN dwd_daily_quote q ON mf.ts_code = q.ts_code AND mf.trade_date = q.trade_date
+                    WHERE mf.ts_code = ? AND mf.trade_date > ? AND mf.trade_date <= ?
+                      AND q.is_suspended = 0
+                """, (ts_code, week_start, week_end)).fetchone()
 
             # Also get the close price from weekly quote
             close_row = self.con.execute(f"""
@@ -129,8 +143,8 @@ class DDECalculator:
         # net_mf_amount: direct copy
         df["net_mf_amount"] = df["net_mf_amount"].values.astype(float)
 
-        # Trend: linear regression slope on DDX2
-        trend_window = 10 if self.freq == "daily" else 4
+        # Trend: linear regression slope on DDX2 (8-bar window for both daily and weekly)
+        trend_window = 8
         df["trend"] = self._compute_trend(df["ddx2"].values.astype(float), window=trend_window)
 
         # Divergence: same logic as MACD but using DDX2 instead of DIF
@@ -141,10 +155,10 @@ class DDECalculator:
 
         return df
 
-    def _compute_trend(self, ddx2: np.ndarray, window: int = 20) -> list:
+    def _compute_trend(self, ddx2: np.ndarray, window: int = 8) -> list:
         """DDX2 trend via linear regression slope (same method as volume trend).
-        - up: slope > 0.0005
-        - down: slope < -0.0005
+        - up: slope > 0.0001
+        - down: slope < -0.0001
         - flat: otherwise
         """
         result = [None] * len(ddx2)
@@ -165,14 +179,17 @@ class DDECalculator:
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
-        """Top/bottom divergence using DDX2 vs close over 60-day window."""
-        result = [None] * len(df)
-        w = 60
-        for i in range(w, len(df)):
-            window_close = df["close_qfq"].iloc[i - w:i + 1]
-            window_ddx2 = df["ddx2"].iloc[i - w:i + 1]
+        """Top/bottom divergence using DDX2 vs close over 60-day window.
 
-            # Skip if window has NaN in ddx2
+        Confirmation day: DDX2 has clearly rolled from its 60d peak/valley,
+        but price still near extreme. Dedup: no repeat within 5 bars.
+        """
+        result = [None] * len(df)
+        w = 59  # 60-bar window: iloc[i-59 : i+1] = 60 elements
+        for i in range(w, len(df)):
+            window_close = df["close_qfq"].iloc[i - w : i + 1]
+            window_ddx2 = df["ddx2"].iloc[i - w : i + 1]
+
             if window_ddx2.isna().any():
                 continue
 
@@ -183,37 +200,61 @@ class DDECalculator:
             cur_c = df["close_qfq"].iloc[i]
             cur_d = df["ddx2"].iloc[i]
 
-            if pd.isna(cur_d):
+            if pd.isna(cur_c) or pd.isna(cur_d):
                 continue
 
-            # Top divergence: price at 60d high but DDX2 below 60d peak
-            if cur_c >= c_hi and cur_d < d_hi:
-                ddx2_peak_idx = window_ddx2.idxmax()
-                if ddx2_peak_idx < df.index[i]:
+            # Top divergence: DDX2 peaked in past, has fallen from peak,
+            #                price still near 60d high (within 2%).
+            ddx2_peak_idx = window_ddx2.idxmax()
+            ddx2_fallen = d_hi != 0 and cur_d < d_hi
+            price_near_peak = cur_c >= c_hi * 0.98
+
+            if ddx2_peak_idx < df.index[i] and ddx2_fallen and price_near_peak:
+                recent = any(result[j] == "top_divergence" for j in range(max(0, i - 5), i))
+                if not recent:
                     result[i] = "top_divergence"
 
-            # Bottom divergence: price at 60d low but DDX2 above 60d valley
-            if cur_c <= c_lo and cur_d > d_lo:
-                ddx2_valley_idx = window_ddx2.idxmin()
-                if ddx2_valley_idx < df.index[i]:
+            # Bottom divergence: DDX2 valley in past, has recovered from valley,
+            #                   price still near 60d low (within 2%).
+            ddx2_valley_idx = window_ddx2.idxmin()
+            ddx2_recovered = d_lo != 0 and cur_d > d_lo
+            price_near_bottom = cur_c <= c_lo * 1.02
+
+            if ddx2_valley_idx < df.index[i] and ddx2_recovered and price_near_bottom:
+                recent = any(result[j] == "bottom_divergence" for j in range(max(0, i - 5), i))
+                if not recent:
                     result[i] = "bottom_divergence"
 
         return result
 
     def _compute_alerts(self, df: pd.DataFrame) -> list:
-        """Upturn/downturn reverse alerts using DDX — 2 consecutive comparisons."""
+        """Upturn/downturn reverse + flat alerts using DDX2.
+
+        - reverse: prev 2 consecutive rises/falls, then direction flips
+        - flat: prev 2 consecutive rises/falls, then |change|/|prev| <= 2%
+        Reverse takes priority over flat.
+        """
         result = [None] * len(df)
-        ddx = df["ddx"].values
+        ddx2 = df["ddx2"].values
         for i in range(3, len(df)):
-            prev = ddx[i - 3:i]
+            prev = ddx2[i - 3:i + 1]
             if any(pd.isna(x) for x in prev):
                 continue
-            prev_up = all(prev[j + 1] > prev[j] for j in range(2))
-            prev_down = all(prev[j + 1] < prev[j] for j in range(2))
-            if prev_up and ddx[i] < ddx[i - 1]:
-                result[i] = "upturn_reverse"
-            elif prev_down and ddx[i] > ddx[i - 1]:
-                result[i] = "downturn_reverse"
+
+            prev_up = prev[2] > prev[1] and prev[1] > prev[0]
+            prev_down = prev[2] < prev[1] and prev[1] < prev[0]
+
+            if prev_up:
+                if ddx2[i] < ddx2[i - 1]:
+                    result[i] = "upturn_reverse"
+                elif ddx2[i - 1] != 0 and abs(ddx2[i] - ddx2[i - 1]) / abs(ddx2[i - 1]) <= 0.02:
+                    result[i] = "upturn_flat"
+            elif prev_down:
+                if ddx2[i] > ddx2[i - 1]:
+                    result[i] = "downturn_reverse"
+                elif ddx2[i - 1] != 0 and abs(ddx2[i] - ddx2[i - 1]) / abs(ddx2[i - 1]) <= 0.02:
+                    result[i] = "downturn_flat"
+
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
