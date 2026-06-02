@@ -353,6 +353,9 @@ _ODS_INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_ods_daily_date ON ods_daily(trade_date)",
     "CREATE INDEX IF NOT EXISTS idx_ods_daily_basic_date ON ods_daily_basic(trade_date)",
     "CREATE INDEX IF NOT EXISTS idx_ods_moneyflow_date ON ods_moneyflow(trade_date)",
+    "CREATE INDEX IF NOT EXISTS idx_etl_log_step ON ods_etl_log(step_name)",
+    "CREATE INDEX IF NOT EXISTS idx_etl_log_started ON ods_etl_log(started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_etl_log_status ON ods_etl_log(status)",
 ]
 
 _DIM_INDEX_DDL = [
