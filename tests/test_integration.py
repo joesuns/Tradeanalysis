@@ -127,9 +127,10 @@ def test_ods_etl_log_is_written():
     con = duckdb.connect(db_path)
     try:
         create_all_tables(con)
-        from backend.etl.error_handler import log_etl
+        from backend.etl.error_handler import log_etl_start, log_etl_end
 
-        log_etl(con, "test_step", "success", row_count=42)
+        lid, t0 = log_etl_start(con, "test_step")
+        log_etl_end(con, lid, "test_step", t0, "success", row_count=42)
         row = con.execute(
             "SELECT step_name, status, row_count FROM ods_etl_log "
             "WHERE step_name='test_step'"
