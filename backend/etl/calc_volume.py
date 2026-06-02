@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
+import logging
 from backend.etl.base import sma, linear_regression_slope, to_float_safe
 
+
+logger = logging.getLogger(__name__)
 
 class VolumeCalculator:
     """Volume indicator calculator.
@@ -20,6 +23,7 @@ class VolumeCalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate volume indicators for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
+            logger.debug("%s: processing %s", self.__class__.__name__, ts_code)
             if self.freq == "weekly":
                 df = self.con.execute(f"""
                     SELECT d.trade_date, d.vol FROM {self.src_table} d
@@ -160,18 +164,20 @@ class VolumeCalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
-        for _, row in df.iterrows():
-            self.con.execute(
-                f"""INSERT OR REPLACE INTO {self.dws_table}
-                (ts_code, trade_date, ma_vol_5, pct_vol_rank, zone, trend, calc_date)
-                VALUES (?,?,?,?,?,?,?)""",
-                (
-                    ts_code,
-                    row["trade_date"],
-                    to_float_safe(row.get("ma_vol_5")),
-                    to_float_safe(row.get("pct_vol_rank")),
-                    row.get("zone"),
-                    row.get("trend"),
-                    calc_date,
-                ),
-            )
+        """Batch insert all rows for one stock via DuckDB register."""
+        dws_cols = ["ts_code", "trade_date", "ma_vol_5", "pct_vol_rank",
+                    "zone", "trend", "calc_date"]
+        data_cols = dws_cols[1:]
+        for c in data_cols:
+            if c not in df.columns:
+                df[c] = None
+        batch = df[data_cols].copy()
+        batch["ts_code"] = ts_code
+        for c in ["ma_vol_5", "pct_vol_rank"]:
+            batch[c] = batch[c].apply(to_float_safe)
+        batch["calc_date"] = batch["calc_date"].astype(str)
+        batch = batch[dws_cols]
+        self.con.register("_batch", batch)
+        cols_sql = ", ".join(dws_cols)
+        self.con.execute(f"INSERT OR REPLACE INTO {self.dws_table} ({cols_sql}) SELECT {cols_sql} FROM _batch")
+        self.con.unregister("_batch")

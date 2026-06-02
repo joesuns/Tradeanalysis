@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
+import logging
 from backend.etl.base import ema, to_float_safe, linear_regression_slope
 
+
+logger = logging.getLogger(__name__)
 
 class MACDCalculator:
     """MACD indicator calculator. Works for both daily and weekly frequencies."""
@@ -15,6 +18,7 @@ class MACDCalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate MACD for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
+            logger.debug("%s: processing %s", self.__class__.__name__, ts_code)
             if self.freq == "weekly":
                 df = self.con.execute(f"""
                     SELECT d.trade_date, d.close_qfq FROM {self.src_table} d
@@ -269,26 +273,21 @@ class MACDCalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
-        for _, row in df.iterrows():
-            self.con.execute(
-                f"""INSERT OR REPLACE INTO {self.dws_table}
-                (ts_code, trade_date, ema_12, ema_26, dif, dea, macd_bar,
-                 divergence, zone, turning_point, alert, trend, trend_strength, calc_date)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    ts_code,
-                    row["trade_date"],
-                    to_float_safe(row.get("ema_12")),
-                    to_float_safe(row.get("ema_26")),
-                    to_float_safe(row.get("dif")),
-                    to_float_safe(row.get("dea")),
-                    to_float_safe(row.get("macd_bar")),
-                    row.get("divergence"),
-                    row.get("zone"),
-                    row.get("turning_point"),
-                    row.get("alert"),
-                    row.get("trend"),
-                    to_float_safe(row.get("trend_strength")),
-                    calc_date,
-                ),
-            )
+        """Batch insert all rows for one stock via DuckDB register."""
+        dws_cols = ["ts_code", "trade_date", "ema_12", "ema_26", "dif", "dea",
+                    "macd_bar", "divergence", "zone", "turning_point", "alert",
+                    "trend", "trend_strength", "calc_date"]
+        data_cols = dws_cols[1:]
+        for c in data_cols:
+            if c not in df.columns:
+                df[c] = None
+        batch = df[data_cols].copy()
+        batch["ts_code"] = ts_code
+        for c in ["ema_12", "ema_26", "dif", "dea", "macd_bar", "trend_strength"]:
+            batch[c] = batch[c].apply(to_float_safe)
+        batch["calc_date"] = batch["calc_date"].astype(str)
+        batch = batch[dws_cols]
+        self.con.register("_batch", batch)
+        cols_sql = ", ".join(dws_cols)
+        self.con.execute(f"INSERT OR REPLACE INTO {self.dws_table} ({cols_sql}) SELECT {cols_sql} FROM _batch")
+        self.con.unregister("_batch")

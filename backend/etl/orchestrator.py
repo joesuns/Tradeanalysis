@@ -7,8 +7,11 @@ Usage:
     run_etl(step="calc-dws", ts_codes=["000001.SZ"])  # specific stocks
 """
 
+import logging
 from typing import Optional
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from backend.db.connection import get_connection, check_connectivity, run_checkpoint
 from backend.etl.error_handler import (
@@ -139,12 +142,22 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             lid, t0 = log_etl_start(con, "calc_dws")
             try:
                 calc_date = datetime.now().strftime("%Y%m%d")
+                n_batches = (len(codes) + batch_size - 1) // batch_size
                 for i in range(0, len(codes), batch_size):
                     batch = codes[i:i + batch_size]
+                    batch_num = i // batch_size + 1
+                    logger.info(
+                        "calc_dws batch %d/%d: %d stocks — started",
+                        batch_num, n_batches, len(batch),
+                    )
                     for CalcCls in CALCULATORS:
                         for freq in ("daily", "weekly"):
                             calc = CalcCls(con, freq)
                             calc.calculate(batch, calc_date)
+                    logger.info(
+                        "calc_dws batch %d/%d: %d stocks — done",
+                        batch_num, n_batches, len(batch),
+                    )
                 # Count actual DWS rows written in this run
                 total = 0
                 for CalcCls in CALCULATORS:

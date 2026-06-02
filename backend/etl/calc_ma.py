@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import logging
 from backend.etl.base import sma, to_float_safe, linear_regression_slope
 
 
@@ -20,6 +21,8 @@ def _compute_slope_pct(series: np.ndarray, window: int = 5) -> np.ndarray:
     return result
 
 
+logger = logging.getLogger(__name__)
+
 class MACalculator:
     """Moving Average indicator calculator. Computes MA5, MA10, bias, slope,
     alignment (9-value classification), and turning points (golden/dead cross).
@@ -34,6 +37,7 @@ class MACalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate MA indicators for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
+            logger.debug("%s: processing %s", self.__class__.__name__, ts_code)
             if self.freq == "weekly":
                 df = self.con.execute(f"""
                     SELECT d.trade_date, d.close_qfq FROM {self.src_table} d
@@ -190,23 +194,21 @@ class MACalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
-        for _, row in df.iterrows():
-            self.con.execute(
-                f"""INSERT OR REPLACE INTO {self.dws_table}
-                (ts_code, trade_date, ma_5, ma_10, bias_ma5, bias_ma10,
-                 ma5_slope, ma10_slope, alignment, turning_point, calc_date)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    ts_code,
-                    row["trade_date"],
-                    to_float_safe(row.get("ma_5")),
-                    to_float_safe(row.get("ma_10")),
-                    to_float_safe(row.get("bias_ma5")),
-                    to_float_safe(row.get("bias_ma10")),
-                    to_float_safe(row.get("ma5_slope")),
-                    to_float_safe(row.get("ma10_slope")),
-                    row.get("alignment"),
-                    row.get("turning_point"),
-                    calc_date,
-                ),
-            )
+        """Batch insert all rows for one stock via DuckDB register."""
+        dws_cols = ["ts_code", "trade_date", "ma_5", "ma_10", "bias_ma5",
+                    "bias_ma10", "ma5_slope", "ma10_slope", "alignment",
+                    "turning_point", "calc_date"]
+        data_cols = dws_cols[1:]
+        for c in data_cols:
+            if c not in df.columns:
+                df[c] = None
+        batch = df[data_cols].copy()
+        batch["ts_code"] = ts_code
+        for c in ["ma_5", "ma_10", "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope"]:
+            batch[c] = batch[c].apply(to_float_safe)
+        batch["calc_date"] = batch["calc_date"].astype(str)
+        batch = batch[dws_cols]
+        self.con.register("_batch", batch)
+        cols_sql = ", ".join(dws_cols)
+        self.con.execute(f"INSERT OR REPLACE INTO {self.dws_table} ({cols_sql}) SELECT {cols_sql} FROM _batch")
+        self.con.unregister("_batch")
