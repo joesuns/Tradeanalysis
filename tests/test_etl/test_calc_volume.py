@@ -77,6 +77,30 @@ def test_trend_flat():
     assert flat_count > 0, f"Expected flat trend for constant volume, got: {valid_trends.unique()}"
 
 
+def test_trend_uses_raw_vol():
+    """趋势直接使用原始成交量，10-bar 窗口即可检出 expanding。"""
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+    n = 30
+    dates = [f"d{i}" for i in range(n)]
+    vols = [1000000.0 + i * 100000 for i in range(n)]  # 每日 +10%
+    df = pd.DataFrame({"trade_date": dates, "vol": vols})
+    result = calc._compute_indicators(df)
+    t = result["trend"].iloc[15]
+    assert t == "expanding", f"raw vol 持续上升应为 expanding，实际 {t}"
+
+
+def test_trend_threshold_0008():
+    """阈值 0.008——弱趋势判为 flat。"""
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+    n = 20
+    dates = [f"d{i}" for i in range(n)]
+    vols = [1000000.0 + i * 5000 for i in range(n)]  # 每日 +0.5%
+    df = pd.DataFrame({"trade_date": dates, "vol": vols})
+    result = calc._compute_indicators(df)
+    t = result["trend"].iloc[15]
+    assert t == "flat", f"弱趋势(斜率<0.008)应为 flat，实际 {t}"
+
+
 def test_integration_volume(db_with_schema):
     """Integration test: volume indicators with real DuckDB data."""
     con = db_with_schema

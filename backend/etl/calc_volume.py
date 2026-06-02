@@ -50,8 +50,8 @@ class VolumeCalculator:
         # Zone: explosive / low_volume / normal
         df["zone"] = self._compute_zone(df)
 
-        # Trend: linear regression slope on ln(MA5_vol) over 20 days
-        df["trend"] = self._compute_trend(df["ma_vol_5"].values, 20)
+        # Trend: linear regression slope on ln(raw_vol) over 10 days
+        df["trend"] = self._compute_trend(df["vol"].values, 10)
 
         return df
 
@@ -129,30 +129,30 @@ class VolumeCalculator:
 
         return result
 
-    def _compute_trend(self, ma_vol_5: np.ndarray, window: int) -> list:
-        """Volume trend via linear regression slope on ln(MA5_vol).
+    def _compute_trend(self, vol_series: np.ndarray, window: int) -> list:
+        """Volume trend via linear regression slope on ln(raw volume).
 
-        - expanding: slope > 0.005
-        - shrinking: slope < -0.005
+        - expanding: slope > 0.008
+        - shrinking: slope < -0.008
         - flat: otherwise
         """
-        n = len(ma_vol_5)
+        n = len(vol_series)
         result = [None] * n
 
         for i in range(n):
             if i < window - 1:
                 continue
-            segment = ma_vol_5[i - window + 1:i + 1]
-            # Need at least 10 valid (non-NaN, positive) values
+            segment = vol_series[i - window + 1:i + 1]
+            # Need at least 5 valid (non-NaN, positive) values
             valid = segment[~np.isnan(segment)]
             valid_positive = valid[valid > 0]
-            if len(valid_positive) < 10:
+            if len(valid_positive) < 5:
                 continue
 
             slope = linear_regression_slope(valid_positive)
-            if slope > 0.005:
+            if slope > 0.008:
                 result[i] = "expanding"
-            elif slope < -0.005:
+            elif slope < -0.008:
                 result[i] = "shrinking"
             else:
                 result[i] = "flat"
