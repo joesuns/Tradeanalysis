@@ -43,7 +43,7 @@ class MACDCalculator:
         df["zone"] = df["macd_bar"].apply(
             lambda x: "bull" if x > 0 else ("bear" if x < 0 else None)
         )
-        window = 8  # 8-bar regression for both daily and weekly
+        window = 5  # 5-bar weighted regression for both daily and weekly
         df["trend"] = self._compute_trend(df["macd_bar"].values, window=window)
         df["trend_strength"] = self._compute_trend_strength(
             df["macd_bar"].values, window=window
@@ -53,10 +53,11 @@ class MACDCalculator:
         df["alert"] = self._compute_alerts(df)
         return df
 
-    def _compute_trend(self, bar: np.ndarray, window: int = 8) -> list:
-        """MACD bar trend via linear regression slope (same method as DDE/Volume).
-        - up: slope > 0.02
-        - down: slope < -0.02
+    def _compute_trend(self, bar: np.ndarray, window: int = 5) -> list:
+        """MACD bar trend via exponentially weighted linear regression.
+        Same method as 123 project: weighted slope with threshold 0.001.
+        - up: weighted_slope > 0.001
+        - down: weighted_slope < -0.001
         - flat: otherwise
         """
         result = [None] * len(bar)
@@ -67,16 +68,25 @@ class MACDCalculator:
             valid = segment[~np.isnan(segment)]
             if len(valid) < window:
                 continue
-            slope = linear_regression_slope(valid, use_log=False)
-            if slope > 0.02:
+            # Exponentially weighted regression (same as 123)
+            n = len(valid)
+            x = np.arange(n, dtype=float)
+            weights = np.exp(x * 0.15)
+            try:
+                slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+            except (np.linalg.LinAlgError, ValueError, TypeError):
+                continue
+            if not np.isfinite(slope):
+                continue
+            if slope > 0.001:
                 result[i] = "up"
-            elif slope < -0.02:
+            elif slope < -0.001:
                 result[i] = "down"
             else:
                 result[i] = "flat"
         return result
 
-    def _compute_trend_strength(self, bar: np.ndarray, window: int = 8) -> np.ndarray:
+    def _compute_trend_strength(self, bar: np.ndarray, window: int = 5) -> np.ndarray:
         """MACD bar trend strength via exponentially weighted linear regression.
 
         Formula: slope / mean(|bar|), unitless signed value.

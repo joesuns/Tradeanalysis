@@ -37,118 +37,77 @@ def test_macd_zone_bull_bear():
     assert len(valid_zones) == 0 or all(z is None for z in valid_zones)
 
 
-def test_macd_trend_moderate_up_triggers_up():
-    """MACD bar with 4-bar regression slope > 0.02 should trigger 'up' trend.
-
-    Values [0.01, 0.03, 0.05, 0.08] give slope ~0.023 > 0.02.
-    With old threshold 0.2 this was 'flat', with new 0.02 it's 'up'.
-    """
+def test_macd_trend_weighted_up():
+    """5-bar 加权回归 + 阈值 0.001：上升趋势触发 up。"""
     calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.0, 0.0, 0.0, 0.01, 0.03, 0.05, 0.08])
-    result = calc._compute_trend(bar, window=4)
-    # index 6 (last element): 4-bar window [0.01, 0.03, 0.05, 0.08] slope ~0.023
-    assert result[6] == "up", f"Expected 'up', got {result[6]}"
+    bar = np.array([0.0, 0.0, 0.0, 0.0, 0.01, 0.03, 0.06, 0.10, 0.15])
+    result = calc._compute_trend(bar, window=5)
+    assert result[8] == "up", f"加权上升趋势应为 up，实际 {result[8]}"
 
 
-def test_macd_trend_moderate_down_triggers_down():
-    """MACD bar with 4-bar regression slope < -0.02 should trigger 'down'.
-
-    Values [-0.01, -0.03, -0.05, -0.08] give slope ~-0.023 < -0.02.
-    """
+def test_macd_trend_weighted_down():
+    """5-bar 加权回归 + 阈值 0.001：下降趋势触发 down。"""
     calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.0, 0.0, 0.0, -0.01, -0.03, -0.05, -0.08])
-    result = calc._compute_trend(bar, window=4)
-    assert result[6] == "down", f"Expected 'down', got {result[6]}"
+    bar = np.array([0.15, 0.10, 0.06, 0.03, 0.01, 0.0, 0.0, 0.0, 0.0])
+    result = calc._compute_trend(bar, window=5)
+    assert result[5] == "down", f"加权下降趋势应为 down，实际 {result[5]}"
 
 
-def test_macd_trend_zigzag_is_flat():
-    """Zigzag MACD bar with near-zero slope should be 'flat'.
-
-    Values [0.01, 0.02, 0.01, 0.02] give slope ~0.002 < 0.02.
-    """
+def test_macd_trend_flat():
+    """5-bar 加权回归：zigzag 数据判为 flat（加权斜率 < 0.001）。"""
     calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.0, 0.0, 0.0, 0.01, 0.02, 0.01, 0.02])
-    result = calc._compute_trend(bar, window=4)
-    assert result[6] == "flat", f"Expected 'flat', got {result[6]}"
+    bar = np.array([0.0, 0.0, 0.0, 0.0, 0.01, 0.009, 0.011, 0.009, 0.01])
+    result = calc._compute_trend(bar, window=5)
+    assert result[8] == "flat", f"zigzag 应为 flat，实际 {result[8]}"
 
 
-def test_macd_trend_boundary_slope_at_threshold():
-    """Slope exactly 0.02 is flat (strict > needed to trigger 'up').
-
-    [0.01, 0.03, 0.05, 0.07] → slope exactly 0.02 → 'flat'.
-    [0.01, 0.03, 0.05, 0.08] → slope ~0.023 → 'up'.
-    """
+def test_macd_trend_insufficient_window():
+    """数据不足 5 根 → None。"""
     calc = MACDCalculator.__new__(MACDCalculator)
-    # Exactly at threshold
-    bar1 = np.array([0.0, 0.0, 0.0, 0.01, 0.03, 0.05, 0.07])
-    result1 = calc._compute_trend(bar1, window=4)
-    assert result1[6] == "flat", f"slope=0.02 should be flat, got {result1[6]}"
-    # Just above threshold
-    bar2 = np.array([0.0, 0.0, 0.0, 0.01, 0.03, 0.05, 0.08])
-    result2 = calc._compute_trend(bar2, window=4)
-    assert result2[6] == "up", f"slope=0.023 should be up, got {result2[6]}"
-
-
-def test_macd_trend_insufficient_window_is_none():
-    """Less than 4 valid bars → trend remains None (not enough data)."""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.01, 0.02, 0.03])  # only 3 bars < window=4
-    result = calc._compute_trend(bar, window=4)
-    assert all(r is None for r in result), f"All should be None, got {result}"
-
-
-def test_macd_trend_8bar_window():
-    """MACD 趋势使用 8-bar 回归窗口（非 4-bar）。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    # 12 根 bar，后 8 根加速上升，斜率远超 0.02
-    bar = np.array([0.0, 0.0, 0.0, 0.01, 0.02, 0.04, 0.07,
-                    0.11, 0.16, 0.22, 0.29, 0.37])
-    result = calc._compute_trend(bar, window=8)
-    # index 11: 窗口 [4:12] 8 根斜率 ≈ (0.37-0.02)/7 ≈ 0.05 > 0.02 → up
-    assert result[11] == "up", f"8-bar 上升趋势应为 up，实际 {result[11]}"
-    # index 6: 仅 7 根有效 → None
-    assert result[6] is None, f"仅 7 根 bar 应为 None，实际 {result[6]}"
+    bar = np.array([0.01, 0.02, 0.03, 0.04])
+    result = calc._compute_trend(bar, window=5)
+    assert all(r is None for r in result), f"应全为 None，实际 {result}"
 
 
 def test_macd_trend_strength_positive():
-    """MACD 柱持续上升 → trend_strength 为正。"""
+    """MACD 柱持续上升 → trend_strength 为正（5-bar）。"""
     calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08])
+    bar = np.array([0.02, 0.04, 0.06, 0.08, 0.10])
     result = calc._compute_trend_strength(bar)
-    assert result[7] > 0, f"上升强度应为正，实际 {result[7]}"
-    assert result[7] > 0.1, f"上升强度应显著，实际 {result[7]}"
+    assert result[4] > 0, f"上升强度应为正，实际 {result[4]}"
+    assert result[4] > 0.2, f"上升强度应显著，实际 {result[4]}"
 
 
 def test_macd_trend_strength_negative():
-    """MACD 柱持续下降 → trend_strength 为负。"""
+    """MACD 柱持续下降 → trend_strength 为负（5-bar）。"""
     calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.08, 0.07, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01])
+    bar = np.array([0.10, 0.08, 0.06, 0.04, 0.02])
     result = calc._compute_trend_strength(bar)
-    assert result[7] < 0, f"下降强度应为负，实际 {result[7]}"
+    assert result[4] < 0, f"下降强度应为负，实际 {result[4]}"
 
 
 def test_macd_trend_strength_flat():
-    """MACD 柱走平 → trend_strength 接近零。"""
+    """MACD 柱走平 → trend_strength 接近零（5-bar）。"""
     calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03])
+    bar = np.array([0.03, 0.03, 0.03, 0.03, 0.03])
     result = calc._compute_trend_strength(bar)
-    assert abs(result[7]) < 0.01, f"平盘强度应接近零，实际 {result[7]}"
+    assert abs(result[4]) < 0.01, f"平盘强度应接近零，实际 {result[4]}"
 
 
 def test_macd_trend_strength_weighted():
-    """加权回归对近期加速更敏感——加速段强度 > 匀速段强度。"""
+    """加权回归对近期加速更敏感——加速段强度 > 匀速段强度（5-bar）。"""
     calc = MACDCalculator.__new__(MACDCalculator)
-    steady = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08])
-    accel = np.array([0.01, 0.01, 0.02, 0.02, 0.03, 0.05, 0.08, 0.12])
+    steady = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
+    accel = np.array([0.01, 0.01, 0.02, 0.04, 0.08])
     s_s = calc._compute_trend_strength(steady)
     s_a = calc._compute_trend_strength(accel)
-    assert s_a[7] > s_s[7], (
-        f"加速段({s_a[7]:.4f})应大于匀速段({s_s[7]:.4f})"
+    assert s_a[4] > s_s[4], (
+        f"加速段({s_a[4]:.4f})应大于匀速段({s_s[4]:.4f})"
     )
 
 
 def test_macd_trend_strength_insufficient():
-    """数据不足 8 根 → NaN。"""
+    """数据不足 5 根 → NaN（5-bar）。"""
     calc = MACDCalculator.__new__(MACDCalculator)
     bar = np.array([0.01, 0.02, 0.03])
     result = calc._compute_trend_strength(bar)
