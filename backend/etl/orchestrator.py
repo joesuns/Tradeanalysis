@@ -160,8 +160,8 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
 
                             done = min(i + batch_size, len(codes))
                             pct = done * 100 // len(codes)
-                            # Log every 20% milestone (and 100%)
-                            if pct - last_pct >= 20 or pct == 100:
+                            # Log every 5% milestone (and 100%)
+                            if pct - last_pct >= 5 or pct == 100:
                                 last_pct = pct
                                 elapsed = time.monotonic() - t0
                                 rate = done / elapsed if elapsed > 0 else 0
