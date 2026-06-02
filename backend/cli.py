@@ -10,14 +10,10 @@ Usage:
 
 import argparse
 import sys
-import logging
 
-from backend.config import LOG_LEVEL
+from backend.log_config import setup_logging
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+setup_logging()
 
 
 def cmd_check(_args):
