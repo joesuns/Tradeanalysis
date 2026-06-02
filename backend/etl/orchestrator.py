@@ -77,11 +77,14 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
 
             codes = ts_codes or get_all_active_codes(con)
             # Date-based batch fetch FIRST — 4 API calls/day for ALL stocks (~30s)
-            lid, t0 = log_etl_start(con, "fetch_market_data")
+            lid, t0 = log_etl_start(con, "fetch_market_data",
+                                     min_trade_date=start, max_trade_date=end)
             rows = fetch_by_date_range_parallel(
                 start or "20150101", end or "20991231", workers=3,
-                ts_codes=ts_codes)
-            log_etl_end(con, lid, "fetch_market_data", t0, "success", row_count=rows)
+                ts_codes=ts_codes, con=con)
+            log_etl_end(con, lid, "fetch_market_data", t0, "success",
+                        row_count=rows,
+                        min_trade_date=start, max_trade_date=end)
 
             # Concept detail LAST — per-stock calls, low priority, skip on failure
             lid, t0 = log_etl_start(con, "fetch_concept_detail")

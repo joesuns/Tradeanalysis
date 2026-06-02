@@ -18,7 +18,9 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def log_etl_start(con, step_name: str) -> tuple:
+def log_etl_start(con, step_name: str,
+                  min_trade_date: Optional[str] = None,
+                  max_trade_date: Optional[str] = None) -> tuple:
     """Insert a 'running' row into ods_etl_log. Returns (log_id, start_time_monotonic).
 
     Use with log_etl_end() to capture real wall-clock duration.
@@ -37,7 +39,9 @@ def log_etl_start(con, step_name: str) -> tuple:
 
 def log_etl_end(con, log_id: str, step_name: str, start_time: float,
                 status: str, row_count: int = 0, error_msg: str = "",
-                data_completeness: Optional[dict] = None):
+                data_completeness: Optional[dict] = None,
+                min_trade_date: Optional[str] = None,
+                max_trade_date: Optional[str] = None):
     """Finalize an ETL step with duration, status, and optional error/audit data.
 
     If status is 'failed' or 'degraded', also emits a warning log.
@@ -61,7 +65,9 @@ def log_etl_end(con, log_id: str, step_name: str, start_time: float,
 
 
 def log_etl_error(con, log_id: str, step_name: str, start_time: float,
-                  row_count: int, exception: Exception):
+                  row_count: int, exception: Exception,
+                  min_trade_date: Optional[str] = None,
+                  max_trade_date: Optional[str] = None):
     """Convenience: log a step as 'failed' with full traceback via logger.exception()."""
     tb = traceback.format_exc()
     logger.exception(f"ETL {step_name} — FAILED")
