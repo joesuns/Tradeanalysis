@@ -1,3 +1,5 @@
+from datetime import datetime, date
+
 from fastapi import APIRouter, Query, HTTPException
 from backend.db.connection import get_connection
 from backend.api.models import (
@@ -23,25 +25,42 @@ _ALLOWED_FIELDS = {
 
 @router.get("/health", response_model=HealthResponse)
 def health():
-    """Health check endpoint returning database connectivity and stats."""
+    """Health check: DB connectivity + per-table data freshness from v_data_freshness."""
     con = get_connection(read_only=True)
     try:
-        latest = con.execute(
-            "SELECT MAX(trade_date) FROM dwd_daily_quote"
-        ).fetchone()[0]
-        macd_rows = con.execute(
-            "SELECT COUNT(*) FROM dws_macd_daily"
-        ).fetchone()[0]
+        rows = con.execute(
+            "SELECT table_name, latest_date FROM v_data_freshness"
+        ).fetchall()
+
+        today = date.today()
+        table_stats = {}
+        max_age = 0
+        global_latest = None
+
+        for table_name, latest_date in rows:
+            if latest_date is None:
+                age = None
+            else:
+                dt = datetime.strptime(latest_date, "%Y%m%d").date()
+                age = (today - dt).days
+            if age is not None:
+                max_age = max(max_age, age)
+                if global_latest is None or latest_date > global_latest:
+                    global_latest = latest_date
+            table_stats[table_name] = {
+                "latest_trade_date": latest_date,
+                "age_days": age,
+                "status": "fresh" if (age is not None and age <= 1) else "stale",
+            }
+
         return {
             "database": "connected",
-            "latest_trade_date": latest,
-            "freshness": {"age_days": 0, "status": "fresh"},
-            "table_stats": {
-                "dws_macd_daily": {
-                    "rows": macd_rows,
-                    "latest_calc_date": latest,
-                }
+            "latest_trade_date": global_latest,
+            "freshness": {
+                "age_days": max_age,
+                "status": "fresh" if max_age <= 1 else "stale",
             },
+            "table_stats": table_stats,
         }
     finally:
         con.close()

@@ -60,6 +60,7 @@
 """
 
 import argparse
+import json
 import sys
 
 import duckdb
@@ -189,10 +190,22 @@ def main():
 
         logger.info(f"导出 {len(ts_codes)} 只标的 — 日期: {export_date}（日线+周线）")
         n = export_wide_to_excel(DUCKDB_PATH, export_date, args.output or "", ts_codes=ts_codes)
+        logger.info(json.dumps({
+            "event": "export_complete",
+            "stock_count": len(ts_codes),
+            "row_count": n,
+            "export_date": export_date,
+        }, ensure_ascii=False))
         logger.info(f"已导出 {n} 行")
         return
 
     # ── ETL 模式 ──
+    logger.info(json.dumps({
+        "event": "etl_start",
+        "stock_count": len(ts_codes),
+        "step": args.step,
+        "date_range": {"start": args.start, "end": args.end},
+    }, ensure_ascii=False))
     logger.info(f"目标标的 ({len(ts_codes)} 只): {', '.join(ts_codes)}")
     logger.info(f"日期范围: {args.start} ~ {args.end or '今天'}")
     logger.info(f"ETL 步骤: {args.step}")
@@ -205,6 +218,10 @@ def main():
         batch_size=args.batch_size,
     )
 
+    logger.info(json.dumps({
+        "event": "etl_complete",
+        "stock_count": len(ts_codes),
+    }, ensure_ascii=False))
     logger.info(f"完成！{len(ts_codes)} 只标的数据已入库")
 
     # ── ETL 后自动导出 ──
@@ -226,6 +243,12 @@ def main():
         if export_date:
             logger.info(f"自动导出日期: {export_date}（日线+周线）")
             n = export_wide_to_excel(DUCKDB_PATH, export_date, args.output or "", ts_codes=ts_codes)
+            logger.info(json.dumps({
+                "event": "export_complete",
+                "stock_count": len(ts_codes),
+                "row_count": n,
+                "export_date": export_date,
+            }, ensure_ascii=False))
             logger.info(f"已导出 {n} 行")
         else:
             logger.warning("未找到导出数据，请检查 ETL 是否成功")
