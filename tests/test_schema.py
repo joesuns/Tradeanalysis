@@ -72,6 +72,19 @@ class TestSchemaCreation:
         # DIM index
         assert "idx_dim_stock_code" in indexes
 
+    def test_etl_log_columns(self, db_with_schema):
+        """ods_etl_log has min_trade_date and max_trade_date columns."""
+        cols = {r[0] for r in db_with_schema.execute(
+            "DESCRIBE ods_etl_log").fetchall()}
+        assert "min_trade_date" in cols, "min_trade_date column missing"
+        assert "max_trade_date" in cols, "max_trade_date column missing"
+
+    def test_data_freshness_view_exists(self, db_with_schema):
+        """v_data_freshness view is created."""
+        views = {r[0] for r in db_with_schema.execute(
+            "SELECT name FROM sqlite_master WHERE type='view'").fetchall()}
+        assert "v_data_freshness" in views, "v_data_freshness view missing"
+
 
 class TestCheckConstraints:
     """Verify DWS CHECK constraints reject invalid data and accept valid data."""

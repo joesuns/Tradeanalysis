@@ -108,9 +108,27 @@ _ODS_DDL = [
         status            TEXT,
         row_count         INTEGER,
         error_msg         TEXT,
-        data_completeness TEXT
+        data_completeness TEXT,
+        min_trade_date    TEXT,
+        max_trade_date    TEXT
     )""",
 ]
+
+def _migrate_etl_log(con):
+    """Add min_trade_date, max_trade_date columns for databases created before migration.
+
+    Uses DESCRIBE to detect existing columns — safe to run repeatedly.
+    """
+    try:
+        cols = {r[0] for r in con.execute("DESCRIBE ods_etl_log").fetchall()}
+        if "min_trade_date" not in cols:
+            con.execute("ALTER TABLE ods_etl_log ADD COLUMN min_trade_date TEXT")
+        if "max_trade_date" not in cols:
+            con.execute("ALTER TABLE ods_etl_log ADD COLUMN max_trade_date TEXT")
+    except Exception:
+        pass  # table may not exist yet (fresh DB creation race)
+
+
 
 # ============================================================
 # DIM LAYER (4 tables) — Dimension tables
@@ -650,6 +668,17 @@ _ADS_WIDE_VIEWS_DDL = [
 ]
 
 
+_V_DATA_FRESHNESS_DDL = """
+CREATE VIEW IF NOT EXISTS v_data_freshness AS
+SELECT 'ods_daily'        AS table_name, MAX(trade_date) AS latest_date FROM ods_daily
+UNION ALL
+SELECT 'ods_daily_basic', MAX(trade_date) FROM ods_daily_basic
+UNION ALL
+SELECT 'ods_moneyflow',   MAX(trade_date) FROM ods_moneyflow
+UNION ALL
+SELECT 'dwd_daily_quote', MAX(trade_date) FROM dwd_daily_quote
+"""
+
 # ============================================================
 # Public API
 # ============================================================
@@ -662,6 +691,7 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # ODS (7 tables)
     for ddl in _ODS_DDL:
         con.execute(ddl)
+    _migrate_etl_log(con)
 
     # DIM (4 tables)
     for ddl in _DIM_DDL:
@@ -698,6 +728,9 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     for ddl in _ADS_WIDE_VIEWS_DDL:
         con.execute(ddl)
 
+    # Data freshness view
+    con.execute(_V_DATA_FRESHNESS_DDL)
+
 
 def _create_dws(con: duckdb.DuckDBPyConnection):
     """Create all 10 DWS tables from templates."""
@@ -712,7 +745,8 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
     # Views first
     _all_views = (
         ["v_ads_index_wide_weekly", "v_ads_index_wide",
-         "v_ads_analysis_wide_weekly", "v_ads_analysis_wide_daily"]
+         "v_ads_analysis_wide_weekly", "v_ads_analysis_wide_daily",
+         "v_data_freshness"]
         + [f"v_dws_{ind}_{freq}_latest"
            for ind in ["kpattern", "macd", "ma", "dde", "volume"]
            for freq in ["daily", "weekly"]]
