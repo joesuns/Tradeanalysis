@@ -166,10 +166,10 @@ class MACDCalculator:
         """Golden cross / Dead cross / Near golden / Near dead.
 
         Golden/dead cross = MACD bar sign flip.
-        Near golden: DIF < DEA, gap narrowing, |DIF-DEA|/|DEA| < 15%.
-        Near dead:   DIF > DEA, gap narrowing, |DIF-DEA|/|DEA| < 15%.
-        Zero-axis fallback (|DEA| < close * 0.1%):
-            use absolute threshold |DIF-DEA| < close * 0.01%.
+        Near = estimated days to cross < 3 (small-gap direct or speed-based).
+        Small gap: |DIF-DEA| < 0.005 → direct near.
+        Speed: 3-day gap regression slope < 0 AND gap/|slope| < 3.
+        Zero-axis fallback (|DEA| < close * 0.1%): absolute threshold.
         """
         result = [None] * len(df)
         bar = df["macd_bar"].values

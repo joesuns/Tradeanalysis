@@ -135,8 +135,9 @@ class MACalculator:
     def _compute_turning_points(self, df: pd.DataFrame) -> list:
         """Golden/dead cross + near_golden/near_dead on MA5/MA10 crossover.
 
-        Near golden: MA5 < MA10, gap narrowing, |MA5-MA10|/MA10 < 15%.
-        Near dead:   MA5 > MA10, gap narrowing, |MA5-MA10|/MA10 < 15%.
+        Near = estimated days to cross < 3 (small-gap direct or speed-based).
+        Small gap: |MA5-MA10|/MA10 < 0.5% → direct near.
+        Speed: 3-day gap regression slope < 0 AND gap/|slope| < 3.
         """
         result = [None] * len(df)
         ma5 = df["ma_5"].values
