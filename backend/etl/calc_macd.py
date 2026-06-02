@@ -1,10 +1,8 @@
 import numpy as np
 import pandas as pd
-import logging
 from backend.etl.base import ema, to_float_safe, linear_regression_slope
 
 
-logger = logging.getLogger(__name__)
 
 class MACDCalculator:
     """MACD indicator calculator. Works for both daily and weekly frequencies."""
@@ -18,7 +16,6 @@ class MACDCalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate MACD for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
-            logger.debug("%s: processing %s", self.__class__.__name__, ts_code)
             if self.freq == "weekly":
                 df = self.con.execute(f"""
                     SELECT d.trade_date, d.close_qfq FROM {self.src_table} d

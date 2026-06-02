@@ -2,11 +2,9 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import logging
 from backend.etl.base import ema, to_float_safe, linear_regression_slope
 
 
-logger = logging.getLogger(__name__)
 
 class DDECalculator:
     """DDE (Data Display Estimate) indicator calculator.
@@ -30,7 +28,6 @@ class DDECalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate DDE indicators for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
-            logger.debug("%s: processing %s", self.__class__.__name__, ts_code)
             if self.freq == "daily":
                 df = self._load_daily(ts_code)
             else:

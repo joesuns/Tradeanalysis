@@ -1,10 +1,8 @@
 import numpy as np
 import pandas as pd
-import logging
 from backend.etl.base import sma, linear_regression_slope, to_float_safe
 
 
-logger = logging.getLogger(__name__)
 
 class VolumeCalculator:
     """Volume indicator calculator.
@@ -23,7 +21,6 @@ class VolumeCalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate volume indicators for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
-            logger.debug("%s: processing %s", self.__class__.__name__, ts_code)
             if self.freq == "weekly":
                 df = self.con.execute(f"""
                     SELECT d.trade_date, d.vol FROM {self.src_table} d

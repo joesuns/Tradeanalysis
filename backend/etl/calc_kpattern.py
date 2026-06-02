@@ -1,11 +1,9 @@
 import numpy as np
 import pandas as pd
-import logging
 from backend.etl.base import sma, to_float_safe
 from backend.kpattern_params import KPATTERN_PARAMS
 
 
-logger = logging.getLogger(__name__)
 
 class KPatternCalculator:
     """K-Line (candlestick) pattern calculator.
@@ -24,7 +22,6 @@ class KPatternCalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate K-line patterns for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
-            logger.debug("%s: processing %s", self.__class__.__name__, ts_code)
             df = self.con.execute(f"""
                 SELECT trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, pct_chg
                 FROM {self.src_table} WHERE ts_code = ? {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}

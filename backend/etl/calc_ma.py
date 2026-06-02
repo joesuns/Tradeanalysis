@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import logging
 from backend.etl.base import sma, to_float_safe, linear_regression_slope
 
 
@@ -21,7 +20,6 @@ def _compute_slope_pct(series: np.ndarray, window: int = 5) -> np.ndarray:
     return result
 
 
-logger = logging.getLogger(__name__)
 
 class MACalculator:
     """Moving Average indicator calculator. Computes MA5, MA10, bias, slope,
@@ -37,7 +35,6 @@ class MACalculator:
     def calculate(self, ts_codes: list[str], calc_date: str):
         """Calculate MA indicators for a batch of stocks. INSERT results into DWS table."""
         for ts_code in ts_codes:
-            logger.debug("%s: processing %s", self.__class__.__name__, ts_code)
             if self.freq == "weekly":
                 df = self.con.execute(f"""
                     SELECT d.trade_date, d.close_qfq FROM {self.src_table} d

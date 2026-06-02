@@ -8,6 +8,7 @@ Usage:
 """
 
 import logging
+import time
 from typing import Optional
 from datetime import datetime
 
@@ -143,32 +144,50 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             try:
                 calc_date = datetime.now().strftime("%Y%m%d")
                 n_batches = (len(codes) + batch_size - 1) // batch_size
-                for i in range(0, len(codes), batch_size):
-                    batch = codes[i:i + batch_size]
-                    batch_num = i // batch_size + 1
-                    logger.info(
-                        "calc_dws batch %d/%d: %d stocks — started",
-                        batch_num, n_batches, len(batch),
-                    )
-                    for CalcCls in CALCULATORS:
-                        for freq in ("daily", "weekly"):
-                            calc = CalcCls(con, freq)
-                            calc.calculate(batch, calc_date)
-                    logger.info(
-                        "calc_dws batch %d/%d: %d stocks — done",
-                        batch_num, n_batches, len(batch),
-                    )
-                # Count actual DWS rows written in this run
-                total = 0
+                grand_total = 0
+                calc_start = time.monotonic()
+
                 for CalcCls in CALCULATORS:
                     for freq in ("daily", "weekly"):
                         calc = CalcCls(con, freq)
+                        label = f"{CalcCls.__name__} {freq}"
+                        t0 = time.monotonic()
+                        last_pct = -1
+
+                        for i in range(0, len(codes), batch_size):
+                            batch = codes[i:i + batch_size]
+                            calc.calculate(batch, calc_date)
+
+                            done = min(i + batch_size, len(codes))
+                            pct = done * 100 // len(codes)
+                            # Log every 20% milestone (and 100%)
+                            if pct - last_pct >= 20 or pct == 100:
+                                last_pct = pct
+                                elapsed = time.monotonic() - t0
+                                rate = done / elapsed if elapsed > 0 else 0
+                                logger.info(
+                                    "calc_dws %-30s %d/%d (%d%%) — %.0fs, %.0f stk/s",
+                                    label, done, len(codes), pct, elapsed, rate,
+                                )
+
+                        elapsed = time.monotonic() - t0
                         n = con.execute(
-                            f"SELECT COUNT(*) FROM {calc.dws_table} WHERE calc_date = ?",
-                            (calc_date,),
+                            f"SELECT COUNT(*) FROM {calc.dws_table} "
+                            f"WHERE calc_date = ?", (calc_date,),
                         ).fetchone()[0]
-                        total += n
-                log_etl_end(con, lid, "calc_dws", t0, "success", row_count=total)
+                        grand_total += n
+                        logger.info(
+                            "calc_dws %-30s DONE — %d rows, %.0fs",
+                            label, n, elapsed,
+                        )
+
+                total_elapsed = time.monotonic() - calc_start
+                logger.info(
+                    "calc_dws ALL DONE — %d stocks × 5 indicators × 2 freqs, "
+                    "%d rows, %.0fs",
+                    len(codes), grand_total, total_elapsed,
+                )
+                log_etl_end(con, lid, "calc_dws", t0, "success", row_count=grand_total)
             except Exception as e:
                 log_etl_error(con, lid, "calc_dws", t0, 0, e)
                 raise
