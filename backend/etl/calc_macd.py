@@ -45,6 +45,9 @@ class MACDCalculator:
         )
         window = 8  # 8-bar regression for both daily and weekly
         df["trend"] = self._compute_trend(df["macd_bar"].values, window=window)
+        df["trend_strength"] = self._compute_trend_strength(
+            df["macd_bar"].values, window=window
+        )
         df["divergence"] = self._compute_divergence(df)
         df["turning_point"] = self._compute_turning_points(df)
         df["alert"] = self._compute_alerts(df)
@@ -71,6 +74,35 @@ class MACDCalculator:
                 result[i] = "down"
             else:
                 result[i] = "flat"
+        return result
+
+    def _compute_trend_strength(self, bar: np.ndarray, window: int = 8) -> np.ndarray:
+        """MACD bar trend strength via exponentially weighted linear regression.
+
+        Formula: slope / mean(|bar|), unitless signed value.
+        Positive = bullish strength, negative = bearish strength.
+        Weighted regression (decay=0.15) makes recent bars ~3x more influential.
+        """
+        result = np.full(len(bar), np.nan)
+        for i in range(window - 1, len(bar)):
+            segment = bar[i - window + 1:i + 1]
+            valid = segment[~np.isnan(segment)]
+            if len(valid) < window:
+                continue
+            # Weighted slope: recent bars carry more weight
+            n = len(valid)
+            x = np.arange(n, dtype=float)
+            weights = np.exp(x * 0.15)
+            try:
+                slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+            except (np.linalg.LinAlgError, ValueError, TypeError):
+                continue
+            # Normalize by mean absolute value
+            scale = np.mean(np.abs(valid))
+            if scale < 1e-6:
+                result[i] = 0.0
+            elif np.isfinite(slope):
+                result[i] = float(slope) / scale
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
@@ -222,8 +254,8 @@ class MACDCalculator:
             self.con.execute(
                 f"""INSERT OR REPLACE INTO {self.dws_table}
                 (ts_code, trade_date, ema_12, ema_26, dif, dea, macd_bar,
-                 divergence, zone, turning_point, alert, trend, calc_date)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 divergence, zone, turning_point, alert, trend, trend_strength, calc_date)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     ts_code,
                     row["trade_date"],
@@ -237,6 +269,7 @@ class MACDCalculator:
                     row.get("turning_point"),
                     row.get("alert"),
                     row.get("trend"),
+                    to_float_safe(row.get("trend_strength")),
                     calc_date,
                 ),
             )

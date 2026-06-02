@@ -110,6 +110,51 @@ def test_macd_trend_8bar_window():
     assert result[6] is None, f"仅 7 根 bar 应为 None，实际 {result[6]}"
 
 
+def test_macd_trend_strength_positive():
+    """MACD 柱持续上升 → trend_strength 为正。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    bar = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08])
+    result = calc._compute_trend_strength(bar)
+    assert result[7] > 0, f"上升强度应为正，实际 {result[7]}"
+    assert result[7] > 0.1, f"上升强度应显著，实际 {result[7]}"
+
+
+def test_macd_trend_strength_negative():
+    """MACD 柱持续下降 → trend_strength 为负。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    bar = np.array([0.08, 0.07, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01])
+    result = calc._compute_trend_strength(bar)
+    assert result[7] < 0, f"下降强度应为负，实际 {result[7]}"
+
+
+def test_macd_trend_strength_flat():
+    """MACD 柱走平 → trend_strength 接近零。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    bar = np.array([0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03])
+    result = calc._compute_trend_strength(bar)
+    assert abs(result[7]) < 0.01, f"平盘强度应接近零，实际 {result[7]}"
+
+
+def test_macd_trend_strength_weighted():
+    """加权回归对近期加速更敏感——加速段强度 > 匀速段强度。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    steady = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08])
+    accel = np.array([0.01, 0.01, 0.02, 0.02, 0.03, 0.05, 0.08, 0.12])
+    s_s = calc._compute_trend_strength(steady)
+    s_a = calc._compute_trend_strength(accel)
+    assert s_a[7] > s_s[7], (
+        f"加速段({s_a[7]:.4f})应大于匀速段({s_s[7]:.4f})"
+    )
+
+
+def test_macd_trend_strength_insufficient():
+    """数据不足 8 根 → NaN。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    bar = np.array([0.01, 0.02, 0.03])
+    result = calc._compute_trend_strength(bar)
+    assert all(np.isnan(r) for r in result), f"应全为 NaN，实际 {result}"
+
+
 def test_macd_near_golden_3day_regression():
     """3 日回归斜率检测收敛——gap 持平但趋势性收缩时仍可检出。"""
     calc = MACDCalculator.__new__(MACDCalculator)

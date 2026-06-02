@@ -261,6 +261,7 @@ _DWS_DDL = {
         turning_point  TEXT,
         alert          TEXT,
         trend          TEXT,
+        trend_strength REAL,
         calc_date      TEXT,
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (divergence IN ('top_divergence', 'bottom_divergence') OR divergence IS NULL),
@@ -491,6 +492,7 @@ _ADS_WIDE_VIEWS_DDL = [
         cw.turning_point AS macd_turning_point,
         cw.alert         AS macd_alert,
         cw.trend         AS macd_trend,
+        cw.trend_strength AS macd_trend_strength,
 
         aw.ma_5, aw.ma_10,
         aw.bias_ma5, aw.bias_ma10,
@@ -558,6 +560,7 @@ _ADS_WIDE_VIEWS_DDL = [
         c.turning_point  AS macd_turning_point,
         c.alert          AS macd_alert,
         c.trend          AS macd_trend,
+        c.trend_strength AS macd_trend_strength,
 
         a.ma_5, a.ma_10,
         a.bias_ma5, a.bias_ma10,
@@ -617,6 +620,7 @@ _ADS_WIDE_VIEWS_DDL = [
         c.ema_12, c.ema_26, c.dif, c.dea, c.macd_bar,
         c.divergence AS macd_divergence, c.zone AS macd_zone,
         c.turning_point AS macd_turning_point, c.alert AS macd_alert, c.trend AS macd_trend,
+        c.trend_strength AS macd_trend_strength,
         a.ma_5, a.ma_10, a.bias_ma5, a.bias_ma10, a.ma5_slope, a.ma10_slope,
         CASE a.alignment
             WHEN 'bull_strong'    THEN '多头强势 — 两线同步上行，持仓舒适区'

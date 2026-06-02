@@ -25,6 +25,7 @@ _COL_NAMES = {
     "ema_12": "EMA12", "ema_26": "EMA26", "dif": "DIF", "dea": "DEA",
     "macd_bar": "MACD柱", "macd_divergence": "MACD背离", "macd_zone": "MACD区域",
     "macd_turning_point": "MACD转折", "macd_alert": "MACD警惕", "macd_trend": "MACD趋势",
+    "macd_trend_strength": "MACD趋势强度",
     "ma_5": "MA5", "ma_10": "MA10",
     "bias_ma5": "MA5乖离率", "bias_ma10": "MA10乖离率",
     "ma5_slope": "MA5斜率", "ma10_slope": "MA10斜率",
@@ -140,6 +141,7 @@ def export_wide_to_excel(
     # ---- Signal-only analysis sheet (first sheet) ----
     _SIGNAL_ONLY = {"kpattern", "kpattern_strength",
                     "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
+                    "macd_trend_strength",
                     "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
                     "dde_trend", "dde_alert", "dde_divergence",
                     "vol_zone", "vol_trend"}
