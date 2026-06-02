@@ -154,9 +154,24 @@ class MACDCalculator:
                 continue
 
             gap = abs(dif[i] - dea[i])
-            gap_prev = abs(dif[i - 1] - dea[i - 1])
-            if gap >= gap_prev:
-                continue  # gap not narrowing
+
+            # 收敛判定：优先用 3 日回归（容忍日间波动），兜底 3 日绝对值缩小
+            narrowing = False
+            if i >= 2:
+                if not pd.isna(dif[i - 2]) and not pd.isna(dea[i - 2]):
+                    gap_seq = np.array([
+                        abs(dif[i - 2] - dea[i - 2]),
+                        abs(dif[i - 1] - dea[i - 1]),
+                        gap,
+                    ])
+                    gap_slope = linear_regression_slope(gap_seq, use_log=False)
+                    narrowing = gap_slope < 0 or gap < abs(dif[i - 2] - dea[i - 2])
+            else:
+                gap_prev = abs(dif[i - 1] - dea[i - 1])
+                narrowing = gap < gap_prev
+
+            if not narrowing:
+                continue
 
             # Zero-axis fallback: |DEA| < close * 0.1%
             if abs(dea[i]) < close[i] * 0.001:

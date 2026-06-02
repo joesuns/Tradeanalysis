@@ -110,6 +110,20 @@ def test_macd_trend_8bar_window():
     assert result[6] is None, f"仅 7 根 bar 应为 None，实际 {result[6]}"
 
 
+def test_macd_near_golden_3day_regression():
+    """3 日回归斜率检测收敛——gap 持平但趋势性收缩时仍可检出。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2", "d3"],
+        "close_qfq": [10.0, 10.0, 10.0, 10.0],
+        "dif":       [0.50, 0.51, 0.52, 0.49],
+        "dea":       [0.55, 0.57, 0.56, 0.53],
+        "macd_bar":  [-0.10, -0.12, -0.08, -0.08],
+    })
+    result = calc._compute_turning_points(df)
+    assert result[3] == "near_golden", f"3 日回归应检出收敛，实际 {result[3]}"
+
+
 def test_macd_near_golden():
     """DIF < DEA, gap narrowing, |DIF-DEA|/|DEA| < 15% → near_golden."""
     calc = MACDCalculator.__new__(MACDCalculator)
