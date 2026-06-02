@@ -139,14 +139,22 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             lid, t0 = log_etl_start(con, "calc_dws")
             try:
                 calc_date = datetime.now().strftime("%Y%m%d")
-                total = 0
                 for i in range(0, len(codes), batch_size):
                     batch = codes[i:i + batch_size]
                     for CalcCls in CALCULATORS:
                         for freq in ("daily", "weekly"):
                             calc = CalcCls(con, freq)
                             calc.calculate(batch, calc_date)
-                    total += len(batch)
+                # Count actual DWS rows written in this run
+                total = 0
+                for CalcCls in CALCULATORS:
+                    for freq in ("daily", "weekly"):
+                        calc = CalcCls(con, freq)
+                        n = con.execute(
+                            f"SELECT COUNT(*) FROM {calc.dws_table} WHERE calc_date = ?",
+                            (calc_date,),
+                        ).fetchone()[0]
+                        total += n
                 log_etl_end(con, lid, "calc_dws", t0, "success", row_count=total)
             except Exception as e:
                 log_etl_error(con, lid, "calc_dws", t0, 0, e)

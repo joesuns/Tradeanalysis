@@ -81,7 +81,14 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
             [ts_code, ts_code, ts_code, ts_code],
         )
 
-    return con.execute("SELECT COUNT(*) FROM dwd_daily_quote").fetchone()[0]
+    if ts_codes:
+        placeholders = ",".join(["?" for _ in ts_codes])
+        return con.execute(
+            f"SELECT COUNT(*) FROM dwd_daily_quote WHERE ts_code IN ({placeholders})",
+            ts_codes,
+        ).fetchone()[0]
+    else:
+        return con.execute("SELECT COUNT(*) FROM dwd_daily_quote").fetchone()[0]
 
 
 def build_dwd_weekly_quote(con, ts_codes=None) -> int:
@@ -130,7 +137,14 @@ def build_dwd_weekly_quote(con, ts_codes=None) -> int:
         params,
     )
 
-    return con.execute("SELECT COUNT(*) FROM dwd_weekly_quote").fetchone()[0]
+    if ts_codes:
+        placeholders = ",".join(["?" for _ in ts_codes])
+        return con.execute(
+            f"SELECT COUNT(*) FROM dwd_weekly_quote WHERE ts_code IN ({placeholders})",
+            ts_codes,
+        ).fetchone()[0]
+    else:
+        return con.execute("SELECT COUNT(*) FROM dwd_weekly_quote").fetchone()[0]
 
 
 def build_dwd_daily_moneyflow(con, ts_codes=None) -> int:
@@ -178,4 +192,11 @@ def build_dwd_daily_moneyflow(con, ts_codes=None) -> int:
         params,
     )
 
-    return con.execute("SELECT COUNT(*) FROM dwd_daily_moneyflow").fetchone()[0]
+    if ts_codes:
+        placeholders = ",".join(["?" for _ in ts_codes])
+        return con.execute(
+            f"SELECT COUNT(*) FROM dwd_daily_moneyflow WHERE ts_code IN ({placeholders})",
+            ts_codes,
+        ).fetchone()[0]
+    else:
+        return con.execute("SELECT COUNT(*) FROM dwd_daily_moneyflow").fetchone()[0]
