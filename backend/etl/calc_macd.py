@@ -189,7 +189,7 @@ class MACDCalculator:
                 result[i] = "dead_cross"
                 continue
 
-            # Near golden / near dead
+            # Near golden / near dead: 预估交叉天数 < 3
             if pd.isna(dif[i]) or pd.isna(dea[i]) or dea[i] == 0:
                 continue
             if pd.isna(dif[i - 1]) or pd.isna(dea[i - 1]):
@@ -197,8 +197,15 @@ class MACDCalculator:
 
             gap = abs(dif[i] - dea[i])
 
-            # 收敛判定：优先用 3 日回归（容忍日间波动），兜底 3 日绝对值缩小
-            narrowing = False
+            # 小间距直通: DIF-DEA 几乎合并
+            if gap < 0.005:
+                if dif[i] < dea[i]:
+                    result[i] = "near_golden"
+                else:
+                    result[i] = "near_dead"
+                continue
+
+            # 速度判定: 3 日回归 est_days = gap / convergence_speed
             if i >= 2:
                 if not pd.isna(dif[i - 2]) and not pd.isna(dea[i - 2]):
                     gap_seq = np.array([
@@ -207,25 +214,19 @@ class MACDCalculator:
                         gap,
                     ])
                     gap_slope = linear_regression_slope(gap_seq, use_log=False)
-                    narrowing = gap_slope < 0 or gap < abs(dif[i - 2] - dea[i - 2])
-            else:
-                gap_prev = abs(dif[i - 1] - dea[i - 1])
-                narrowing = gap < gap_prev
-
-            if not narrowing:
-                continue
-
-            # Zero-axis fallback: |DEA| < close * 0.1%
-            if abs(dea[i]) < close[i] * 0.001:
-                near = gap < close[i] * 0.0001  # absolute: close * 0.01%
-            else:
-                near = gap / abs(dea[i]) < 0.15  # relative: 15% of |DEA|
-
-            if near:
-                if dif[i] < dea[i]:
-                    result[i] = "near_golden"
-                else:
-                    result[i] = "near_dead"
+                    if gap_slope < 0:
+                        conv_speed = -gap_slope
+                        if conv_speed > 1e-9 and gap / conv_speed < 3:
+                            # 零轴兜底（保留不变）
+                            if abs(dea[i]) < close[i] * 0.001:
+                                near = gap < close[i] * 0.0001
+                            else:
+                                near = gap / abs(dea[i]) < 0.15
+                            if near:
+                                if dif[i] < dea[i]:
+                                    result[i] = "near_golden"
+                                else:
+                                    result[i] = "near_dead"
 
         return result
 

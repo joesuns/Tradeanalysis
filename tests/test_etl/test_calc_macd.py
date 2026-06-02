@@ -115,17 +115,19 @@ def test_macd_trend_strength_insufficient():
 
 
 def test_macd_near_golden_3day_regression():
-    """3 日回归斜率检测收敛——gap 持平但趋势性收缩时仍可检出。"""
+    """3 日回归斜率检测收敛——gap 快速缩小，est<3。"""
     calc = MACDCalculator.__new__(MACDCalculator)
     df = pd.DataFrame({
         "trade_date": ["d0", "d1", "d2", "d3"],
         "close_qfq": [10.0, 10.0, 10.0, 10.0],
-        "dif":       [0.50, 0.51, 0.52, 0.49],
-        "dea":       [0.55, 0.57, 0.56, 0.53],
-        "macd_bar":  [-0.10, -0.12, -0.08, -0.08],
+        "dif":       [0.50, 0.48, 0.46, 0.44],
+        "dea":       [0.60, 0.55, 0.51, 0.48],
+        "macd_bar":  [-0.20, -0.14, -0.10, -0.08],
     })
     result = calc._compute_turning_points(df)
-    assert result[3] == "near_golden", f"3 日回归应检出收敛，实际 {result[3]}"
+    # gaps: 0.10, 0.07, 0.05, 0.04 → 3日回归[0.07,0.05,0.04] slope≈-0.015
+    # est_days = 0.04/0.015 ≈ 2.7 < 3 ✓, gap/|DEA| = 0.04/0.48 = 8.3% < 15% ✓
+    assert result[3] == "near_golden", f"est<3应触发 near_golden，实际 {result[3]}"
 
 
 def test_macd_near_golden():
@@ -142,8 +144,9 @@ def test_macd_near_golden():
         "macd_bar":  [-0.10, -0.06, -0.14, -0.06, -0.02],  # = 2*(DIF-DEA)
     })
     result = calc._compute_turning_points(df)
-    # Day 1: gap 0.03 < 0.05 (narrowing), 0.03/0.24=12.5% < 15%, DIF < DEA → near_golden
-    assert result[1] == "near_golden", f"Expected near_golden at [1], got {result[1]}"
+    # Day 4: gaps [0.03, 0.12, 0.04, 0.01], 3日回归[0.12,0.04,0.01] slope≈-0.055
+    # est_days = 0.01/0.055 ≈ 0.18 < 3 ✓, gap/|DEA| = 0.01/0.24 = 4.2% < 15% ✓
+    assert result[4] == "near_golden", f"Expected near_golden at [4], got {result[4]}"
     # Day 4: gap 0.01 < 0.03 (narrowing), 0.01/0.24=4.2% < 15%, DIF < DEA → near_golden
     assert result[4] == "near_golden", f"Expected near_golden at [4], got {result[4]}"
 
@@ -160,7 +163,7 @@ def test_macd_near_dead():
         "macd_bar":  [0.10, 0.06, 0.14, 0.06, 0.02],
     })
     result = calc._compute_turning_points(df)
-    assert result[1] == "near_dead", f"Expected near_dead at [1], got {result[1]}"
+    assert result[4] == "near_dead", f"Expected near_dead at [4], got {result[4]}"
 
 
 def test_macd_near_golden_gap_not_narrowing():
@@ -197,6 +200,36 @@ def test_macd_near_zero_axis_absolute_threshold():
     # gap narrowing: 0.0007 → 0.0006; |DEA|=0.0004 << 0.01 → absolute
     # gap=0.0006 < close*0.0001=0.001 ✓; DIF > DEA → near_dead
     assert result[1] == "near_dead", f"Expected near_dead via abs threshold, got {result[1]}"
+
+
+def test_macd_near_small_gap_direct():
+    """DIF-DEA 间距 < 0.005 → 直通 near_golden。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2", "d3"],
+        "close_qfq": [10.0, 10.0, 10.0, 10.0],
+        "dif":       [0.30, 0.30, 0.30, 0.30],
+        "dea":       [0.30, 0.30, 0.30, 0.304],
+        "macd_bar":  [-0.02, -0.01, -0.01, -0.02],  # stays negative, no cross
+    })
+    result = calc._compute_turning_points(df)
+    # gap = |0.30-0.304| = 0.004 < 0.005 → 直通
+    assert result[3] == "near_golden", f"小间距应直通 near_golden，实际 {result[3]}"
+
+
+def test_macd_near_est_too_slow():
+    """收敛太慢 → est>3 → 不触发。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2", "d3"],
+        "close_qfq": [10.0, 10.0, 10.0, 10.0],
+        "dif":       [0.50, 0.51, 0.515, 0.52],
+        "dea":       [0.60, 0.60, 0.60, 0.60],
+        "macd_bar":  [-0.20, -0.18, -0.17, -0.16],
+    })
+    result = calc._compute_turning_points(df)
+    # gaps: 0.10, 0.09, 0.085, 0.08 → 收敛太慢 est>>3
+    assert result[3] is None, f"est>3 不应触发，实际 {result[3]}"
 
 
 def test_macd_upturn_flat_alert():
