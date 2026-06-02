@@ -264,7 +264,7 @@ _DWS_DDL = {
         calc_date      TEXT,
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (divergence IN ('top_divergence', 'bottom_divergence') OR divergence IS NULL),
-        CHECK (zone IN ('bull', 'bear')),
+        CHECK (zone IN ('bull', 'bear') OR zone IS NULL),
         CHECK (turning_point IN ('golden_cross', 'dead_cross', 'near_golden', 'near_dead') OR turning_point IS NULL),
         CHECK (alert IN ('upturn_reverse', 'downturn_reverse', 'upturn_flat', 'downturn_flat') OR alert IS NULL),
         CHECK (trend IN ('up', 'down', 'flat'))
@@ -286,7 +286,7 @@ _DWS_DDL = {
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (alignment IN ('bull_strong', 'bull_building', 'bull_weakening', 'bull_rolling',
                               'bear_strong', 'bear_building', 'bear_weakening', 'bear_rolling',
-                              'tangle') OR alignment IS NULL),
+                              'tangle', 'sideways') OR alignment IS NULL),
         CHECK (turning_point IN ('golden_cross', 'dead_cross', 'near_golden', 'near_dead') OR turning_point IS NULL)
     )""",
 

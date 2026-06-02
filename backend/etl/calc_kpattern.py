@@ -62,6 +62,9 @@ class KPatternCalculator:
         ma_vol_5 = sma(v, 5)
         df["_ma5_vol"] = ma_vol_5  # populate for _compute_strength
 
+        # MA10 for trend-context filter on yang_ke_yin / yin_ke_yang
+        ma_10 = sma(c, 10)
+
         # Initialize pattern columns and strength
         df["yang_bao_yin"] = 0
         df["yang_ke_yin"] = 0
@@ -120,7 +123,8 @@ class KPatternCalculator:
             #    vol > prev_vol * 1.2 AND max(open,close) > prev max(open,close)
             # ============================================================
             if (v[i] > v[i - 1] * 1.2
-                    and max(o[i], c[i]) > max(o[i - 1], c[i - 1])):
+                    and max(o[i], c[i]) > max(o[i - 1], c[i - 1])
+                    and not pd.isna(ma_10[i]) and c[i] > ma_10[i]):
                 df.at[i, "yang_ke_yin"] = 1
 
             # ============================================================
@@ -128,8 +132,16 @@ class KPatternCalculator:
             #    Uptrend + doji + long upper shadow
             # ============================================================
             is_uptrend = uptrend_60d_high[i] or uptrend_20d_gain[i]
-            is_doji = body_pct[i] < 0.005 if not pd.isna(body_pct[i]) else False
-            long_upper = (body[i] > 0 and upper_shadow[i] >= 3.0 * body[i])
+            # Doji: |O-C|/prev_close < 0.5% OR body < 10% of amplitude
+            is_doji_by_prev = (i >= 1 and c[i-1] > 0
+                               and abs(c[i] - o[i]) / c[i-1] < 0.005)
+            is_doji_by_amp = (body_pct[i] < 0.10 if not pd.isna(body_pct[i]) else False)
+            is_doji = is_doji_by_prev or is_doji_by_amp
+            # Long upper shadow: body>0 → >= 3x body; zero body → uppershadow/full_range > 60%
+            if body[i] > 0:
+                long_upper = upper_shadow[i] >= 3.0 * body[i]
+            else:
+                long_upper = full_range[i] > 0 and upper_shadow[i] / full_range[i] > 0.60
             if is_uptrend and is_doji and long_upper:
                 df.at[i, "mu_bei_xian"] = 1
 
@@ -142,7 +154,10 @@ class KPatternCalculator:
             if full_range[i] > 0 and not pd.isna(full_range[i]):
                 body_center_y = min(o[i], c[i]) + body[i] / 2.0
                 body_lower_third = (body_center_y - l[i]) / full_range[i] < (1.0 / 3.0)
-            long_upper_2 = body[i] > 0 and upper_shadow[i] >= 3.0 * body[i]
+            if body[i] > 0:
+                long_upper_2 = upper_shadow[i] >= 3.0 * body[i]
+            else:
+                long_upper_2 = full_range[i] > 0 and upper_shadow[i] / full_range[i] > 0.60
             if is_uptrend and small_body and body_lower_third and long_upper_2:
                 df.at[i, "bi_lei_zhen"] = 1
 
@@ -172,7 +187,8 @@ class KPatternCalculator:
             #    vol > prev_vol * 1.2 AND min(open,close) < prev min(open,close)
             # ============================================================
             if (v[i] > v[i - 1] * 1.2
-                    and min(o[i], c[i]) < min(o[i - 1], c[i - 1])):
+                    and min(o[i], c[i]) < min(o[i - 1], c[i - 1])
+                    and not pd.isna(ma_10[i]) and c[i] < ma_10[i]):
                 df.at[i, "yin_ke_yang"] = 1
 
         # --- Strength computation ---
@@ -181,11 +197,9 @@ class KPatternCalculator:
         return df
 
     def _compute_strength(self, df: pd.DataFrame) -> np.ndarray:
-        """Compute pattern strength as a weighted composite (0.0-1.0).
+        """Compute per-pattern strength scores (0.0-1.0).
 
-        Strength is computed only for rows where at least one pattern is active.
-        Components: body ratio weight (0.4), volume confirmation (0.3),
-        trend alignment (0.3).
+        Each of the 7 patterns uses its own dimensions and weights per spec §6.1.
         """
         n = len(df)
         result = np.full(n, np.nan)
@@ -195,49 +209,92 @@ class KPatternCalculator:
         h = df["high_qfq"].values.astype(float)
         l = df["low_qfq"].values.astype(float)
         v = df["vol"].values.astype(float)
-
-        patterns = ["yang_bao_yin", "yang_ke_yin", "mu_bei_xian", "bi_lei_zhen",
-                     "gao_kai_chang_yin", "yin_bao_yang", "yin_ke_yang"]
+        ma5v = df.get("_ma5_vol", pd.Series([np.nan] * n)).values
 
         for i in range(n):
-            has_pattern = any(df.at[i, p] == 1 for p in patterns)
-            if not has_pattern:
-                continue
-
-            # Body weight (0.4): larger body relative to range = stronger signal
             full_range = h[i] - l[i]
             body = abs(c[i] - o[i])
-            body_score = min(body / full_range, 1.0) if full_range > 0 else 0.0
+            prev_body = abs(c[i-1] - o[i-1]) if i >= 1 else 0
+            prev_vol = v[i-1] if i >= 1 and v[i-1] > 0 else 1.0
 
-            # Volume confirmation (0.3): vol vs MA5_vol
-            ma5v = df.get("_ma5_vol", pd.Series([np.nan] * n))
-            vol_score = 0.5
-            if i >= 5 and not pd.isna(ma5v.iloc[i]) if "_ma5_vol" in df.columns else False:
-                ratio = v[i] / ma5v.iloc[i] if ma5v.iloc[i] > 0 else 1.0
-                vol_score = min(ratio / 2.0, 1.0)
-            else:
-                # Use simple prev-volume comparison
-                if i >= 1 and v[i - 1] > 0:
-                    vol_score = min(v[i] / v[i - 1] / 2.0, 1.0)
+            # --- 阳包阴 (0.5 engulf + 0.3 volume + 0.2 close_pos) ---
+            if df.at[i, "yang_bao_yin"] == 1:
+                engulf = min(body / prev_body / 2.0, 1.0) if prev_body > 0 else 0.0
+                vs = min(v[i] / ma5v[i] / 1.5, 1.0) if i >= 4 and not pd.isna(ma5v[i]) and ma5v[i] > 0 else \
+                     min(v[i] / prev_vol / 1.5, 1.0)
+                cp = (c[i] - l[i]) / full_range if full_range > 0 else 0.5
+                result[i] = min(max(0.5*engulf + 0.3*vs + 0.2*cp, 0.0), 1.0)
 
-            # Trend alignment (0.3): for bullish patterns, being above MA10 is stronger
-            trend_score = 0.5  # neutral default
-            if i >= 10:
-                ma10 = np.mean(c[i - 9:i + 1])
-                if ma10 > 0:
-                    pct_from_ma = (c[i] - ma10) / ma10
-                    # For bullish patterns (yang), above MA is stronger
-                    # For bearish patterns (yin), below MA is stronger
-                    is_bullish = any(df.at[i, p] == 1 for p in ["yang_bao_yin", "yang_ke_yin"])
-                    is_bearish = any(df.at[i, p] == 1 for p in ["yin_bao_yang", "yin_ke_yang",
-                                                                  "gao_kai_chang_yin"])
-                    if is_bullish:
-                        trend_score = min(max((pct_from_ma + 0.1) / 0.2, 0.0), 1.0)
-                    elif is_bearish:
-                        trend_score = min(max((-pct_from_ma + 0.1) / 0.2, 0.0), 1.0)
+            # --- 阳克阴 (0.4 top + 0.4 vol + 0.2 close_pos) ---
+            elif df.at[i, "yang_ke_yin"] == 1:
+                rtop = max(o[i], c[i]); prtop = max(o[i-1], c[i-1])
+                top_s = min((rtop - prtop) / prtop / 0.02, 1.0) if prtop > 0 else 0.0
+                vr = v[i] / prev_vol
+                vs = min((vr - 1.2) / 0.8, 1.0) if vr > 1.2 else 0.0
+                cp = (c[i] - l[i]) / full_range if full_range > 0 else 0.5
+                result[i] = min(max(0.4*top_s + 0.4*vs + 0.2*cp, 0.0), 1.0)
 
-            strength = 0.4 * body_score + 0.3 * vol_score + 0.3 * trend_score
-            result[i] = min(max(strength, 0.0), 1.0)
+            # --- 墓碑线 (0.4 shadow + 0.3 doji_purity + 0.3 high_confirm) ---
+            elif df.at[i, "mu_bei_xian"] == 1:
+                us = h[i] - max(o[i], c[i])
+                if body > 0:
+                    sh_s = min(us / body / 4.0, 1.0)
+                else:
+                    sh_s = min(us / full_range / 0.8, 1.0) if full_range > 0 else 1.0
+                doji_p = 1.0 - min(abs(c[i]-o[i]) / c[i-1] / 0.005, 1.0) if i >= 1 and c[i-1] > 0 else 0.5
+                # high_confirm: 60d high 10% = 0.6, +20d gain >15% = 1.0
+                hi_cf = 0.0
+                if i >= 59:
+                    h60 = h[i-59:i+1].max()
+                    if c[i] >= h60 * 0.9:
+                        hi_cf = 0.6
+                if i >= 20 and c[i-20] > 0 and (c[i]-c[i-20])/c[i-20] > 0.15:
+                    hi_cf = 1.0
+                result[i] = min(max(0.4*sh_s + 0.3*doji_p + 0.3*hi_cf, 0.0), 1.0)
+
+            # --- 避雷针 (0.4 shadow + 0.3 bottom_pos + 0.3 high_confirm) ---
+            elif df.at[i, "bi_lei_zhen"] == 1:
+                us = h[i] - max(o[i], c[i])
+                if body > 0:
+                    sh_s = min(us / body / 4.0, 1.0)
+                else:
+                    sh_s = min(us / full_range / 0.8, 1.0) if full_range > 0 else 1.0
+                bp = 1.0 - (c[i] - l[i]) / full_range if full_range > 0 else 0.0
+                hi_cf = 0.0
+                if i >= 59:
+                    h60 = h[i-59:i+1].max()
+                    if c[i] >= h60 * 0.9:
+                        hi_cf = 0.6
+                if i >= 20 and c[i-20] > 0 and (c[i]-c[i-20])/c[i-20] > 0.15:
+                    hi_cf = 1.0
+                result[i] = min(max(0.4*sh_s + 0.3*bp + 0.3*hi_cf, 0.0), 1.0)
+
+            # --- 高开长阴 (0.3 bear_body + 0.3 vol + 0.2 gap + 0.2 gain10d) ---
+            elif df.at[i, "gao_kai_chang_yin"] == 1:
+                bb = min(abs(c[i]-o[i]) / o[i] / 0.08, 1.0) if o[i] > 0 else 0.0
+                vs = min(v[i] / ma5v[i] / 2.5, 1.0) if i >= 4 and not pd.isna(ma5v[i]) and ma5v[i] > 0 else \
+                     min(v[i] / prev_vol / 2.5, 1.0)
+                gp = min((o[i]-c[i-1]) / c[i-1] / 0.03, 1.0) if i >= 1 and c[i-1] > 0 else 0.0
+                j = max(0, i-10)
+                g10 = min((c[i]-c[j]) / c[j] / 0.25, 1.0) if i >= 10 and c[j] > 0 else 0.0
+                result[i] = min(max(0.3*bb + 0.3*vs + 0.2*gp + 0.2*g10, 0.0), 1.0)
+
+            # --- 阴包阳 (0.5 engulf + 0.3 volume + 0.2 close_pos) ---
+            elif df.at[i, "yin_bao_yang"] == 1:
+                engulf = min(body / prev_body / 2.0, 1.0) if prev_body > 0 else 0.0
+                vs = min(v[i] / ma5v[i] / 1.5, 1.0) if i >= 4 and not pd.isna(ma5v[i]) and ma5v[i] > 0 else \
+                     min(v[i] / prev_vol / 1.5, 1.0)
+                cp = 1.0 - (c[i] - l[i]) / full_range if full_range > 0 else 0.5  # 光脚满分
+                result[i] = min(max(0.5*engulf + 0.3*vs + 0.2*cp, 0.0), 1.0)
+
+            # --- 阴克阳 (0.4 bottom + 0.4 vol + 0.2 close_pos) ---
+            elif df.at[i, "yin_ke_yang"] == 1:
+                rbot = min(o[i], c[i]); prbot = min(o[i-1], c[i-1])
+                bot_s = min((prbot - rbot) / prbot / 0.02, 1.0) if prbot > 0 else 0.0
+                vr = v[i] / prev_vol
+                vs = min((vr - 1.2) / 0.8, 1.0) if vr > 1.2 else 0.0
+                cp = 1.0 - (c[i] - l[i]) / full_range if full_range > 0 else 0.5
+                result[i] = min(max(0.4*bot_s + 0.4*vs + 0.2*cp, 0.0), 1.0)
 
         return result
 

@@ -169,6 +169,25 @@ def test_tangle_with_enough_crosses():
     assert result[12] == "tangle", f"Index 12 should be tangle, got {result[12]}"
 
 
+def test_alignment_sideways():
+    """双斜率均在平区（|s|<0.3%）且非 tangle → sideways。"""
+    calc = MACalculator.__new__(MACalculator)
+    n = 20
+    ma5  = np.full(n, 10.0)
+    ma10 = np.full(n, 10.2)
+    s5  = np.full(n, 0.1)
+    s10 = np.full(n, -0.1)
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": ma5, "ma_5": ma5, "ma_10": ma10,
+        "ma5_slope": s5, "ma10_slope": s10,
+    })
+    result = calc._compute_alignment(df)
+    for i in range(10, n):
+        assert result[i] == "sideways", f"idx {i}: 期望 sideways，实际 {result[i]}"
+
+
 def test_golden_cross(db_with_schema):
     """Integration test: golden cross detection with real DuckDB."""
     con = db_with_schema

@@ -83,6 +83,13 @@ class MACalculator:
                 result[i] = "tangle"
                 continue
 
+            # Sideways: 双斜率均在平区（|s| < 0.3%）且非 tangle
+            s5_flat = s5[i] > -0.3 and s5[i] < 0.3
+            s10_flat = s10[i] > -0.3 and s10[i] < 0.3
+            if s5_flat and s10_flat:
+                result[i] = "sideways"
+                continue
+
             above = ma5[i] > ma10[i]
             s5_up = s5[i] > 0.3
             s5_dn = s5[i] < -0.3
