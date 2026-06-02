@@ -122,7 +122,7 @@ class KPatternCalculator:
             # 2. 阳克阴 (yang_ke_yin): Bull overcomes bear
             #    vol > prev_vol * 1.2 AND max(open,close) > prev max(open,close)
             # ============================================================
-            if (v[i] > v[i - 1] * 1.2
+            if (v[i] > ma_vol_5[i] * 1.2
                     and max(o[i], c[i]) > max(o[i - 1], c[i - 1])
                     and not pd.isna(ma_10[i]) and c[i] > ma_10[i]):
                 df.at[i, "yang_ke_yin"] = 1
@@ -186,7 +186,7 @@ class KPatternCalculator:
             # 7. 阴克阳 (yin_ke_yang): Bear overcomes bull
             #    vol > prev_vol * 1.2 AND min(open,close) < prev min(open,close)
             # ============================================================
-            if (v[i] > v[i - 1] * 1.2
+            if (v[i] > ma_vol_5[i] * 1.2
                     and min(o[i], c[i]) < min(o[i - 1], c[i - 1])
                     and not pd.isna(ma_10[i]) and c[i] < ma_10[i]):
                 df.at[i, "yin_ke_yang"] = 1

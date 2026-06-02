@@ -73,7 +73,8 @@ class DDECalculator:
                         SUM(mf.buy_elg_vol) AS buy_elg_vol,
                         SUM(mf.sell_elg_vol) AS sell_elg_vol,
                         SUM(mf.total_vol) AS total_vol,
-                        SUM(mf.net_mf_amount) AS net_mf_amount
+                        SUM(mf.net_mf_amount) AS net_mf_amount,
+                        COUNT(DISTINCT mf.trade_date) AS active_days
                     FROM {self.src_table} mf
                     JOIN dwd_daily_quote q ON mf.ts_code = q.ts_code AND mf.trade_date = q.trade_date
                     WHERE mf.ts_code = ?
@@ -90,7 +91,8 @@ class DDECalculator:
                         SUM(mf.buy_elg_vol) AS buy_elg_vol,
                         SUM(mf.sell_elg_vol) AS sell_elg_vol,
                         SUM(mf.total_vol) AS total_vol,
-                        SUM(mf.net_mf_amount) AS net_mf_amount
+                        SUM(mf.net_mf_amount) AS net_mf_amount,
+                        COUNT(DISTINCT mf.trade_date) AS active_days
                     FROM {self.src_table} mf
                     JOIN dwd_daily_quote q ON mf.ts_code = q.ts_code AND mf.trade_date = q.trade_date
                     WHERE mf.ts_code = ? AND mf.trade_date > ? AND mf.trade_date <= ?
@@ -106,6 +108,26 @@ class DDECalculator:
             if close_row is None:
                 continue
 
+            # 查该周应有交易日数（考虑假期），对比 moneyflow 覆盖
+            if i == 0:
+                expected_days = self.con.execute("""
+                    SELECT COUNT(*) FROM dim_date
+                    WHERE trade_date > (SELECT STRFTIME(CAST(? AS DATE) - INTERVAL 7 DAY))
+                      AND trade_date <= ? AND is_trade_day = 1
+                """, (week_end, week_end)).fetchone()[0]
+            else:
+                expected_days = self.con.execute("""
+                    SELECT COUNT(*) FROM dim_date
+                    WHERE trade_date > ? AND trade_date <= ? AND is_trade_day = 1
+                """, (week_start, week_end)).fetchone()[0]
+
+            active_days = agg[6] if agg[6] else 0
+            skip_dde = False
+            if expected_days == 0:
+                continue  # 无交易日（如黄金周），不应存在周线
+            if active_days < expected_days * 0.6:
+                skip_dde = True  # moneyflow 覆盖不足 60%
+
             rows.append({
                 "trade_date": week_end,
                 "buy_lg_vol": agg[0] if agg[0] else 0,
@@ -115,6 +137,7 @@ class DDECalculator:
                 "total_vol": agg[4] if agg[4] else 0,
                 "net_mf_amount": agg[5] if agg[5] else 0,
                 "close_qfq": close_row[0],
+                "_skip_dde": skip_dde,
             })
 
         if not rows:
@@ -129,11 +152,14 @@ class DDECalculator:
         sell_elg = df["sell_elg_vol"].values.astype(float)
         total = df["total_vol"].values.astype(float)
 
+        # 检查 _skip_dde 标记（周线 moneyflow 覆盖不足的周）
+        skip_mask = df.get("_skip_dde", pd.Series([False] * len(df)))
+
         # DDX = (buy_lg + buy_elg - sell_lg - sell_elg) / total_vol
         net_big = buy_lg + buy_elg - sell_lg - sell_elg
         ddx = np.full(len(df), np.nan)
         for i in range(len(df)):
-            if total[i] != 0:
+            if not skip_mask.iloc[i] and total[i] != 0:
                 ddx[i] = net_big[i] / total[i]
         df["ddx"] = ddx
 
