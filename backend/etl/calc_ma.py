@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import sma, to_float_safe
+from backend.etl.base import sma, to_float_safe, linear_regression_slope
 
 
 class MACalculator:
@@ -51,12 +51,24 @@ class MACalculator:
 
     def _compute_alignment(self, df: pd.DataFrame) -> list:
         """9-value alignment classification based on MA5/MA10 relative position
-        and dual-slope direction (threshold +/- 0.3% over 3 days)."""
+        and dual-slope direction (threshold +/- 0.3% over 3 days).
+
+        Tangle requires BOTH: gap < 3% of MA10 AND >= 2 crosses in last 10 days.
+        """
         result = [None] * len(df)
         ma5 = df["ma_5"].values
         ma10 = df["ma_10"].values
         s5 = df["ma5_slope"].values
         s10 = df["ma10_slope"].values
+
+        # Pre-compute crosses for tangle cross-count
+        cross_marker = np.zeros(len(df), dtype=int)
+        for i in range(1, len(df)):
+            if pd.isna(ma5[i]) or pd.isna(ma10[i]) or pd.isna(ma5[i - 1]) or pd.isna(ma10[i - 1]):
+                continue
+            if (ma5[i - 1] <= ma10[i - 1] and ma5[i] > ma10[i]) or \
+               (ma5[i - 1] >= ma10[i - 1] and ma5[i] < ma10[i]):
+                cross_marker[i] = 1
 
         for i in range(len(df)):
             if pd.isna(ma5[i]) or pd.isna(ma10[i]):
@@ -64,9 +76,10 @@ class MACalculator:
             if pd.isna(s5[i]) or pd.isna(s10[i]):
                 continue
 
-            # Tangle: near cross (gap < 3% of MA10, with epsilon for float boundary)
+            # Tangle: gap < 3% AND >= 2 crosses in last 10 days
             gap = abs(ma5[i] - ma10[i]) / ma10[i] if ma10[i] != 0 else 0
-            if gap < 0.0299:
+            recent_crosses = cross_marker[max(0, i - 9):i + 1].sum()
+            if gap < 0.0299 and recent_crosses >= 2:
                 result[i] = "tangle"
                 continue
 
@@ -96,7 +109,11 @@ class MACalculator:
         return result
 
     def _compute_turning_points(self, df: pd.DataFrame) -> list:
-        """Golden cross (金叉) / Dead cross (死叉) detection on MA5/MA10 crossover."""
+        """Golden/dead cross + near_golden/near_dead on MA5/MA10 crossover.
+
+        Near golden: MA5 < MA10, gap narrowing, |MA5-MA10|/MA10 < 15%.
+        Near dead:   MA5 > MA10, gap narrowing, |MA5-MA10|/MA10 < 15%.
+        """
         result = [None] * len(df)
         ma5 = df["ma_5"].values
         ma10 = df["ma_10"].values
@@ -106,10 +123,42 @@ class MACalculator:
                 continue
             if pd.isna(ma5[i]) or pd.isna(ma10[i]):
                 continue
+            if ma10[i] == 0:
+                continue
+
+            # Golden / dead cross
             if ma5[i - 1] <= ma10[i - 1] and ma5[i] > ma10[i]:
                 result[i] = "golden_cross"
+                continue
             elif ma5[i - 1] >= ma10[i - 1] and ma5[i] < ma10[i]:
                 result[i] = "dead_cross"
+                continue
+
+            # Near golden / near dead
+            gap = abs(ma5[i] - ma10[i])
+
+            # 收敛判定：优先用 3 日回归（容忍日间波动），兜底 3 日绝对值缩小
+            narrowing = False
+            if i >= 2:
+                gap_seq = np.array([
+                    abs(ma5[i - 2] - ma10[i - 2]),
+                    abs(ma5[i - 1] - ma10[i - 1]),
+                    gap,
+                ])
+                gap_slope = linear_regression_slope(gap_seq, use_log=False)
+                narrowing = gap_slope < 0 or gap < abs(ma5[i - 2] - ma10[i - 2])
+            else:
+                gap_prev = abs(ma5[i - 1] - ma10[i - 1])
+                narrowing = gap < gap_prev
+
+            if not narrowing:
+                continue
+
+            if gap / ma10[i] < 0.15:
+                if ma5[i] < ma10[i]:
+                    result[i] = "near_golden"
+                else:
+                    result[i] = "near_dead"
 
         return result
 

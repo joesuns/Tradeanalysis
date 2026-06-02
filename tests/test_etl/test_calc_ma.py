@@ -56,6 +56,119 @@ def test_alignment_bull_strong():
     assert bull_strong_count > 0, f"Expected bull_strong in uptrend, got: {valid.unique()}"
 
 
+def test_near_golden_ma_3day_regression():
+    """MA 含噪收敛——3 日回归仍能检出。"""
+    calc = MACalculator.__new__(MACalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2", "d3"],
+        "close_qfq": [10.0, 10.1, 10.2, 10.3],
+        "ma_5":      [9.5, 9.6, 9.8, 9.9],
+        "ma_10":     [10.5, 10.5, 10.4, 10.2],
+        "ma5_slope": [0.5, 0.5, 0.5, 0.5],
+        "ma10_slope":[0.5, 0.5, 0.5, 0.5],
+    })
+    result = calc._compute_turning_points(df)
+    # 间距: 1.0, 0.9, 0.6, 0.3。3 日回归 [0.9,0.6,0.3] 斜率负 → 收敛
+    # 0.3/10.2=2.9% < 15% → near_golden
+    assert result[3] == "near_golden", f"MA 含噪收敛应触发 near_golden，实际 {result[3]}"
+
+
+def test_near_golden_ma():
+    """MA5 < MA10, gap narrowing, gap/MA10 < 15% → near_golden."""
+    calc = MACalculator.__new__(MACalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2"],
+        "close_qfq": [10.0, 10.1, 10.2],
+        "ma_5":      [9.8, 9.9, 10.0],
+        "ma_10":     [10.5, 10.4, 10.3],
+        "ma5_slope": [0.5, 0.5, 0.5],
+        "ma10_slope":[0.5, 0.5, 0.5],
+    })
+    result = calc._compute_turning_points(df)
+    # Day 1: MA5=9.9 < MA10=10.4, gap=0.5/10.4=4.8% < 15%
+    # Day 2: gap narrows: 0.4 < 0.5, MA5 < MA10 → near_golden
+    assert result[2] == "near_golden", f"Expected near_golden, got {result[2]}"
+
+
+def test_near_dead_ma():
+    """MA5 > MA10, gap narrowing, gap/MA10 < 15% → near_dead."""
+    calc = MACalculator.__new__(MACalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2"],
+        "close_qfq": [10.0, 10.1, 10.2],
+        "ma_5":      [10.5, 10.4, 10.3],
+        "ma_10":     [9.8, 9.9, 10.0],
+        "ma5_slope": [0.5, 0.5, 0.5],
+        "ma10_slope":[0.5, 0.5, 0.5],
+    })
+    result = calc._compute_turning_points(df)
+    assert result[2] == "near_dead", f"Expected near_dead, got {result[2]}"
+
+
+def test_tangle_needs_cross_count():
+    """Tangle requires gap < 3% AND >= 2 crosses in last 10 days.
+
+    Without sufficient recent crosses, even a small gap should NOT be tangle.
+    """
+    calc = MACalculator.__new__(MACalculator)
+    n = 20
+    # MA5 and MA10 run parallel with 2% gap — no crosses at all
+    ma5 = np.array([10.0 + i * 0.1 for i in range(n)])
+    ma10 = np.array([10.2 + i * 0.1 for i in range(n)])  # gap = 0.2, ~2% of MA10
+    s5 = np.full(n, 0.5)   # both rising
+    s10 = np.full(n, 0.5)
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": ma5,
+        "ma_5": ma5,
+        "ma_10": ma10,
+        "ma5_slope": s5,
+        "ma10_slope": s10,
+    })
+    result = calc._compute_alignment(df)
+    # Gap ~2% < 3%, but zero crosses in last 10 days → NOT tangle
+    # Should be bull_strong (MA5 > MA10, both slopes up)
+    # Wait, MA5=10.0 < MA10=10.2 initially → bull not triggered
+    # MA5 crosses above MA10 when? ma5 = 10+i*0.1, ma10 = 10.2+i*0.1
+    # ma5 never exceeds ma10 because they're parallel with constant gap
+    # So MA5 < MA10 always. Both slopes > 0.3 → bear_rolling
+    for i in range(10, n):
+        gap = abs(ma5[i] - ma10[i]) / ma10[i]
+        assert gap < 0.03, f"Gap at {i} should be < 3%"
+        assert result[i] != "tangle", (
+            f"Index {i}: gap={gap:.3%} < 3% but no crosses, should NOT be tangle, got {result[i]}"
+        )
+
+
+def test_tangle_with_enough_crosses():
+    """Tangle triggers when gap < 3% AND >= 2 crosses in last 10 days."""
+    calc = MACalculator.__new__(MACalculator)
+    n = 20
+    # Create MA lines that zigzag and cross frequently, then converge
+    ma5  = np.array([10.0, 10.3, 9.9, 10.2, 9.8, 10.2, 9.9, 10.1, 9.8, 10.1,
+                     10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+    ma10 = np.array([10.1, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1,
+                     10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+    s5 = np.full(n, 0.0)
+    s10 = np.full(n, 0.0)
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": ma5,
+        "ma_5": ma5,
+        "ma_10": ma10,
+        "ma5_slope": s5,
+        "ma10_slope": s10,
+    })
+    result = calc._compute_alignment(df)
+    # Crosses at indices 1,2,3,4,5,6,7,8 (8 crosses between indices 0-9)
+    # Indices 10-13 should have 2+ crosses in last 10 days + gap=0 → tangle
+    assert result[10] == "tangle", f"Index 10 should be tangle, got {result[10]}"
+    assert result[11] == "tangle", f"Index 11 should be tangle, got {result[11]}"
+    assert result[12] == "tangle", f"Index 12 should be tangle, got {result[12]}"
+
+
 def test_golden_cross(db_with_schema):
     """Integration test: golden cross detection with real DuckDB."""
     con = db_with_schema
