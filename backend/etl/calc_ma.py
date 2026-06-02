@@ -3,6 +3,23 @@ import pandas as pd
 from backend.etl.base import sma, to_float_safe, linear_regression_slope
 
 
+def _compute_slope_pct(series: np.ndarray, window: int = 5) -> np.ndarray:
+    """5-bar linear regression slope, normalized as %/day of current value.
+
+    Replaces the old diff(3)/shift(3)*100 formula. The normalization by
+    current MA value makes slopes comparable across stocks of different prices.
+    """
+    result = np.full(len(series), np.nan)
+    for i in range(window - 1, len(series)):
+        segment = series[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        if len(valid) < window or series[i] == 0:
+            continue
+        raw_slope = linear_regression_slope(valid, use_log=False)
+        result[i] = raw_slope / series[i] * 100.0
+    return result
+
+
 class MACalculator:
     """Moving Average indicator calculator. Computes MA5, MA10, bias, slope,
     alignment (9-value classification), and turning points (golden/dead cross).
@@ -42,16 +59,16 @@ class MACalculator:
         # Bias (乖离率): (close - MA) / MA * 100
         df["bias_ma5"] = (c - df["ma_5"].values) / df["ma_5"].values * 100.0
         df["bias_ma10"] = (c - df["ma_10"].values) / df["ma_10"].values * 100.0
-        # Slope: 3-period rate of change of the MA line
-        df["ma5_slope"] = df["ma_5"].diff(3) / df["ma_5"].shift(3) * 100.0
-        df["ma10_slope"] = df["ma_10"].diff(3) / df["ma_10"].shift(3) * 100.0
+        # Slope: 5-bar linear regression normalized as %/day
+        df["ma5_slope"] = _compute_slope_pct(df["ma_5"].values)
+        df["ma10_slope"] = _compute_slope_pct(df["ma_10"].values)
         df["alignment"] = self._compute_alignment(df)
         df["turning_point"] = self._compute_turning_points(df)
         return df
 
     def _compute_alignment(self, df: pd.DataFrame) -> list:
-        """9-value alignment classification based on MA5/MA10 relative position
-        and dual-slope direction (threshold +/- 0.3% over 3 days).
+        """10-value alignment classification based on MA5/MA10 relative position
+        and dual-slope direction (threshold +/- 0.08%/day via 5-bar regression).
 
         Tangle requires BOTH: gap < 3% of MA10 AND >= 2 crosses in last 10 days.
         """
@@ -83,18 +100,18 @@ class MACalculator:
                 result[i] = "tangle"
                 continue
 
-            # Sideways: 双斜率均在平区（|s| < 0.3%）且非 tangle
-            s5_flat = s5[i] > -0.3 and s5[i] < 0.3
-            s10_flat = s10[i] > -0.3 and s10[i] < 0.3
+            # Sideways: 双斜率均在平区（|s| < 0.08%）且非 tangle
+            s5_flat = s5[i] > -0.08 and s5[i] < 0.08
+            s10_flat = s10[i] > -0.08 and s10[i] < 0.08
             if s5_flat and s10_flat:
                 result[i] = "sideways"
                 continue
 
             above = ma5[i] > ma10[i]
-            s5_up = s5[i] > 0.3
-            s5_dn = s5[i] < -0.3
-            s10_up = s10[i] > 0.3
-            s10_dn = s10[i] < -0.3
+            s5_up = s5[i] > 0.08
+            s5_dn = s5[i] < -0.08
+            s10_up = s10[i] > 0.08
+            s10_dn = s10[i] < -0.08
 
             if above and s5_up and s10_up:
                 result[i] = "bull_strong"

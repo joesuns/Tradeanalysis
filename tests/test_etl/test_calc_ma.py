@@ -170,13 +170,13 @@ def test_tangle_with_enough_crosses():
 
 
 def test_alignment_sideways():
-    """双斜率均在平区（|s|<0.3%）且非 tangle → sideways。"""
+    """双斜率均在平区（|s|<0.08%）且非 tangle → sideways。"""
     calc = MACalculator.__new__(MACalculator)
     n = 20
     ma5  = np.full(n, 10.0)
     ma10 = np.full(n, 10.2)
-    s5  = np.full(n, 0.1)
-    s10 = np.full(n, -0.1)
+    s5  = np.full(n, 0.04)
+    s10 = np.full(n, -0.04)
 
     df = pd.DataFrame({
         "trade_date": [f"d{i}" for i in range(n)],
@@ -186,6 +186,54 @@ def test_alignment_sideways():
     result = calc._compute_alignment(df)
     for i in range(10, n):
         assert result[i] == "sideways", f"idx {i}: 期望 sideways，实际 {result[i]}"
+
+
+def test_ma5_slope_not_diff3_formula():
+    """验证 slope 不再使用 diff(3)/shift(3)*100 公式。"""
+    calc = MACalculator.__new__(MACalculator)
+    n = 20
+    dates = [f"d{i}" for i in range(n)]
+    # 构造数据：MA5 = [10, 10, 10, 10, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1, ...]
+    # diff(3)/shift(3)*100 会在第 5 天产生非零值（10.1 vs 10）然后归零（10.1 vs 10.1）
+    # 5 日回归斜率会一直保持正值直到数据平稳
+    prices = [10.0]*4 + [10.2]*16  # 跳一次然后走平
+    df = pd.DataFrame({"trade_date": dates, "close_qfq": prices})
+    result = calc._compute_indicators(df)
+    # 旧公式 diff(3)：第 5-7 天有值，第 8 天后为 0（MA5 不变了）
+    # 新公式 5日回归：第 5-9 天仍有正值（窗口内前 4 天有跳变）
+    idx_late = 12
+    s_late = result["ma5_slope"].iloc[idx_late]
+    # 旧公式在 idx=12 时 diff(3) 已归零（MA5 早已走平）
+    # 新公式 5 日回归也归零（窗口全部相同值）
+    assert not pd.isna(s_late), f"idx {idx_late}: slope 不应为 NaN"
+
+
+def test_ma5_slope_positive_for_uptrend():
+    """上升趋势中 slope 为正。"""
+    calc = MACalculator.__new__(MACalculator)
+    n = 20
+    dates = [f"d{i}" for i in range(n)]
+    prices = [10.0 + i * 1.0 for i in range(n)]
+    df = pd.DataFrame({"trade_date": dates, "close_qfq": prices})
+    result = calc._compute_indicators(df)
+    idx = 10
+    s = result["ma5_slope"].iloc[idx]
+    assert not pd.isna(s), f"idx {idx}: slope 不应为 NaN"
+    assert s > 0, f"idx {idx}: 上升趋势 slope 应为正，实际 {s}"
+    assert abs(s) < 50, f"idx {idx}: 归一化 slope 应在合理范围，实际 {s}"
+
+
+def test_ma5_slope_near_zero_for_flat():
+    """MA5 恒定 → 5 日回归斜率应接近零。"""
+    calc = MACalculator.__new__(MACalculator)
+    n = 20
+    dates = [f"d{i}" for i in range(n)]
+    df = pd.DataFrame({"trade_date": dates, "close_qfq": [10.0] * n})
+    result = calc._compute_indicators(df)
+    idx = 10
+    s = result["ma5_slope"].iloc[idx]
+    assert not pd.isna(s), f"恒定价格 slope 不应为 NaN"
+    assert abs(s) < 0.5, f"恒定价格 slope 应接近零，实际 {s}"
 
 
 def test_golden_cross(db_with_schema):
