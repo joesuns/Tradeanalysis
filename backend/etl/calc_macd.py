@@ -139,11 +139,11 @@ class MACDCalculator:
 
             # Top divergence: DIF peaked in past, DIF has fallen from peak,
             #                price still near 60d high (within 2%).
-            dif_peak_idx = window_dif.idxmax()
+            dif_peak_iloc = np.argmax(window_dif.values)
             dif_has_fallen = d_hi != 0 and cur_d < d_hi
             price_near_peak = cur_c >= c_hi * 0.98
 
-            if dif_peak_idx < df.index[i] and dif_has_fallen and price_near_peak:
+            if dif_peak_iloc < w and dif_has_fallen and price_near_peak:
                 # Dedup: no top_divergence within previous 5 bars
                 recent = any(result[j] == "top_divergence" for j in range(max(0, i - 5), i))
                 if not recent:
@@ -151,11 +151,11 @@ class MACDCalculator:
 
             # Bottom divergence: DIF valley in past, DIF has recovered from valley,
             #                   price still near 60d low (within 2%).
-            dif_valley_idx = window_dif.idxmin()
+            dif_valley_iloc = np.argmin(window_dif.values)
             dif_has_recovered = d_lo != 0 and cur_d > d_lo
             price_near_bottom = cur_c <= c_lo * 1.02
 
-            if dif_valley_idx < df.index[i] and dif_has_recovered and price_near_bottom:
+            if dif_valley_iloc < w and dif_has_recovered and price_near_bottom:
                 recent = any(result[j] == "bottom_divergence" for j in range(max(0, i - 5), i))
                 if not recent:
                     result[i] = "bottom_divergence"
