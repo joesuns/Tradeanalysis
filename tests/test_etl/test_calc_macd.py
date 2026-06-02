@@ -341,6 +341,82 @@ def test_macd_divergence_no_duplicate_within_5_days():
         assert gap > 5, f"Divergence at {div_indices[j-1]} and {div_indices[j]} too close (gap={gap})"
 
 
+def test_macd_bottom_div_recovery_strong():
+    """DIF 回升 >10% + 价格低点 3 天前 → 底背离触发。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    n = 68
+    close = np.full(n, 10.0)
+    dif = np.full(n, 0.5)
+    for i in range(30, 58):
+        close[i] = 10.0 - (i - 30) * 0.1
+    for i in range(30, 56):
+        dif[i] = 0.5 - (i - 30) * 0.05
+    dif[55] = -0.75
+    for i in range(56, n):
+        dif[i] = dif[i-1] + 0.04
+        close[i] = close[57] * 1.001    # 极慢反弹, 距低点仍在 2% 内
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close, "dif": dif,
+    })
+    result = calc._compute_divergence(df)
+    # DIF 回升 >10% + 价格止跌 → 底背离触发（可能在5日去重窗口内附近）
+    any_bottom = any(r == "bottom_divergence" for r in result[58:63])
+    assert any_bottom, "DIF回升>10%+价格止跌应触发底背离"
+
+
+def test_macd_bottom_div_recovery_weak():
+    """DIF 回升 <10% → 不触发。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    n = 68
+    close = np.full(n, 10.0)
+    dif = np.full(n, 0.5)
+    for i in range(30, 58):
+        close[i] = 10.0 - (i - 30) * 0.1
+    for i in range(30, 56):
+        dif[i] = 0.5 - (i - 30) * 0.05
+    dif[55] = -0.75
+    for i in range(56, n):
+        dif[i] = dif[i-1] + 0.002      # 回升极慢
+        close[i] = close[57] * 1.005
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close, "dif": dif,
+    })
+    result = calc._compute_divergence(df)
+    for i in range(60, n):
+        assert result[i] != "bottom_divergence", (
+            f"DIF回升<10%不应触发，idx {i} 实际 {result[i]}"
+        )
+
+
+def test_macd_bottom_div_price_still_falling():
+    """价格仍在创新低 → 不触发。"""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    n = 68
+    close = np.full(n, 10.0)
+    dif = np.full(n, 0.5)
+    for i in range(30, n):
+        close[i] = 10.0 - (i - 30) * 0.1     # 持续下跌
+    for i in range(30, 56):
+        dif[i] = 0.5 - (i - 30) * 0.05
+    dif[55] = -0.75
+    for i in range(56, n):
+        dif[i] = dif[i-1] + 0.03
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close, "dif": dif,
+    })
+    result = calc._compute_divergence(df)
+    for i in range(60, n):
+        assert result[i] != "bottom_divergence", (
+            f"价格仍创新低不应触发，idx {i} 实际 {result[i]}"
+        )
+
+
 def test_macd_golden_cross(db_with_schema):
     """Integration test: golden cross detection with real DuckDB."""
     con = db_with_schema

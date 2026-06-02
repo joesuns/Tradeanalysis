@@ -149,13 +149,21 @@ class MACDCalculator:
                 if not recent:
                     result[i] = "top_divergence"
 
-            # Bottom divergence: DIF valley in past, DIF has recovered from valley,
-            #                   price still near 60d low (within 2%).
+            # Bottom divergence: DIF valley in past, DIF recovered >10%,
+            #                   price stopped falling (low >= 3 bars ago).
             dif_valley_iloc = np.argmin(window_dif.values)
+            dif_valley_val = window_dif.min()
             dif_has_recovered = d_lo != 0 and cur_d > d_lo
+            # 回升确认：DIF 回升幅度 > 谷值绝对值的 10%
+            dif_recovery_pct = (cur_d - d_lo) / abs(d_lo) if d_lo != 0 else 0
+            dif_confirmed = dif_recovery_pct > 0.1
+            # 价格止跌确认：60日低点距今 >= 3 根 bar
+            c_lo_iloc = np.argmin(window_close.values)
+            price_stopped = (w - c_lo_iloc) >= 3
             price_near_bottom = cur_c <= c_lo * 1.02
 
-            if dif_valley_iloc < w and dif_has_recovered and price_near_bottom:
+            if (dif_valley_iloc < w and dif_has_recovered and dif_confirmed
+                    and price_stopped and price_near_bottom):
                 recent = any(result[j] == "bottom_divergence" for j in range(max(0, i - 5), i))
                 if not recent:
                     result[i] = "bottom_divergence"
