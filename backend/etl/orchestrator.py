@@ -7,12 +7,13 @@ Usage:
     run_etl(step="calc-dws", ts_codes=["000001.SZ"])  # specific stocks
 """
 
-import logging
 from typing import Optional
 from datetime import datetime
 
 from backend.db.connection import get_connection, check_connectivity, run_checkpoint
-from backend.etl.error_handler import log_etl, check_data_completeness
+from backend.etl.error_handler import (
+    log_etl_start, log_etl_end, log_etl_error, check_data_completeness,
+)
 from backend.fetch.client import TushareClient
 from backend.fetch.ods_daily import fetch_by_date_range_parallel, get_all_active_codes
 from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
@@ -22,8 +23,6 @@ from backend.etl.calc_ma import MACalculator
 from backend.etl.calc_kpattern import KPatternCalculator
 from backend.etl.calc_dde import DDECalculator
 from backend.etl.calc_volume import VolumeCalculator
-
-logger = logging.getLogger(__name__)
 
 CALCULATORS = [MACDCalculator, MACalculator, KPatternCalculator,
                DDECalculator, VolumeCalculator]
@@ -51,13 +50,14 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
     try:
         # 0. Self-check
         health = check_connectivity()
+        lid, t0 = log_etl_start(con, "health_check")
         if "fatal" in health.get("duckdb", ""):
-            log_etl(con, "health_check", "failed",
-                    error_msg=health["duckdb"])
+            log_etl_end(con, lid, "health_check", t0, "failed",
+                        error_msg=health["duckdb"])
             raise RuntimeError(health["duckdb"])
-        log_etl(con, "health_check", "success",
-                error_msg=f"DuckDB v{health['version']}, "
-                          f"{health['disk_free_mb']}MB free")
+        log_etl_end(con, lid, "health_check", t0, "success",
+                    error_msg=f"DuckDB v{health['version']}, "
+                              f"{health['disk_free_mb']}MB free")
 
         # 1. Determine what to run
         if step in ("fetch-ods", "build-all"):
@@ -66,50 +66,88 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             from backend.fetch.ods_stock_basic import fetch_stock_basic
             from backend.fetch.ods_trade_cal import fetch_trade_cal
             from backend.fetch.ods_concept import fetch_concept_detail
+
+            lid, t0 = log_etl_start(con, "fetch_stock_basic")
             n = fetch_stock_basic(client, con)
-            log_etl(con, "fetch_stock_basic", "success", row_count=n)
+            log_etl_end(con, lid, "fetch_stock_basic", t0, "success", row_count=n)
+
+            lid, t0 = log_etl_start(con, "fetch_trade_cal")
             n = fetch_trade_cal(client, con)
-            log_etl(con, "fetch_trade_cal", "success", row_count=n)
+            log_etl_end(con, lid, "fetch_trade_cal", t0, "success", row_count=n)
+
             codes = ts_codes or get_all_active_codes(con)
             # Date-based batch fetch FIRST — 4 API calls/day for ALL stocks (~30s)
+            lid, t0 = log_etl_start(con, "fetch_market_data")
             rows = fetch_by_date_range_parallel(
-                start or "20150101", end or "20991231", workers=3)
-            log_etl(con, "fetch_market_data", "success", row_count=rows)
+                start or "20150101", end or "20991231", workers=3,
+                ts_codes=ts_codes)
+            log_etl_end(con, lid, "fetch_market_data", t0, "success", row_count=rows)
+
             # Concept detail LAST — per-stock calls, low priority, skip on failure
+            lid, t0 = log_etl_start(con, "fetch_concept_detail")
             try:
                 n = fetch_concept_detail(client, con, ts_codes=codes)
-                log_etl(con, "fetch_concept_detail", "success", row_count=n)
+                log_etl_end(con, lid, "fetch_concept_detail", t0, "success", row_count=n)
             except Exception as e:
-                log_etl(con, "fetch_concept_detail", "degraded",
-                        error_msg=f"skipped (rate limited): {e}")
+                log_etl_end(con, lid, "fetch_concept_detail", t0, "degraded",
+                            error_msg=f"skipped (rate limited): {e}")
+
+            # Run data completeness check after fetch
+            lid, t0 = log_etl_start(con, "data_completeness_check")
+            comp = check_data_completeness(con)
+            log_etl_end(con, lid, "data_completeness_check", t0, "success",
+                        data_completeness=comp)
 
         if step in ("build-dim", "build-all"):
-            n = build_dim_stock(con)
-            log_etl(con, "build_dim_stock", "success", row_count=n)
-            n = build_dim_date(con)
-            log_etl(con, "build_dim_date", "success", row_count=n)
-            nc, nm = build_dim_concept(con)
-            log_etl(con, "build_dim_concept", "success", row_count=nc + nm)
+            for dim_step, fn in [
+                ("build_dim_stock", build_dim_stock),
+                ("build_dim_date", build_dim_date),
+                ("build_dim_concept", build_dim_concept),
+            ]:
+                lid, t0 = log_etl_start(con, dim_step)
+                try:
+                    if dim_step == "build_dim_concept":
+                        nc, nm = fn(con)
+                        n = nc + nm
+                    else:
+                        n = fn(con)
+                    log_etl_end(con, lid, dim_step, t0, "success", row_count=n)
+                except Exception as e:
+                    log_etl_error(con, lid, dim_step, t0, 0, e)
+                    raise
 
         if step in ("build-dwd", "build-all"):
             codes = ts_codes or get_all_active_codes(con)
-            n = build_dwd_daily_quote(con, codes)
-            log_etl(con, "build_dwd_daily", "success", row_count=n)
-            n = build_dwd_weekly_quote(con, codes)
-            log_etl(con, "build_dwd_weekly", "success", row_count=n)
-            n = build_dwd_daily_moneyflow(con, codes)
-            log_etl(con, "build_dwd_moneyflow", "success", row_count=n)
+            for dwd_step, fn in [
+                ("build_dwd_daily_quote", build_dwd_daily_quote),
+                ("build_dwd_weekly_quote", build_dwd_weekly_quote),
+                ("build_dwd_daily_moneyflow", build_dwd_daily_moneyflow),
+            ]:
+                lid, t0 = log_etl_start(con, dwd_step)
+                try:
+                    n = fn(con, codes)
+                    log_etl_end(con, lid, dwd_step, t0, "success", row_count=n)
+                except Exception as e:
+                    log_etl_error(con, lid, dwd_step, t0, 0, e)
+                    raise
 
         if step in ("calc-dws", "build-all"):
             codes = ts_codes or get_all_active_codes(con)
-            calc_date = datetime.now().strftime("%Y%m%d")
-            for i in range(0, len(codes), batch_size):
-                batch = codes[i:i + batch_size]
-                for CalcCls in CALCULATORS:
-                    for freq in ("daily", "weekly"):
-                        calc = CalcCls(con, freq)
-                        calc.calculate(batch, calc_date)
-            log_etl(con, "calc_dws", "success", row_count=len(codes))
+            lid, t0 = log_etl_start(con, "calc_dws")
+            try:
+                calc_date = datetime.now().strftime("%Y%m%d")
+                total = 0
+                for i in range(0, len(codes), batch_size):
+                    batch = codes[i:i + batch_size]
+                    for CalcCls in CALCULATORS:
+                        for freq in ("daily", "weekly"):
+                            calc = CalcCls(con, freq)
+                            calc.calculate(batch, calc_date)
+                    total += len(batch)
+                log_etl_end(con, lid, "calc_dws", t0, "success", row_count=total)
+            except Exception as e:
+                log_etl_error(con, lid, "calc_dws", t0, 0, e)
+                raise
 
         # Final checkpoint
         run_checkpoint(con)
