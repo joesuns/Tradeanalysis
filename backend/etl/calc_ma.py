@@ -158,11 +158,19 @@ class MACalculator:
                 result[i] = "dead_cross"
                 continue
 
-            # Near golden / near dead
+            # Near golden / near dead: 预估交叉天数 < 3
             gap = abs(ma5[i] - ma10[i])
+            gap_pct = gap / ma10[i]
 
-            # 收敛判定：优先用 3 日回归（容忍日间波动），兜底 3 日绝对值缩小
-            narrowing = False
+            # 小间距直通: gap < 0.5% of MA10
+            if gap_pct < 0.005:
+                if ma5[i] < ma10[i]:
+                    result[i] = "near_golden"
+                else:
+                    result[i] = "near_dead"
+                continue
+
+            # 速度判定: 3 日回归 est_days = gap / convergence_speed
             if i >= 2:
                 gap_seq = np.array([
                     abs(ma5[i - 2] - ma10[i - 2]),
@@ -170,19 +178,13 @@ class MACalculator:
                     gap,
                 ])
                 gap_slope = linear_regression_slope(gap_seq, use_log=False)
-                narrowing = gap_slope < 0 or gap < abs(ma5[i - 2] - ma10[i - 2])
-            else:
-                gap_prev = abs(ma5[i - 1] - ma10[i - 1])
-                narrowing = gap < gap_prev
-
-            if not narrowing:
-                continue
-
-            if gap / ma10[i] < 0.15:
-                if ma5[i] < ma10[i]:
-                    result[i] = "near_golden"
-                else:
-                    result[i] = "near_dead"
+                if gap_slope < 0:
+                    conv_speed = -gap_slope
+                    if conv_speed > 1e-9 and gap / conv_speed < 3:
+                        if ma5[i] < ma10[i]:
+                            result[i] = "near_golden"
+                        else:
+                            result[i] = "near_dead"
 
         return result
 

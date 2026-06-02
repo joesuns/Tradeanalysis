@@ -105,6 +105,54 @@ def test_near_dead_ma():
     assert result[2] == "near_dead", f"Expected near_dead, got {result[2]}"
 
 
+def test_near_ma_small_gap_direct():
+    """间距 < 0.5% → 直通 near_golden，不看收敛速度。"""
+    calc = MACalculator.__new__(MACalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2", "d3"],
+        "close_qfq": [10.0, 10.1, 10.2, 10.3],
+        "ma_5":      [9.9, 9.95, 9.97, 9.98],
+        "ma_10":     [10.0, 10.0, 10.0, 10.0],
+        "ma5_slope": [0.5, 0.5, 0.5, 0.5],
+        "ma10_slope":[0.5, 0.5, 0.5, 0.5],
+    })
+    result = calc._compute_turning_points(df)
+    # gap/ma10 = 0.02/10.0 = 0.2% < 0.5% → 直通
+    assert result[3] == "near_golden", f"小间距应直通 near_golden，实际 {result[3]}"
+
+
+def test_near_ma_est_too_slow():
+    """gap 大 + 收敛太慢 → est>3 → 不触发。"""
+    calc = MACalculator.__new__(MACalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2", "d3"],
+        "close_qfq": [10.0, 10.1, 10.2, 10.3],
+        "ma_5":      [9.5, 9.52, 9.55, 9.58],
+        "ma_10":     [10.5, 10.48, 10.46, 10.44],
+        "ma5_slope": [0.5, 0.5, 0.5, 0.5],
+        "ma10_slope":[0.5, 0.5, 0.5, 0.5],
+    })
+    result = calc._compute_turning_points(df)
+    # gaps: 1.0, 0.96, 0.91, 0.86 → 收敛太慢 est>>3
+    assert result[3] is None, f"收敛太慢不应触发，实际 {result[3]}"
+
+
+def test_near_ma_widening():
+    """间距扩大 → 不触发。"""
+    calc = MACalculator.__new__(MACalculator)
+    df = pd.DataFrame({
+        "trade_date": ["d0", "d1", "d2", "d3"],
+        "close_qfq": [10.0, 10.1, 10.2, 10.3],
+        "ma_5":      [9.5, 9.4, 9.3, 9.2],
+        "ma_10":     [10.0, 10.1, 10.2, 10.3],
+        "ma5_slope": [0.5, 0.5, 0.5, 0.5],
+        "ma10_slope":[0.5, 0.5, 0.5, 0.5],
+    })
+    result = calc._compute_turning_points(df)
+    # gaps: 0.5, 0.7, 0.9, 1.1 → 扩大中
+    assert result[3] is None, f"间距扩大不应触发，实际 {result[3]}"
+
+
 def test_tangle_needs_cross_count():
     """Tangle requires gap < 3% AND >= 2 crosses in last 10 days.
 
