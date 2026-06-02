@@ -185,6 +185,7 @@ def test_dde_divergence_window_60():
     df = pd.DataFrame({
         "trade_date": [f"d{i}" for i in range(n)],
         "close_qfq": close,
+        "ddx": ddx2,   # 新增：_compute_divergence 现在读 ddx 列
         "ddx2": ddx2,
     })
     result = calc._compute_divergence(df)
@@ -211,6 +212,7 @@ def test_dde_divergence_no_tie_false_positive():
     df = pd.DataFrame({
         "trade_date": [f"d{i}" for i in range(n)],
         "close_qfq": close,
+        "ddx": ddx2,   # 新增：_compute_divergence 现在读 ddx 列
         "ddx2": ddx2,
     })
     result = calc._compute_divergence(df)
@@ -227,6 +229,53 @@ def test_dde_trend_8bar_window():
                      0.006, 0.007, 0.008, 0.009, 0.010])
     result = calc._compute_trend(ddx2, window=8)
     assert result[9] is not None, "8-bar 窗口下第 9 根应有趋势值"
+
+
+def test_dde_divergence_uses_ddx():
+    """背离检测使用原始 DDX（非 DDX2），信号更早触发。"""
+    calc = DDECalculator.__new__(DDECalculator)
+    n = 68
+    close = np.full(n, 10.0)
+    ddx = np.full(n, 0.05)
+    for i in range(30, 57):
+        ddx[i] = 0.05 + (i - 30) * 0.01   # DDX 第 56 天见顶
+    for i in range(57, n):
+        ddx[i] = ddx[56] - (i - 56) * 0.01  # DDX 回落
+    for i in range(30, 61):
+        close[i] = 10.0 + (i - 30) * 0.1   # 价格第 60 天见顶
+    for i in range(61, n):
+        close[i] = close[60] * 0.99
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close, "ddx": ddx,
+    })
+    result = calc._compute_divergence(df)
+    div_indices = [i for i, v in enumerate(result) if v == "top_divergence"]
+    assert len(div_indices) >= 1, "DDX 背离应至少检测到一次"
+
+
+def test_dde_divergence_spike_filtered():
+    """单日 DDX 尖刺不应成为 60 日伪峰值触发假背离。"""
+    calc = DDECalculator.__new__(DDECalculator)
+    n = 68
+    close = np.full(n, 10.0)
+    ddx = np.full(n, 0.05)
+    ddx[55] = 0.50  # 单日尖刺 10x，邻域无确认
+    for i in range(30, 61):
+        close[i] = 10.0 + (i - 30) * 0.1
+    for i in range(61, n):
+        close[i] = close[60] * 0.99
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close, "ddx": ddx,
+    })
+    result = calc._compute_divergence(df)
+    for i in range(55, 60):
+        assert result[i] != "top_divergence", (
+            f"idx {i}: 单日尖刺不应触发背离"
+        )
 
 
 def test_integration_dde_daily(db_with_schema):

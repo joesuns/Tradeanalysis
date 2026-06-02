@@ -205,48 +205,66 @@ class DDECalculator:
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
-        """Top/bottom divergence using DDX2 vs close over 60-day window.
+        """Top/bottom divergence using DDX (raw) vs close over 60-day window.
 
-        Confirmation day: DDX2 has clearly rolled from its 60d peak/valley,
+        Confirmation day: DDX has clearly rolled from its 60d peak/valley,
         but price still near extreme. Dedup: no repeat within 5 bars.
+        Single-bar DDX spikes are filtered by requiring at least 2 bars
+        within ±2 days of the peak to reach >= 80% of the peak value.
         """
         result = [None] * len(df)
         w = 59  # 60-bar window: iloc[i-59 : i+1] = 60 elements
         for i in range(w, len(df)):
             window_close = df["close_qfq"].iloc[i - w : i + 1]
-            window_ddx2 = df["ddx2"].iloc[i - w : i + 1]
+            window_ddx = df["ddx"].iloc[i - w : i + 1]
 
-            if window_ddx2.isna().any():
+            if window_ddx.isna().any():
                 continue
 
             c_hi = window_close.max()
             c_lo = window_close.min()
-            d_hi = window_ddx2.max()
-            d_lo = window_ddx2.min()
+            d_hi = window_ddx.max()
+            d_lo = window_ddx.min()
             cur_c = df["close_qfq"].iloc[i]
-            cur_d = df["ddx2"].iloc[i]
+            cur_d = df["ddx"].iloc[i]
 
             if pd.isna(cur_c) or pd.isna(cur_d):
                 continue
 
-            # Top divergence: DDX2 peaked in past, has fallen from peak,
+            # Top divergence: DDX peaked in past, has fallen from peak,
             #                price still near 60d high (within 2%).
-            ddx2_peak_idx = window_ddx2.idxmax()
-            ddx2_fallen = d_hi != 0 and cur_d < d_hi
+            ddx_peak_idx = window_ddx.idxmax()
+            ddx_peak_val = window_ddx.max()
+            ddx_fallen = d_hi != 0 and cur_d < d_hi
             price_near_peak = cur_c >= c_hi * 0.98
 
-            if ddx2_peak_idx < df.index[i] and ddx2_fallen and price_near_peak:
+            # 邻域确认：峰值不是孤立的单日尖刺
+            peak_iloc = window_ddx.index.get_loc(ddx_peak_idx)
+            neighbors = window_ddx.iloc[
+                max(0, peak_iloc - 2):min(len(window_ddx), peak_iloc + 3)
+            ]
+            is_spike = (neighbors >= ddx_peak_val * 0.8).sum() < 2
+
+            if ddx_peak_idx < df.index[i] and ddx_fallen and not is_spike and price_near_peak:
                 recent = any(result[j] == "top_divergence" for j in range(max(0, i - 5), i))
                 if not recent:
                     result[i] = "top_divergence"
 
-            # Bottom divergence: DDX2 valley in past, has recovered from valley,
+            # Bottom divergence: DDX valley in past, has recovered from valley,
             #                   price still near 60d low (within 2%).
-            ddx2_valley_idx = window_ddx2.idxmin()
-            ddx2_recovered = d_lo != 0 and cur_d > d_lo
+            ddx_valley_idx = window_ddx.idxmin()
+            ddx_valley_val = window_ddx.min()
+            ddx_recovered = d_lo != 0 and cur_d > d_lo
             price_near_bottom = cur_c <= c_lo * 1.02
 
-            if ddx2_valley_idx < df.index[i] and ddx2_recovered and price_near_bottom:
+            # 邻域确认：谷值不是孤立的单日尖刺
+            valley_iloc = window_ddx.index.get_loc(ddx_valley_idx)
+            v_neighbors = window_ddx.iloc[
+                max(0, valley_iloc - 2):min(len(window_ddx), valley_iloc + 3)
+            ]
+            is_valley_spike = (v_neighbors <= ddx_valley_val * 1.2).sum() < 2
+
+            if ddx_valley_idx < df.index[i] and ddx_recovered and not is_valley_spike and price_near_bottom:
                 recent = any(result[j] == "bottom_divergence" for j in range(max(0, i - 5), i))
                 if not recent:
                     result[i] = "bottom_divergence"
