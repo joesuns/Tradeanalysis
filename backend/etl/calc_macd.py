@@ -43,17 +43,17 @@ class MACDCalculator:
         df["zone"] = df["macd_bar"].apply(
             lambda x: "bull" if x > 0 else ("bear" if x < 0 else None)
         )
-        window = 4  # 4-bar regression for both daily and weekly
+        window = 8  # 8-bar regression for both daily and weekly
         df["trend"] = self._compute_trend(df["macd_bar"].values, window=window)
         df["divergence"] = self._compute_divergence(df)
         df["turning_point"] = self._compute_turning_points(df)
         df["alert"] = self._compute_alerts(df)
         return df
 
-    def _compute_trend(self, bar: np.ndarray, window: int = 20) -> list:
+    def _compute_trend(self, bar: np.ndarray, window: int = 8) -> list:
         """MACD bar trend via linear regression slope (same method as DDE/Volume).
-        - up: slope > 0.0005
-        - down: slope < -0.0005
+        - up: slope > 0.02
+        - down: slope < -0.02
         - flat: otherwise
         """
         result = [None] * len(bar)
@@ -65,60 +65,141 @@ class MACDCalculator:
             if len(valid) < window:
                 continue
             slope = linear_regression_slope(valid, use_log=False)
-            if slope > 0.2:
+            if slope > 0.02:
                 result[i] = "up"
-            elif slope < -0.2:
+            elif slope < -0.02:
                 result[i] = "down"
             else:
                 result[i] = "flat"
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
-        """Top/bottom divergence using 60-day window. Marked on confirmation day."""
+        """Top/bottom divergence using 60-day window. Marked on confirmation day.
+
+        Confirmation day = DIF has clearly rolled over from its 60d peak
+        but price is still near its 60d high (within 2%).
+        Deduplication: same type of divergence does not repeat within 5 bars.
+        """
         result = [None] * len(df)
-        w = 60
+        w = 59  # 60-bar window: iloc[i-59 : i+1] = 60 elements
         for i in range(w, len(df)):
             window_close = df["close_qfq"].iloc[i - w : i + 1]
             window_dif = df["dif"].iloc[i - w : i + 1]
-            c_hi, c_lo = window_close.max(), window_close.min()
-            d_hi, d_lo = window_dif.max(), window_dif.min()
-            cur_c, cur_d = df["close_qfq"].iloc[i], df["dif"].iloc[i]
-            # Top divergence: price at 60d high but DIF below 60d peak, and DIF peaked BEFORE today
-            if cur_c >= c_hi and cur_d < d_hi:
-                dif_peak_idx = window_dif.idxmax()
-                if dif_peak_idx < df.index[i]:
+            c_hi = window_close.max()
+            c_lo = window_close.min()
+            d_hi = window_dif.max()
+            d_lo = window_dif.min()
+            cur_c = df["close_qfq"].iloc[i]
+            cur_d = df["dif"].iloc[i]
+
+            if pd.isna(cur_c) or pd.isna(cur_d):
+                continue
+
+            # Top divergence: DIF peaked in past, DIF has fallen from peak,
+            #                price still near 60d high (within 2%).
+            dif_peak_idx = window_dif.idxmax()
+            dif_has_fallen = d_hi != 0 and cur_d < d_hi
+            price_near_peak = cur_c >= c_hi * 0.98
+
+            if dif_peak_idx < df.index[i] and dif_has_fallen and price_near_peak:
+                # Dedup: no top_divergence within previous 5 bars
+                recent = any(result[j] == "top_divergence" for j in range(max(0, i - 5), i))
+                if not recent:
                     result[i] = "top_divergence"
-            # Bottom divergence
-            if cur_c <= c_lo and cur_d > d_lo:
-                dif_valley_idx = window_dif.idxmin()
-                if dif_valley_idx < df.index[i]:
+
+            # Bottom divergence: DIF valley in past, DIF has recovered from valley,
+            #                   price still near 60d low (within 2%).
+            dif_valley_idx = window_dif.idxmin()
+            dif_has_recovered = d_lo != 0 and cur_d > d_lo
+            price_near_bottom = cur_c <= c_lo * 1.02
+
+            if dif_valley_idx < df.index[i] and dif_has_recovered and price_near_bottom:
+                recent = any(result[j] == "bottom_divergence" for j in range(max(0, i - 5), i))
+                if not recent:
                     result[i] = "bottom_divergence"
+
         return result
 
     def _compute_turning_points(self, df: pd.DataFrame) -> list:
-        """Golden cross (金叉) / Dead cross (死叉) / Near golden / Near dead."""
+        """Golden cross / Dead cross / Near golden / Near dead.
+
+        Golden/dead cross = MACD bar sign flip.
+        Near golden: DIF < DEA, gap narrowing, |DIF-DEA|/|DEA| < 15%.
+        Near dead:   DIF > DEA, gap narrowing, |DIF-DEA|/|DEA| < 15%.
+        Zero-axis fallback (|DEA| < close * 0.1%):
+            use absolute threshold |DIF-DEA| < close * 0.01%.
+        """
         result = [None] * len(df)
         bar = df["macd_bar"].values
+        dif = df["dif"].values
+        dea = df["dea"].values
+        close = df["close_qfq"].values
+
         for i in range(1, len(df)):
             if pd.isna(bar[i - 1]) or pd.isna(bar[i]):
                 continue
+
+            # Golden / dead cross: MACD bar sign flip
             if bar[i - 1] <= 0 and bar[i] > 0:
                 result[i] = "golden_cross"
+                continue
             elif bar[i - 1] >= 0 and bar[i] < 0:
                 result[i] = "dead_cross"
+                continue
+
+            # Near golden / near dead
+            if pd.isna(dif[i]) or pd.isna(dea[i]) or dea[i] == 0:
+                continue
+            if pd.isna(dif[i - 1]) or pd.isna(dea[i - 1]):
+                continue
+
+            gap = abs(dif[i] - dea[i])
+            gap_prev = abs(dif[i - 1] - dea[i - 1])
+            if gap >= gap_prev:
+                continue  # gap not narrowing
+
+            # Zero-axis fallback: |DEA| < close * 0.1%
+            if abs(dea[i]) < close[i] * 0.001:
+                near = gap < close[i] * 0.0001  # absolute: close * 0.01%
+            else:
+                near = gap / abs(dea[i]) < 0.15  # relative: 15% of |DEA|
+
+            if near:
+                if dif[i] < dea[i]:
+                    result[i] = "near_golden"
+                else:
+                    result[i] = "near_dead"
+
         return result
 
     def _compute_alerts(self, df: pd.DataFrame) -> list:
-        """Upturn/downturn reverse alerts based on most recent 2 comparisons."""
+        """Upturn/downturn reverse + flat alerts.
+
+        - reverse: prev 2 consecutive rises/falls, then direction flips
+        - flat: prev 2 consecutive rises/falls, then |change|/|prev| <= 2%
+        Reverse takes priority over flat when bar[i] < bar[i-1] (or > for downtrend).
+        """
         result = [None] * len(df)
         bar = df["macd_bar"].values
         for i in range(3, len(df)):
-            prev_up = all(bar[i - 1 - j] > bar[i - 2 - j] for j in range(2))
-            prev_down = all(bar[i - 1 - j] < bar[i - 2 - j] for j in range(2))
-            if prev_up and bar[i] < bar[i - 1]:
-                result[i] = "upturn_reverse"
-            elif prev_down and bar[i] > bar[i - 1]:
-                result[i] = "downturn_reverse"
+            prev = bar[i - 3:i + 1]
+            if any(pd.isna(x) for x in prev):
+                continue
+
+            prev_up = bar[i - 1] > bar[i - 2] and bar[i - 2] > bar[i - 3]
+            prev_down = bar[i - 1] < bar[i - 2] and bar[i - 2] < bar[i - 3]
+
+            if prev_up:
+                if bar[i] < bar[i - 1]:
+                    result[i] = "upturn_reverse"
+                elif bar[i - 1] != 0 and abs(bar[i] - bar[i - 1]) / abs(bar[i - 1]) <= 0.02:
+                    result[i] = "upturn_flat"
+            elif prev_down:
+                if bar[i] > bar[i - 1]:
+                    result[i] = "downturn_reverse"
+                elif bar[i - 1] != 0 and abs(bar[i] - bar[i - 1]) / abs(bar[i - 1]) <= 0.02:
+                    result[i] = "downturn_flat"
+
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
