@@ -278,6 +278,53 @@ def test_dde_divergence_spike_filtered():
         )
 
 
+def test_dde_bottom_div_triggers():
+    """DDX 谷值回升 >10% + 价格止跌 → DDE 底背离触发。"""
+    calc = DDECalculator.__new__(DDECalculator)
+    n = 68
+    close = np.full(n, 10.0)
+    ddx = np.full(n, 0.05)
+    for i in range(30, 58):
+        close[i] = 10.0 - (i - 30) * 0.1
+    for i in range(30, 56):
+        ddx[i] = 0.05 - (i - 30) * 0.01
+    ddx[55] = -0.20
+    for i in range(56, n):
+        ddx[i] = ddx[i-1] + 0.03              # DDX 快速回升
+        close[i] = close[57] * 1.001          # 价格在低点附近
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close, "ddx": ddx,
+    })
+    result = calc._compute_divergence(df)
+    any_bottom = any(r == "bottom_divergence" for r in result[58:])
+    assert any_bottom, "DDX回升>10%+价格止跌应触发底背离"
+
+
+def test_dde_top_div_spike_still_filtered():
+    """顶背离尖刺过滤仍然有效。"""
+    calc = DDECalculator.__new__(DDECalculator)
+    n = 68
+    close = np.full(n, 10.0)
+    ddx = np.full(n, 0.05)
+    ddx[55] = 0.50  # 单日尖刺
+    for i in range(30, 61):
+        close[i] = 10.0 + (i - 30) * 0.1
+    for i in range(61, n):
+        close[i] = close[60] * 0.99
+
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": close, "ddx": ddx,
+    })
+    result = calc._compute_divergence(df)
+    for i in range(55, 60):
+        assert result[i] != "top_divergence", (
+            f"顶背离尖刺过滤应仍然有效，idx {i} 实际 {result[i]}"
+        )
+
+
 def test_integration_dde_daily(db_with_schema):
     """Integration test: DDX computation from real DuckDB moneyflow data."""
     con = db_with_schema

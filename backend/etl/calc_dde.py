@@ -254,20 +254,21 @@ class DDECalculator:
                 if not recent:
                     result[i] = "top_divergence"
 
-            # Bottom divergence: DDX valley in past, has recovered from valley,
-            #                   price still near 60d low (within 2%).
+            # Bottom divergence: DDX valley in past, recovered >10%,
+            #                   price stopped falling (low >= 3 bars ago).
             ddx_valley_iloc = np.argmin(window_ddx.values)
             ddx_valley_val = window_ddx.min()
             ddx_recovered = d_lo != 0 and cur_d > d_lo
+            # 回升确认：DDX 回升幅度 > 谷值绝对值的 10%
+            ddx_recovery_pct = (cur_d - d_lo) / abs(d_lo) if d_lo != 0 else 0
+            ddx_confirmed = ddx_recovery_pct > 0.1
+            # 价格止跌确认：60日低点距今 >= 3 根 bar
+            c_lo_iloc = np.argmin(window_close.values)
+            price_stopped = (w - c_lo_iloc) >= 3
             price_near_bottom = cur_c <= c_lo * 1.02
 
-            # 邻域确认：谷值不是孤立的单日尖刺
-            v_neighbors = window_ddx.values[
-                max(0, ddx_valley_iloc - 2):min(len(window_ddx), ddx_valley_iloc + 3)
-            ]
-            is_valley_spike = (v_neighbors <= ddx_valley_val * 1.2).sum() < 2
-
-            if ddx_valley_iloc < w and ddx_recovered and not is_valley_spike and price_near_bottom:
+            if (ddx_valley_iloc < w and ddx_recovered and ddx_confirmed
+                    and price_stopped and price_near_bottom):
                 recent = any(result[j] == "bottom_divergence" for j in range(max(0, i - 5), i))
                 if not recent:
                     result[i] = "bottom_divergence"
