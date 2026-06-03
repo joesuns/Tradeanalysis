@@ -78,19 +78,19 @@ def cmd_fetch(args):
 def cmd_calc(args):
     """Compute DWS indicators.
 
-    Falls back to run_etl(step='calc-dws') until Task 3 delivers run_calc()
-    with data-completeness checks and auto-fetch.
+    Pre-check: validates DWD data completeness per stock.
+    Missing data → auto-fetch (unless --no-auto-fetch) or error.
     """
     from backend.db.connection import get_connection
-    from backend.etl.orchestrator import run_etl
+    from backend.etl.orchestrator import run_calc
 
     con = get_connection()
     try:
         ts_codes = args.ts_code if args.ts_code else None
-        run_etl(
-            step="calc-dws",
+        run_calc(
+            con,
             ts_codes=ts_codes,
-            batch_size=100,
+            auto_fetch=not args.no_auto_fetch,
         )
     finally:
         con.close()
@@ -111,10 +111,10 @@ def cmd_export(args):
 
     if args.recalc:
         print("Recalculating DWS before export...")
-        from backend.etl.orchestrator import run_etl
+        from backend.etl.orchestrator import run_calc
         con = get_connection()
         try:
-            run_etl(con, step="calc-dws", ts_codes=ts_codes, batch_size=100)
+            run_calc(con, ts_codes=ts_codes, auto_fetch=not args.no_auto_fetch)
         finally:
             con.close()
 
