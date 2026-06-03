@@ -253,15 +253,7 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     from backend.fetch.client import TushareClient
     from backend.fetch.ods_daily import fetch_stocks_incremental
     from backend.etl.error_handler import log_etl_start, log_etl_end
-    from backend.etl.calc_macd import MACDCalculator
-    from backend.etl.calc_ma import MACalculator
-    from backend.etl.calc_kpattern import KPatternCalculator
-    from backend.etl.calc_dde import DDECalculator
-    from backend.etl.calc_volume import VolumeCalculator
-    from backend.etl.calc_price_position import PricePositionCalculator
-
-    CALCULATORS = [MACDCalculator, MACalculator, KPatternCalculator,
-                   DDECalculator, VolumeCalculator, PricePositionCalculator]
+    from backend.db.connection import run_checkpoint
 
     if ts_codes is None:
         ts_codes = get_all_active_codes(con)
@@ -299,7 +291,7 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                              code, info["dwd_rows"],
                              info["min_date"] or "N/A",
                              info["max_date"] or "N/A")
-            return
+            # Still calculate stocks with sufficient data
 
     # 2. 只计算数据充足的股票
     codes_to_calc = completeness["ok"]
@@ -335,3 +327,4 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     logger.info("calc ALL DONE — %d stocks, %d rows, %.0fs",
                 len(codes_to_calc), grand_total, total_elapsed)
     log_etl_end(con, lid, "calc_dws", t0, "success", row_count=grand_total)
+    run_checkpoint(con)

@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import to_float_safe
+from backend.etl.base import to_float_safe, insert_dws_batch
 
 
 class PricePositionCalculator:
@@ -64,24 +64,9 @@ class PricePositionCalculator:
         return df
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
-        """Batch insert all rows for one stock via DuckDB register."""
-        dws_cols = ["ts_code", "trade_date",
-                    "price_position_60d", "price_position_120d",
-                    "price_position_250d", "calc_date"]
-        data_cols = dws_cols[1:]
-        for c in data_cols:
-            if c not in df.columns:
-                df[c] = None
-        batch = df[data_cols].copy()
-        batch["ts_code"] = ts_code
-        for c in ["price_position_60d", "price_position_120d", "price_position_250d"]:
-            batch[c] = batch[c].apply(to_float_safe)
-        batch["calc_date"] = calc_date
-        batch = batch[dws_cols]
-        self.con.register("_batch", batch)
-        cols_sql = ", ".join(dws_cols)
-        self.con.execute(
-            f"INSERT OR REPLACE INTO {self.dws_table} ({cols_sql}) "
-            f"SELECT {cols_sql} FROM _batch"
-        )
-        self.con.unregister("_batch")
+        pos_cols = [f"price_position_{w}d" for w in self.WINDOWS]
+        dws_cols = ["ts_code", "trade_date"] + pos_cols + [
+            "calc_date", "input_fingerprint", "spec_version"]
+        float_cols = pos_cols
+        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                         dws_cols, float_cols)
