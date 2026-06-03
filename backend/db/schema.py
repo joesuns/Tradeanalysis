@@ -143,6 +143,24 @@ def _migrate_dde_trend_strength(con):
             pass  # table may not exist yet (fresh DB creation race)
 
 
+def _migrate_volume_new_columns(con):
+    """Add volume_ratio, trend_strength, divergence columns to existing volume tables.
+
+    Safe to run on new databases (columns already exist = no-op).
+    """
+    for freq in ("daily", "weekly"):
+        table = f"dws_volume_{freq}"
+        for col, col_type in [
+            ("volume_ratio", "REAL"),
+            ("trend_strength", "REAL"),
+            ("divergence", "TEXT"),
+        ]:
+            try:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass  # column already exists
+
+
 
 # ============================================================
 # DIM LAYER (4 tables) — Dimension tables
@@ -349,11 +367,29 @@ _DWS_DDL = {
         pct_vol_rank   REAL,
         zone           TEXT,
         trend          TEXT,
+        volume_ratio   REAL,
+        trend_strength REAL,
+        divergence     TEXT,
         calc_date      TEXT,
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (pct_vol_rank >= 0 AND pct_vol_rank <= 100),
         CHECK (zone IN ('explosive', 'low_volume', 'normal')),
-        CHECK (trend IN ('expanding', 'shrinking', 'flat'))
+        CHECK (trend IN ('expanding', 'shrinking', 'flat')),
+        CHECK (divergence IN ('top_divergence', 'bottom_divergence') OR divergence IS NULL)
+    )""",
+
+    # 6.6 Price Position
+    "price_position": """CREATE TABLE IF NOT EXISTS {table} (
+        ts_code              TEXT,
+        trade_date           TEXT,
+        price_position_60d   REAL,
+        price_position_120d  REAL,
+        price_position_250d  REAL,
+        calc_date            TEXT,
+        PRIMARY KEY (ts_code, trade_date, calc_date),
+        CHECK (price_position_60d IS NULL OR (price_position_60d >= 0 AND price_position_60d <= 100)),
+        CHECK (price_position_120d IS NULL OR (price_position_120d >= 0 AND price_position_120d <= 100)),
+        CHECK (price_position_250d IS NULL OR (price_position_250d >= 0 AND price_position_250d <= 100))
     )""",
 }
 
@@ -362,7 +398,7 @@ _DWS_DDL = {
 # ============================================================
 
 _DWS_INDEX_DDL = []
-for _indicator in ["kpattern", "macd", "ma", "dde", "volume"]:
+for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
     for _freq in ["daily", "weekly"]:
         _table = f"dws_{_indicator}_{_freq}"
         # Time-series: pull history for one stock
@@ -400,7 +436,7 @@ _DIM_INDEX_DDL = [
 # ============================================================
 
 _LATEST_VIEW_DDL = []
-for _indicator in ["kpattern", "macd", "ma", "dde", "volume"]:
+for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
     for _freq in ["daily", "weekly"]:
         _table = f"dws_{_indicator}_{_freq}"
         _view = f"v_dws_{_indicator}_{_freq}_latest"
@@ -448,6 +484,31 @@ _ADS_WIDE_VIEWS_DDL = [
         END              AS kpattern,
         k.strength       AS kpattern_strength,
 
+        -- Composite volume-price signals
+        CASE
+            WHEN q.close_qfq > (
+                SELECT MAX(q2.close_qfq) FROM dwd_daily_quote q2
+                WHERE q2.ts_code = c.ts_code
+                  AND q2.trade_date < c.trade_date
+                  AND q2.trade_date > (
+                    SELECT MIN(trade_date) FROM dwd_daily_quote
+                    WHERE ts_code = c.ts_code AND trade_date >= c.trade_date
+                    LIMIT 1 OFFSET 59
+                  )
+            ) AND v.volume_ratio > 1.5
+                THEN 'breakout_confirmed'
+            WHEN pp.price_position_60d > 85 AND v.zone = 'explosive'
+                 AND q.pct_chg BETWEEN -2 AND 2
+                THEN 'volume_climax'
+            WHEN pp.price_position_60d < 15 AND v.zone = 'low_volume'
+                THEN 'volume_dry_up'
+            WHEN c.turning_point = 'golden_cross' AND v.divergence = 'top_divergence'
+                THEN 'golden_cross_weakened'
+            WHEN c.turning_point = 'dead_cross' AND v.divergence = 'bottom_divergence'
+                THEN 'dead_cross_weakened'
+            ELSE NULL
+        END              AS vol_signal,
+
         c.ema_12, c.ema_26, c.dif, c.dea, c.macd_bar,
         c.divergence     AS macd_divergence,
         c.zone           AS macd_zone,
@@ -480,7 +541,14 @@ _ADS_WIDE_VIEWS_DDL = [
 
         v.ma_vol_5, v.pct_vol_rank,
         v.zone           AS vol_zone,
-        v.trend          AS vol_trend
+        v.trend          AS vol_trend,
+        v.volume_ratio   AS vol_ratio,
+        v.trend_strength AS vol_trend_strength,
+        v.divergence     AS vol_divergence,
+
+        pp.price_position_60d,
+        pp.price_position_120d,
+        pp.price_position_250d
 
     FROM v_dws_macd_daily_latest c
     LEFT JOIN dim_stock s              ON c.ts_code = s.ts_code
@@ -488,6 +556,7 @@ _ADS_WIDE_VIEWS_DDL = [
     LEFT JOIN v_dws_ma_daily_latest      a ON c.ts_code = a.ts_code AND c.trade_date = a.trade_date
     LEFT JOIN v_dws_dde_daily_latest     d ON c.ts_code = d.ts_code AND c.trade_date = d.trade_date
     LEFT JOIN v_dws_volume_daily_latest  v ON c.ts_code = v.ts_code AND c.trade_date = v.trade_date
+    LEFT JOIN v_dws_price_position_daily_latest pp ON c.ts_code = pp.ts_code AND c.trade_date = pp.trade_date
     LEFT JOIN dwd_daily_quote            q ON c.ts_code = q.ts_code AND c.trade_date = q.trade_date""",
 
     # 7.1 v_ads_analysis_wide_weekly
@@ -523,6 +592,31 @@ _ADS_WIDE_VIEWS_DDL = [
         END              AS kpattern,
         kw.strength      AS kpattern_strength,
 
+        -- Composite volume-price signals
+        CASE
+            WHEN qw.close_qfq > (
+                SELECT MAX(qw2.close_qfq) FROM dwd_weekly_quote qw2
+                WHERE qw2.ts_code = cw.ts_code
+                  AND qw2.trade_date < cw.trade_date
+                  AND qw2.trade_date > (
+                    SELECT MIN(trade_date) FROM dwd_weekly_quote
+                    WHERE ts_code = cw.ts_code AND trade_date >= cw.trade_date
+                    LIMIT 1 OFFSET 59
+                  )
+            ) AND vw.volume_ratio > 1.5
+                THEN 'breakout_confirmed'
+            WHEN ppw.price_position_60d > 85 AND vw.zone = 'explosive'
+                 AND qw.pct_chg BETWEEN -2 AND 2
+                THEN 'volume_climax'
+            WHEN ppw.price_position_60d < 15 AND vw.zone = 'low_volume'
+                THEN 'volume_dry_up'
+            WHEN cw.turning_point = 'golden_cross' AND vw.divergence = 'top_divergence'
+                THEN 'golden_cross_weakened'
+            WHEN cw.turning_point = 'dead_cross' AND vw.divergence = 'bottom_divergence'
+                THEN 'dead_cross_weakened'
+            ELSE NULL
+        END              AS vol_signal,
+
         cw.ema_12, cw.ema_26, cw.dif, cw.dea, cw.macd_bar,
         cw.divergence    AS macd_divergence,
         cw.zone          AS macd_zone,
@@ -555,8 +649,15 @@ _ADS_WIDE_VIEWS_DDL = [
         dw.divergence     AS dde_divergence,
 
         vw.ma_vol_5, vw.pct_vol_rank,
-        vw.zone          AS vol_zone,
-        vw.trend         AS vol_trend
+        vw.zone           AS vol_zone,
+        vw.trend          AS vol_trend,
+        vw.volume_ratio   AS vol_ratio,
+        vw.trend_strength AS vol_trend_strength,
+        vw.divergence     AS vol_divergence,
+
+        ppw.price_position_60d,
+        ppw.price_position_120d,
+        ppw.price_position_250d
 
     FROM v_dws_macd_weekly_latest cw
     LEFT JOIN dim_stock s                  ON cw.ts_code = s.ts_code
@@ -564,10 +665,11 @@ _ADS_WIDE_VIEWS_DDL = [
     LEFT JOIN v_dws_ma_weekly_latest      aw ON cw.ts_code = aw.ts_code AND cw.trade_date = aw.trade_date
     LEFT JOIN v_dws_dde_weekly_latest     dw ON cw.ts_code = dw.ts_code AND cw.trade_date = dw.trade_date
     LEFT JOIN v_dws_volume_weekly_latest  vw ON cw.ts_code = vw.ts_code AND cw.trade_date = vw.trade_date
+    LEFT JOIN v_dws_price_position_weekly_latest ppw ON cw.ts_code = ppw.ts_code AND cw.trade_date = ppw.trade_date
     LEFT JOIN dwd_weekly_quote            qw ON cw.ts_code = qw.ts_code AND cw.trade_date = qw.trade_date""",
 
     # 7.1 v_ads_index_wide (uses c.trade_date, c.ts_code — NOT m.trade_date)
-    """CREATE VIEW IF NOT EXISTS v_ads_index_wide AS
+    """CREATE OR REPLACE VIEW v_ads_index_wide AS
     SELECT
         'D'             AS freq,
         c.trade_date,
@@ -626,17 +728,25 @@ _ADS_WIDE_VIEWS_DDL = [
 
         v.ma_vol_5, v.pct_vol_rank,
         v.zone           AS vol_zone,
-        v.trend          AS vol_trend
+        v.trend          AS vol_trend,
+        v.volume_ratio   AS vol_ratio,
+        v.trend_strength AS vol_trend_strength,
+        v.divergence     AS vol_divergence,
+
+        pp.price_position_60d,
+        pp.price_position_120d,
+        pp.price_position_250d
 
     FROM v_dws_macd_daily_latest c
     LEFT JOIN v_dws_kpattern_daily_latest k ON c.ts_code = k.ts_code AND c.trade_date = k.trade_date
     LEFT JOIN v_dws_ma_daily_latest      a ON c.ts_code = a.ts_code AND c.trade_date = a.trade_date
     LEFT JOIN v_dws_volume_daily_latest  v ON c.ts_code = v.ts_code AND c.trade_date = v.trade_date
+    LEFT JOIN v_dws_price_position_daily_latest pp ON c.ts_code = pp.ts_code AND c.trade_date = pp.trade_date
     LEFT JOIN dwd_daily_quote            q ON c.ts_code = q.ts_code AND c.trade_date = q.trade_date
     WHERE c.ts_code = '000001.SH'""",
 
     # 7.1 v_ads_index_wide_weekly (uses c.trade_date, c.ts_code)
-    """CREATE VIEW IF NOT EXISTS v_ads_index_wide_weekly AS
+    """CREATE OR REPLACE VIEW v_ads_index_wide_weekly AS
     SELECT
         'W'             AS freq,
         c.trade_date,
@@ -675,11 +785,15 @@ _ADS_WIDE_VIEWS_DDL = [
         a.turning_point AS ma_turning_point,
         NULL AS net_mf_amount, NULL AS ddx, NULL AS ddx2, NULL AS dde_trend, NULL AS dde_alert,
         NULL AS dde_divergence,
-        v.ma_vol_5, v.pct_vol_rank, v.zone AS vol_zone, v.trend AS vol_trend
+        v.ma_vol_5, v.pct_vol_rank, v.zone AS vol_zone, v.trend AS vol_trend,
+        v.volume_ratio AS vol_ratio, v.trend_strength AS vol_trend_strength,
+        v.divergence AS vol_divergence,
+        pp.price_position_60d, pp.price_position_120d, pp.price_position_250d
     FROM v_dws_macd_weekly_latest c
     LEFT JOIN v_dws_kpattern_weekly_latest k ON c.ts_code = k.ts_code AND c.trade_date = k.trade_date
     LEFT JOIN v_dws_ma_weekly_latest      a ON c.ts_code = a.ts_code AND c.trade_date = a.trade_date
     LEFT JOIN v_dws_volume_weekly_latest  v ON c.ts_code = v.ts_code AND c.trade_date = v.trade_date
+    LEFT JOIN v_dws_price_position_weekly_latest pp ON c.ts_code = pp.ts_code AND c.trade_date = pp.trade_date
     LEFT JOIN dwd_weekly_quote            q ON c.ts_code = q.ts_code AND c.trade_date = q.trade_date
     WHERE c.ts_code = '000001.SH'""",
 ]
@@ -739,6 +853,7 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
 
     # Migrations for existing databases
     _migrate_dde_trend_strength(con)
+    _migrate_volume_new_columns(con)
 
     # Latest views (10)
     for ddl in _LATEST_VIEW_DDL:
@@ -768,7 +883,7 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
          "v_ads_analysis_wide_weekly", "v_ads_analysis_wide_daily",
          "v_data_freshness"]
         + [f"v_dws_{ind}_{freq}_latest"
-           for ind in ["kpattern", "macd", "ma", "dde", "volume"]
+           for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
            for freq in ["daily", "weekly"]]
     )
     for view in _all_views:
@@ -778,7 +893,7 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
     _all_tables = (
         # DWS (10)
         [f"dws_{ind}_{freq}"
-         for ind in ["kpattern", "macd", "ma", "dde", "volume"]
+         for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
          for freq in ["daily", "weekly"]]
         # DWD (3)
         + ["dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
