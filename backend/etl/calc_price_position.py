@@ -54,11 +54,12 @@ class PricePositionCalculator:
             roll_min = s.rolling(window, min_periods=window).min()
             roll_max = s.rolling(window, min_periods=window).max()
             denom = roll_max - roll_min
-            df[col] = np.where(
-                denom.values > 0,
-                (c - roll_min.values) / denom.values * 100.0,
-                np.nan,
-            )
+            with np.errstate(divide='ignore', invalid='ignore'):
+                df[col] = np.where(
+                    denom.values > 0,
+                    (c - roll_min.values) / denom.values * 100.0,
+                    np.nan,
+                )
 
         return df
 

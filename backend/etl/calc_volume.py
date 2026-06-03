@@ -141,26 +141,38 @@ class VolumeCalculator:
         return result
 
     def _compute_trend(self, vol_series: np.ndarray, window: int) -> list:
-        """Volume trend via linear regression slope on ln(raw volume).
+        """Volume trend via exponentially weighted linear regression on ln(vol).
 
-        - expanding: slope > 0.008
-        - shrinking: slope < -0.008
+        Weighted regression (decay=0.20) — same method as _compute_trend_strength
+        and DDE trend. Ensures trend direction and trend_strength never contradict.
+        - expanding: weighted_slope > 0.008
+        - shrinking: weighted_slope < -0.008
         - flat: otherwise
         """
         n = len(vol_series)
         result = [None] * n
+        decay = 0.20
 
         for i in range(n):
             if i < window - 1:
                 continue
             segment = vol_series[i - window + 1:i + 1]
-            # Need at least 5 valid (non-NaN, positive) values
             valid = segment[~np.isnan(segment)]
-            valid_positive = valid[valid > 0]
-            if len(valid_positive) < 5:
+            valid_pos = valid[valid > 0]
+            if len(valid_pos) < 5:
                 continue
 
-            slope = linear_regression_slope(valid_positive)
+            log_segment = np.log(valid_pos)
+            m = len(log_segment)
+            x = np.arange(m, dtype=float)
+            weights = np.exp(x * decay)
+            try:
+                slope = float(np.polyfit(x, log_segment, 1, w=weights)[0])
+            except (np.linalg.LinAlgError, ValueError, TypeError):
+                continue
+            if not np.isfinite(slope):
+                continue
+
             if slope > 0.008:
                 result[i] = "expanding"
             elif slope < -0.008:
@@ -208,7 +220,7 @@ class VolumeCalculator:
             if scale < 1e-6:
                 result[i] = 0.0
             else:
-                result[i] = float(slope) / scale
+                result[i] = slope / scale
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
@@ -225,9 +237,6 @@ class VolumeCalculator:
         for i in range(w, len(df)):
             window_close = df["close_qfq"].iloc[i - w:i + 1]
             window_vol = df["vol"].iloc[i - w:i + 1]
-
-            if window_vol.isna().any() or window_close.isna().any():
-                continue
 
             c_hi = window_close.max()
             c_lo = window_close.min()
