@@ -351,14 +351,14 @@ class DDECalculator:
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
         """Batch insert all rows for one stock via DuckDB register."""
         dws_cols = ["ts_code", "trade_date", "net_mf_amount", "ddx", "ddx2",
-                    "trend", "alert", "divergence", "calc_date"]
+                    "trend", "trend_strength", "alert", "divergence", "calc_date"]
         data_cols = dws_cols[1:]
         for c in data_cols:
             if c not in df.columns:
                 df[c] = None
         batch = df[data_cols].copy()
         batch["ts_code"] = ts_code
-        for c in ["net_mf_amount", "ddx", "ddx2"]:
+        for c in ["net_mf_amount", "ddx", "ddx2", "trend_strength"]:
             batch[c] = batch[c].apply(to_float_safe)
         batch["calc_date"] = batch["calc_date"].astype(str)
         batch = batch[dws_cols]
