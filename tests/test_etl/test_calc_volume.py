@@ -130,3 +130,119 @@ def test_integration_volume(db_with_schema):
     # Verify zone is populated
     zones = [r[3] for r in rows if r[3] is not None]
     assert "normal" in zones, f"Expected normal zone, got zones: {set(zones)}"
+
+
+def test_volume_ratio():
+    """volume_ratio = vol / MA5_vol. Values centered around 1.0."""
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+
+    n = 30
+    dates = [f"d{i}" for i in range(n)]
+    vols = [1000000.0] * 10 + [3000000.0] * 5 + [1000000.0] * 15
+    df = pd.DataFrame({"trade_date": dates, "vol": vols})
+    result = calc._compute_indicators(df)
+
+    assert "volume_ratio" in result.columns, "volume_ratio column should exist"
+    ratio_mid = result["volume_ratio"].iloc[9]
+    assert ratio_mid is not None and 0.9 < ratio_mid < 1.1, \
+        f"Constant volume should give ratio ~1.0, got {ratio_mid}"
+
+    ratio_high = result["volume_ratio"].iloc[10]
+    assert ratio_high is not None and ratio_high > 1.5, \
+        f"Volume spike should give ratio > 1.5, got {ratio_high}"
+
+
+def test_volume_divergence_top():
+    """Price hits 60d high + vol declining → top_divergence."""
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+
+    n = 80
+    dates = [f"d{i}" for i in range(n)]
+    closes = [10.0 + i * 0.2 for i in range(60)]
+    closes += [closes[59]] * 20
+    vols = [1000000.0 - i * 5000 for i in range(60)]
+    vols += [vols[59]] * 20
+
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "vol": vols,
+        "close_qfq": closes,
+    })
+    result = calc._compute_indicators(df)
+
+    assert "divergence" in result.columns
+    divs = result["divergence"].dropna()
+    assert "top_divergence" in divs.values, \
+        f"Expected top_divergence, got {divs.unique() if len(divs) > 0 else 'none'}"
+
+
+def test_volume_divergence_bottom():
+    """Price hits 60d low + vol recovering → bottom_divergence."""
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+
+    n = 80
+    dates = [f"d{i}" for i in range(n)]
+    closes = [50.0 - i * 0.5 for i in range(50)]
+    closes += [closes[49]] * 30
+    vols = [500000.0 + i * 5000 for i in range(50)]
+    vols += [vols[49]] * 30
+
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "vol": vols,
+        "close_qfq": closes,
+    })
+    result = calc._compute_indicators(df)
+
+    divs = result["divergence"].dropna()
+    assert "bottom_divergence" in divs.values, \
+        f"Expected bottom_divergence, got {divs.unique() if len(divs) > 0 else 'none'}"
+
+
+def test_volume_trend_strength():
+    """trend_strength is de-unitized. Positive when volume expanding."""
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+
+    n = 30
+    dates = [f"d{i}" for i in range(n)]
+    vols = [1000000.0 + i * 50000 for i in range(n)]  # steadily rising
+    df = pd.DataFrame({"trade_date": dates, "vol": vols})
+    result = calc._compute_indicators(df)
+
+    assert "trend_strength" in result.columns
+    ts = result["trend_strength"].dropna()
+    assert len(ts) > 0, "Should have trend_strength values"
+    positive_ratio = (ts > 0).sum() / len(ts)
+    assert positive_ratio > 0.5, \
+        f"Continuously expanding volume should have mostly positive trend_strength, got {positive_ratio:.1%}"
+
+
+def test_volume_divergence_dedup():
+    """Same divergence type should not repeat within 5 bars."""
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+
+    n = 100
+    dates = [f"d{i}" for i in range(n)]
+    closes_list = []
+    for i in range(n):
+        if i < 80:
+            closes_list.append(10.0 + i * 0.1)
+        else:
+            closes_list.append(18.0)
+    vols = [900000.0 - i * 5000 for i in range(60)] + [500000.0] * 40
+
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "vol": vols,
+        "close_qfq": closes_list,
+    })
+    result = calc._compute_indicators(df)
+
+    divs = result["divergence"].dropna()
+    if len(divs) > 0:
+        top_indices = [i for i, v in enumerate(result["divergence"]) if v == "top_divergence"]
+        if len(top_indices) >= 2:
+            for j in range(1, len(top_indices)):
+                gap = top_indices[j] - top_indices[j - 1]
+                assert gap >= 5, \
+                    f"Dedup failed: top_divergence repeated after {gap} days"

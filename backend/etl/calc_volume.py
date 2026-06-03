@@ -23,14 +23,14 @@ class VolumeCalculator:
         for ts_code in ts_codes:
             if self.freq == "weekly":
                 df = self.con.execute(f"""
-                    SELECT d.trade_date, d.vol FROM {self.src_table} d
+                    SELECT d.trade_date, d.vol, d.close_qfq FROM {self.src_table} d
                     JOIN dim_date dd ON d.trade_date = dd.trade_date
                     WHERE d.ts_code = ? AND dd.is_week_end = 1
                     ORDER BY d.trade_date
                 """, (ts_code,)).df()
             else:
                 df = self.con.execute(f"""
-                    SELECT trade_date, vol FROM {self.src_table}
+                    SELECT trade_date, vol, close_qfq FROM {self.src_table}
                     WHERE ts_code = ? AND is_suspended = 0
                     ORDER BY trade_date
                 """, (ts_code,)).df()
@@ -45,6 +45,9 @@ class VolumeCalculator:
         # MA5 volume
         df["ma_vol_5"] = sma(v, 5)
 
+        # Volume ratio: vol / MA5_vol
+        df["volume_ratio"] = self._compute_volume_ratio(df)
+
         # Percentile rank of MA5_vol within last 120 days
         df["pct_vol_rank"] = self._compute_pct_rank(df["ma_vol_5"].values, 120)
 
@@ -53,6 +56,13 @@ class VolumeCalculator:
 
         # Trend: linear regression slope on ln(raw_vol) over 10 days
         df["trend"] = self._compute_trend(df["vol"].values, 10)
+
+        # Trend strength: de-unitized slope
+        window = 10
+        df["trend_strength"] = self._compute_trend_strength(df["vol"].values, window=window)
+
+        # Divergence: vol vs close over 60-day window
+        df["divergence"] = self._compute_divergence(df)
 
         return df
 
@@ -160,17 +170,118 @@ class VolumeCalculator:
 
         return result
 
+    def _compute_volume_ratio(self, df: pd.DataFrame) -> np.ndarray:
+        """volume_ratio = vol / MA5_vol. NaN where MA5 not available."""
+        vol = df["vol"].values.astype(float)
+        ma5 = df["ma_vol_5"].values.astype(float)
+        result = np.full(len(vol), np.nan)
+        mask = ~np.isnan(ma5) & (ma5 > 0)
+        result[mask] = vol[mask] / ma5[mask]
+        return result
+
+    def _compute_trend_strength(self, vol_series: np.ndarray, window: int = 10) -> np.ndarray:
+        """Volume trend strength via exponentially weighted linear regression.
+
+        Formula: weighted_slope(ln(vol)) / mean(|ln(vol)|), unitless.
+        Positive = volume expanding, negative = shrinking.
+        Weighted regression (decay=0.20) gives recent bars ~3x more influence.
+        """
+        n = len(vol_series)
+        result = np.full(n, np.nan)
+        for i in range(window - 1, n):
+            segment = vol_series[i - window + 1:i + 1]
+            valid = segment[~np.isnan(segment)]
+            valid_pos = valid[valid > 0]
+            if len(valid_pos) < 5:
+                continue
+            log_segment = np.log(valid_pos)
+            m = len(log_segment)
+            x = np.arange(m, dtype=float)
+            weights = np.exp(x * 0.20)
+            try:
+                slope = float(np.polyfit(x, log_segment, 1, w=weights)[0])
+            except (np.linalg.LinAlgError, ValueError, TypeError):
+                continue
+            if not np.isfinite(slope):
+                continue
+            scale = np.mean(np.abs(log_segment))
+            if scale < 1e-6:
+                result[i] = 0.0
+            else:
+                result[i] = float(slope) / scale
+        return result
+
+    def _compute_divergence(self, df: pd.DataFrame) -> list:
+        """Top/bottom volume-price divergence using 60-day window.
+
+        Confirmation day + 5-day dedup, same pattern as MACD/DDE divergence.
+        - Top divergence: price near 60d high + vol has fallen from 60d peak
+        - Bottom divergence: price near 60d low + vol has recovered from 60d valley
+        """
+        result = [None] * len(df)
+        if "close_qfq" not in df.columns:
+            return result
+        w = 59  # 60-bar window
+        for i in range(w, len(df)):
+            window_close = df["close_qfq"].iloc[i - w:i + 1]
+            window_vol = df["vol"].iloc[i - w:i + 1]
+
+            if window_vol.isna().any() or window_close.isna().any():
+                continue
+
+            c_hi = window_close.max()
+            c_lo = window_close.min()
+            v_hi = window_vol.max()
+            v_lo = window_vol.min()
+            cur_c = df["close_qfq"].iloc[i]
+            cur_v = df["vol"].iloc[i]
+
+            if pd.isna(cur_c) or pd.isna(cur_v):
+                continue
+
+            # Top divergence: price at 60d high, vol has fallen from 60d peak
+            vol_peak_iloc = np.argmax(window_vol.values)
+            vol_fallen = v_hi != 0 and cur_v < window_vol.values[vol_peak_iloc]
+            price_near_peak = cur_c >= c_hi * 0.98
+
+            if vol_peak_iloc < w and vol_fallen and price_near_peak:
+                recent = any(
+                    result[j] == "top_divergence" for j in range(max(0, i - 5), i)
+                )
+                if not recent:
+                    result[i] = "top_divergence"
+
+            # Bottom divergence: price at 60d low, vol has recovered from 60d valley
+            vol_valley_iloc = np.argmin(window_vol.values)
+            vol_recovered = v_lo != 0 and cur_v > window_vol.values[vol_valley_iloc]
+            vol_recovery_pct = (cur_v - v_lo) / abs(v_lo) if v_lo != 0 else 0
+            vol_confirmed = vol_recovery_pct > 0.1
+            c_lo_iloc = np.argmin(window_close.values)
+            price_stopped = (w - c_lo_iloc) >= 3
+            price_near_bottom = cur_c <= c_lo * 1.02
+
+            if (vol_valley_iloc < w and vol_recovered and vol_confirmed
+                    and price_stopped and price_near_bottom):
+                recent = any(
+                    result[j] == "bottom_divergence" for j in range(max(0, i - 5), i)
+                )
+                if not recent:
+                    result[i] = "bottom_divergence"
+
+        return result
+
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
         """Batch insert all rows for one stock via DuckDB register."""
         dws_cols = ["ts_code", "trade_date", "ma_vol_5", "pct_vol_rank",
-                    "zone", "trend", "calc_date"]
+                    "zone", "trend", "volume_ratio", "trend_strength",
+                    "divergence", "calc_date"]
         data_cols = dws_cols[1:]
         for c in data_cols:
             if c not in df.columns:
                 df[c] = None
         batch = df[data_cols].copy()
         batch["ts_code"] = ts_code
-        for c in ["ma_vol_5", "pct_vol_rank"]:
+        for c in ["ma_vol_5", "pct_vol_rank", "volume_ratio", "trend_strength"]:
             batch[c] = batch[c].apply(to_float_safe)
         batch["calc_date"] = batch["calc_date"].astype(str)
         batch = batch[dws_cols]
