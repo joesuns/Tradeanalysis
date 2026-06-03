@@ -31,15 +31,22 @@ _COL_NAMES = {
     "ma5_slope": "MA5斜率", "ma10_slope": "MA10斜率",
     "ma_alignment": "均线形态", "ma_turning_point": "均线转折",
     "net_mf_amount": "主力净流入(万元)", "ddx": "DDX", "ddx2": "DDX2",
-    "dde_trend": "DDE趋势", "dde_alert": "DDE警惕", "dde_divergence": "DDE背离",
+    "dde_trend": "DDE趋势", "dde_trend_strength": "DDE趋势强度", "dde_alert": "DDE警惕", "dde_divergence": "DDE背离",
     "ma_vol_5": "5日均量(万手)", "pct_vol_rank": "量能百分位",
     "vol_zone": "量能区域", "vol_trend": "量能趋势",
+    "volume_ratio": "量比", "vol_trend_strength": "量能趋势强度",
+    "vol_divergence": "量价背离",
+    "price_position_60d": "价格位置60日", "price_position_120d": "价格位置120日",
+    "price_position_250d": "价格位置250日",
+    "vol_signal": "量价复合信号",
 }
 
 # Enum value translations (English → Chinese). NULL = no signal, shown as "-"
 _ENUM_VALUES = {
     "kpattern": {"yang_bao_yin": "阳包阴", "yang_ke_yin": "阳克阴",
                  "yin_bao_yang": "阴包阳", "yin_ke_yang": "阴克阳",
+                 "contrarian_yin_bao_yang": "阴包阳(反向买入)",
+                 "contrarian_yin_ke_yang": "阴克阳(反向买入)",
                  "mu_bei_xian": "墓碑线", "bi_lei_zhen": "避雷针",
                  "gao_kai_chang_yin": "高开长阴"},
     "macd_zone": {"bull": "多头", "bear": "空头"},
@@ -57,14 +64,23 @@ _ENUM_VALUES = {
                   "upturn_flat": "上升走平", "downturn_flat": "下降走平"},
     "vol_zone": {"explosive": "爆量", "low_volume": "地量", "normal": "正常"},
     "vol_trend": {"expanding": "放量", "shrinking": "缩量", "flat": "平量"},
+    "vol_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
+    "vol_signal": {
+        "breakout_confirmed": "突破确认", "volume_climax": "放量滞涨",
+        "volume_dry_up": "缩量止跌",
+        "golden_cross_weakened": "金叉量弱", "dead_cross_weakened": "死叉量弱",
+    },
 }
 
 # Signal columns — NULL means "no signal today" (shown as "-")
 _SIGNAL_COLS = {"kpattern", "kpattern_strength", "macd_divergence", "macd_turning_point",
-                "macd_alert", "ma_turning_point", "dde_alert", "dde_divergence"}
+                "macd_alert", "ma_turning_point", "dde_alert", "dde_divergence",
+                "vol_divergence", "vol_signal"}
 
 # Columns to round to 2 decimal places
-_ROUND_2DP = {"close", "pct_chg", "pe_ttm", "turnover_rate", "net_mf_amount"}
+_ROUND_2DP = {"close", "pct_chg", "pe_ttm", "turnover_rate", "net_mf_amount",
+              "volume_ratio", "vol_trend_strength",
+              "price_position_60d", "price_position_120d", "price_position_250d"}
 
 # Columns to convert 万元 → 亿 (divide by 10000)
 _CONVERT_DIV10000 = {"total_mv", "vol", "ma_vol_5"}  # → 万 (or 亿 for mv)
@@ -81,6 +97,7 @@ def export_wide_to_excel(
     output_path: str = "",  # .xlsx path (auto-timestamped if empty)
     filter_st: bool = True,
     include_index: bool = True,
+    ts_codes: list[str] = None,  # 可选，只导出指定股票
 ) -> int:
     """Export horizontal daily+weekly merged analysis to Excel.
 
@@ -100,6 +117,14 @@ def export_wide_to_excel(
     if daily.empty:
         con.close()
         return 0
+
+    # ---- Optional ts_code filter ----
+    if ts_codes:
+        daily = daily[daily["ts_code"].isin(ts_codes)]
+        if daily.empty:
+            con.close()
+            return 0
+
     daily = _format_numbers(daily)
 
     # ---- Weekly data (rolling: same trade_date) ----
@@ -108,6 +133,8 @@ def export_wide_to_excel(
         + (" AND is_st = 0" if filter_st else ""),
         [trade_date]
     ).df()
+    if ts_codes:
+        weekly = weekly[weekly["ts_code"].isin(ts_codes)]
     weekly = _format_numbers(weekly)
 
     # Drop identity + fundamental columns from weekly (already in basic section from daily)
@@ -143,7 +170,7 @@ def export_wide_to_excel(
                     "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
                     "macd_trend_strength",
                     "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
-                    "dde_trend", "dde_alert", "dde_divergence",
+                    "dde_trend", "dde_trend_strength", "dde_alert", "dde_divergence",
                     "vol_zone", "vol_trend"}
     daily_signal_only = [c for c in daily_cols if c in _SIGNAL_ONLY or c in basic_cols_outer]
     weekly_signal_only = [c for c in weekly_cols if c in _SIGNAL_ONLY]
@@ -218,8 +245,10 @@ def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
         "kpattern", "kpattern_strength",
         "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
         "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope",
-        "dde_trend", "dde_alert", "dde_divergence",
-        "vol_zone", "vol_trend",
+        "dde_trend", "dde_trend_strength", "dde_alert", "dde_divergence",
+        "vol_zone", "vol_trend", "volume_ratio", "vol_trend_strength", "vol_divergence",
+        "vol_signal",
+        "price_position_60d", "price_position_120d", "price_position_250d",
     ]
     tail = [c for c in df.columns if c not in head and c not in signals]
     ordered = [c for c in head + signals + tail if c in df.columns]
@@ -233,7 +262,9 @@ _COL_GROUPS = {
     "macd":    {"EMA12", "EMA26", "DIF", "DEA", "MACD柱", "MACD背离", "MACD区域", "MACD转折", "MACD警惕", "MACD趋势"},
     "ma":      {"MA5", "MA10", "MA5乖离率", "MA10乖离率", "MA5斜率", "MA10斜率", "均线形态", "均线转折"},
     "dde":     {"主力净流入(万元)", "DDX", "DDX2", "DDE趋势", "DDE警惕", "DDE背离"},
-    "volume":  {"5日均量(万手)", "量能百分位", "量能区域", "量能趋势"},
+    "volume":  {"5日均量(万手)", "量能百分位", "量能区域", "量能趋势",
+                "量比", "量能趋势强度", "量价背离", "量价复合信号"},
+    "price_pos": {"价格位置60日", "价格位置120日", "价格位置250日"},
     "kline":   {"K线形态", "形态强度"},
 }
 
@@ -251,6 +282,7 @@ _GROUP_TINTS = {
     "ma":       "117864",  # dark green
     "dde":      "7D6608",  # dark gold
     "volume":   "935116",  # dark amber
+    "price_pos": "1E8449",  # dark green-teal
     "kline":    "922B21",  # dark burgundy
 }
 
@@ -323,6 +355,7 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
         "阳包阴": green, "阳克阴": green,
         "墓碑线": red, "避雷针": red, "高开长阴": red,
         "阴包阳": red, "阴克阳": red,
+        "阴包阳(反向买入)": green, "阴克阳(反向买入)": green,
     }
     if "K线形态" in df.columns:
         col_idx = list(df.columns).index("K线形态") + 1
@@ -348,6 +381,14 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
         "DDE背离": {"顶背离": red, "底背离": green},
         "量能区域": {"爆量": red, "地量": blue},
         "量能趋势": {"放量": green, "缩量": red},
+        "量价背离": {"顶背离": red, "底背离": green},
+        "量价复合信号": {
+            "突破确认": green,
+            "放量滞涨": red,
+            "缩量止跌": green,
+            "金叉量弱": blue,
+            "死叉量弱": blue,
+        },
     }
     for col_name, value_colors in text_signal_cols.items():
         if col_name in df.columns:
@@ -536,7 +577,8 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
 
     # ── Signal highlights ──
     kpattern_colors = {"阳包阴": green, "阳克阴": green, "墓碑线": red, "避雷针": red,
-                       "高开长阴": red, "阴包阳": red, "阴克阳": red}
+                       "高开长阴": red, "阴包阳": red, "阴克阳": red,
+                       "阴包阳(反向买入)": green, "阴克阳(反向买入)": green}
     text_signal_cols = {
         "MACD转折": {"金叉": green, "死叉": red}, "MACD区域": {"多头": green, "空头": red},
         "MACD背离": {"顶背离": red, "底背离": green},
@@ -545,6 +587,14 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         "均线转折": {"金叉": green, "死叉": red}, "DDE趋势": {"上升": green, "下降": red},
         "DDE背离": {"顶背离": red, "底背离": green}, "量能区域": {"爆量": red, "地量": blue},
         "量能趋势": {"放量": green, "缩量": red},
+        "量价背离": {"顶背离": red, "底背离": green},
+        "量价复合信号": {
+            "突破确认": green,
+            "放量滞涨": red,
+            "缩量止跌": green,
+            "金叉量弱": blue,
+            "死叉量弱": blue,
+        },
     }
     for col_name, value_colors in text_signal_cols.items():
         for prefix in ("", "__w__"):
