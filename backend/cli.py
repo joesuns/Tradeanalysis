@@ -1,10 +1,12 @@
-"""CLI entry point for the Tradeanalysis ETL and query tool.
+"""CLI entry point for the Tradeanalysis data pipeline.
 
 Usage:
     python -m backend.cli check
-    python -m backend.cli etl --step build-all
-    python -m backend.cli query --ts-code 000001.SZ
-    python -m backend.cli export --date 20251231 --output analysis.xlsx
+    python -m backend.cli fetch --all
+    python -m backend.cli fetch --ts-code 000543.SZ --start 20150101
+    python -m backend.cli calc --all
+    python -m backend.cli calc --ts-code 000543.SZ
+    python -m backend.cli export --date 20260529 --ts-code 000543.SZ --output analysis.xlsx
     python -m backend.cli status
 """
 
@@ -15,6 +17,8 @@ from backend.log_config import setup_logging
 
 setup_logging()
 
+
+# ── check ──
 
 def cmd_check(_args):
     """Check environment connectivity: DuckDB + tushare."""
@@ -31,25 +35,105 @@ def cmd_check(_args):
         print(f"tushare: error — {e}")
 
 
-def cmd_etl(args):
-    """Run the ETL pipeline."""
-    from backend.etl.orchestrator import run_etl
+# ── fetch ──
 
-    ts_codes = [args.ts_code] if args.ts_code else None
-    run_etl(
-        step=args.step,
-        ts_codes=ts_codes,
-        start=args.start,
-        end=args.end,
-        batch_size=args.batch_size,
-        force_full=args.force_full,
+def cmd_fetch(args):
+    """Pull ODS data into DuckDB.
+
+    --ts-code mode (recommended for <=500 stocks): stock-batched, each stock
+      independently detects missing dates.
+    --all mode (default): date-batched, iterates trading days for the full market.
+    """
+    from backend.db.connection import get_connection
+    from backend.fetch.client import TushareClient
+    from backend.fetch.ods_daily import (
+        fetch_by_date_range_parallel,
+        fetch_stocks_incremental,
+        get_all_active_codes,
     )
 
+    client = TushareClient()
+    con = get_connection()
+    try:
+        start = args.start or "20150101"
+        end = args.end or "20991231"
+
+        if args.ts_code:
+            codes = args.ts_code if isinstance(args.ts_code, list) else [args.ts_code]
+            print(f"Stock-batched fetch: {len(codes)} stocks, {start}~{end}")
+            n = fetch_stocks_incremental(client, con, codes, start=start, end=end)
+        else:
+            codes = get_all_active_codes(con)
+            print(f"Date-batched fetch: {len(codes)} active stocks, {start}~{end}")
+            n = fetch_by_date_range_parallel(
+                start, end, workers=3, con=con
+            )
+        print(f"Fetched {n} rows")
+    finally:
+        con.close()
+
+
+# ── calc ──
+
+def cmd_calc(args):
+    """Compute DWS indicators.
+
+    Falls back to run_etl(step='calc-dws') until Task 3 delivers run_calc()
+    with data-completeness checks and auto-fetch.
+    """
+    from backend.db.connection import get_connection
+    from backend.etl.orchestrator import run_etl
+
+    con = get_connection()
+    try:
+        ts_codes = args.ts_code if args.ts_code else None
+        run_etl(
+            step="calc-dws",
+            ts_codes=ts_codes,
+            batch_size=100,
+        )
+    finally:
+        con.close()
+
+
+# ── export ──
+
+def cmd_export(args):
+    """Export analysis wide table to Excel.
+
+    Default: export directly from latest views (no recalculation).
+    --recalc: re-run calc-dws before exporting.
+    """
+    from backend.db.connection import get_connection
+    from backend.export_wide import export_wide_to_excel
+
+    ts_codes = args.ts_code if args.ts_code else None
+
+    if args.recalc:
+        print("Recalculating DWS before export...")
+        from backend.etl.orchestrator import run_etl
+        con = get_connection()
+        try:
+            run_etl(con, step="calc-dws", ts_codes=ts_codes, batch_size=100)
+        finally:
+            con.close()
+
+    n = export_wide_to_excel(
+        args.db_path or "data/tradeanalysis.duckdb",
+        args.date,
+        args.output,
+        filter_st=not args.include_st,
+        include_index=not args.no_index,
+        ts_codes=ts_codes,
+    )
+    print(f"Exported {n} rows -> {args.output}")
+
+
+# ── query / status ──
 
 def cmd_query(args):
     """Query DWS indicators for a stock."""
     from backend.db.connection import get_connection
-
     con = get_connection(read_only=True)
     try:
         view = f"v_dws_macd_{args.freq}_latest"
@@ -69,18 +153,6 @@ def cmd_query(args):
         con.close()
 
 
-def cmd_export(args):
-    """Export wide table to Excel.  Requires backend.export_wide (Task 18)."""
-    from backend.export_wide import export_wide_to_excel
-
-    db_path = args.db_path or "data/tradeanalysis.duckdb"
-    n = export_wide_to_excel(
-        db_path, args.date, args.output, freq=args.freq,
-        filter_st=not args.include_st,
-    )
-    print(f"Exported {n} rows -> {args.output}")
-
-
 def cmd_status(_args):
     """Show database table statistics."""
     from backend.db.connection import get_connection
@@ -89,8 +161,9 @@ def cmd_status(_args):
     try:
         tables = [
             "ods_daily", "ods_daily_basic", "ods_moneyflow",
-            "dwd_daily_quote", "dws_macd_daily", "dws_ma_daily",
-            "dws_kpattern_daily", "dws_dde_daily", "dws_volume_daily",
+            "dwd_daily_quote", "dwd_weekly_quote",
+            "dws_macd_daily", "dws_ma_daily", "dws_kpattern_daily",
+            "dws_dde_daily", "dws_volume_daily", "dws_price_position_daily",
         ]
         for table in tables:
             try:
@@ -100,12 +173,14 @@ def cmd_status(_args):
                 latest = con.execute(
                     f"SELECT MAX(trade_date) FROM {table}"
                 ).fetchone()[0]
-                print(f"{table:25s} {cnt:>12,}  {latest or 'N/A'}")
+                print(f"{table:30s} {cnt:>12,}  {latest or 'N/A'}")
             except Exception:
-                print(f"{table:25s}  (not found)")
+                print(f"{table:30s}  (not found)")
     finally:
         con.close()
 
+
+# ── main ──
 
 def main():
     p = argparse.ArgumentParser(prog="tradeanalysis")
@@ -113,36 +188,49 @@ def main():
 
     sp.add_parser("check", help="Check environment connectivity")
 
-    ep = sp.add_parser("etl", help="Run ETL pipeline")
-    ep.add_argument(
-        "--step", default="build-all",
-        choices=["fetch-ods", "build-dim", "build-dwd", "calc-dws", "build-all"],
-    )
-    ep.add_argument("--start")
-    ep.add_argument("--end")
-    ep.add_argument("--ts-code", help="Process only this stock (e.g. 000001.SZ)")
-    ep.add_argument("--batch-size", type=int, default=100)
-    ep.add_argument("--force-full", action="store_true")
+    # fetch
+    fp = sp.add_parser("fetch", help="Pull ODS data into DuckDB")
+    fp.add_argument("--ts-code", nargs="+", help="Stock code(s) to fetch (stock-batched mode)")
+    fp.add_argument("--start", help="Start date YYYYMMDD (default 20150101)")
+    fp.add_argument("--end", help="End date YYYYMMDD (default today)")
+    fp.add_argument("--all", action="store_true",
+                    help="Fetch all active stocks (date-batched mode, default)")
 
+    # calc
+    cp = sp.add_parser("calc", help="Compute DWS indicators")
+    cp.add_argument("--ts-code", nargs="+", help="Stock codes to calculate")
+    cp.add_argument("--all", action="store_true",
+                    help="Calculate all active stocks (default)")
+    cp.add_argument("--no-auto-fetch", action="store_true",
+                    help="Disable auto-fetch when data is missing")
+
+    # export
+    xp = sp.add_parser("export", help="Export analysis wide table to Excel")
+    xp.add_argument("--date", required=True, help="Analysis date YYYYMMDD")
+    xp.add_argument("--output", default="analysis.xlsx")
+    xp.add_argument("--ts-code", nargs="+", help="Stock codes to export")
+    xp.add_argument("--db-path")
+    xp.add_argument("--include-st", action="store_true")
+    xp.add_argument("--no-index", action="store_true")
+    xp.add_argument("--recalc", action="store_true",
+                    help="Recalculate DWS before export")
+    xp.add_argument("--no-auto-fetch", action="store_true",
+                    help="Disable auto-fetch when recalculating")
+
+    # query
     qp = sp.add_parser("query", help="Query DWS indicators")
     qp.add_argument("--ts-code", required=True)
     qp.add_argument("--freq", default="daily")
-
-    xp = sp.add_parser("export", help="Export wide table to Excel")
-    xp.add_argument("--date", required=True)
-    xp.add_argument("--output", default="analysis.xlsx")
-    xp.add_argument("--freq", default="daily")
-    xp.add_argument("--db-path")
-    xp.add_argument("--include-st", action="store_true")
 
     sp.add_parser("status", help="Show database table stats")
 
     args = p.parse_args()
     handlers = {
         "check": cmd_check,
-        "etl": cmd_etl,
-        "query": cmd_query,
+        "fetch": cmd_fetch,
+        "calc": cmd_calc,
         "export": cmd_export,
+        "query": cmd_query,
         "status": cmd_status,
     }
     handler = handlers.get(args.command)

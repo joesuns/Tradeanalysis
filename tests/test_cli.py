@@ -30,8 +30,8 @@ def test_cli_help_subcommand():
     """CLI subcommand --help should show subcommand-specific options."""
     env = {**os.environ, "TUSHARE_TOKEN": "test"}
     result = subprocess.run(
-        [sys.executable, "-m", "backend.cli", "etl", "--help"],
+        [sys.executable, "-m", "backend.cli", "fetch", "--help"],
         capture_output=True, text=True, env=env,
     )
     assert result.returncode == 0
-    assert "--step" in result.stdout
+    assert "--ts-code" in result.stdout
