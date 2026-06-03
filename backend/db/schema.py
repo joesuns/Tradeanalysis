@@ -129,6 +129,20 @@ def _migrate_etl_log(con):
         pass  # table may not exist yet (fresh DB creation race)
 
 
+def _migrate_dde_trend_strength(con):
+    """Add trend_strength column to DDE tables for databases created before migration.
+
+    Uses DESCRIBE to detect existing columns — safe to run repeatedly.
+    """
+    for table in ("dws_dde_daily", "dws_dde_weekly"):
+        try:
+            cols = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+            if "trend_strength" not in cols:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN trend_strength REAL")
+        except Exception:
+            pass  # table may not exist yet (fresh DB creation race)
+
+
 
 # ============================================================
 # DIM LAYER (4 tables) — Dimension tables
@@ -391,7 +405,7 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume"]:
         _table = f"dws_{_indicator}_{_freq}"
         _view = f"v_dws_{_indicator}_{_freq}_latest"
         _LATEST_VIEW_DDL.append(f"""
-            CREATE VIEW IF NOT EXISTS {_view} AS
+            CREATE OR REPLACE VIEW {_view} AS
             SELECT *
             FROM {_table} d
             WHERE calc_date = (
@@ -402,7 +416,7 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume"]:
 
 _ADS_WIDE_VIEWS_DDL = [
     # 7.1 v_ads_analysis_wide_daily
-    """CREATE VIEW IF NOT EXISTS v_ads_analysis_wide_daily AS
+    """CREATE OR REPLACE VIEW v_ads_analysis_wide_daily AS
     SELECT
         'D'             AS freq,
         c.trade_date,
@@ -477,7 +491,7 @@ _ADS_WIDE_VIEWS_DDL = [
     LEFT JOIN dwd_daily_quote            q ON c.ts_code = q.ts_code AND c.trade_date = q.trade_date""",
 
     # 7.1 v_ads_analysis_wide_weekly
-    """CREATE VIEW IF NOT EXISTS v_ads_analysis_wide_weekly AS
+    """CREATE OR REPLACE VIEW v_ads_analysis_wide_weekly AS
     SELECT
         'W'             AS freq,
         cw.trade_date,
@@ -722,6 +736,9 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # DWS indexes (20)
     for ddl in _DWS_INDEX_DDL:
         con.execute(ddl)
+
+    # Migrations for existing databases
+    _migrate_dde_trend_strength(con)
 
     # Latest views (10)
     for ddl in _LATEST_VIEW_DDL:
