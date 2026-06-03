@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from backend.etl.base import ema, to_float_safe, linear_regression_slope
+from backend.etl.base import ema, to_float_safe
 
 
 
@@ -175,9 +175,10 @@ class DDECalculator:
         # net_mf_amount: direct copy
         df["net_mf_amount"] = df["net_mf_amount"].values.astype(float)
 
-        # Trend: linear regression slope on DDX2 (8-bar window for both daily and weekly)
+        # Trend: exponentially weighted linear regression on DDX2 (8-bar, decay=0.20)
         trend_window = 8
         df["trend"] = self._compute_trend(df["ddx2"].values.astype(float), window=trend_window)
+        df["trend_strength"] = self._compute_trend_strength(df["ddx2"].values.astype(float), window=trend_window)
 
         # Divergence: same logic as MACD but using DDX2 instead of DIF
         df["divergence"] = self._compute_divergence(df)
@@ -188,9 +189,11 @@ class DDECalculator:
         return df
 
     def _compute_trend(self, ddx2: np.ndarray, window: int = 8) -> list:
-        """DDX2 trend via linear regression slope (same method as volume trend).
-        - up: slope > 0.0001
-        - down: slope < -0.0001
+        """DDX2 trend via exponentially weighted linear regression.
+
+        Weighted regression (decay=0.20) makes recent bars ~3x more influential.
+        - up: weighted_slope > 0.0001
+        - down: weighted_slope < -0.0001
         - flat: otherwise
         """
         result = [None] * len(ddx2)
@@ -201,13 +204,52 @@ class DDECalculator:
             valid = segment[~np.isnan(segment)]
             if len(valid) < window:
                 continue
-            slope = linear_regression_slope(valid, use_log=False)
+            n = len(valid)
+            x = np.arange(n, dtype=float)
+            weights = np.exp(x * 0.20)
+            try:
+                slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+            except (np.linalg.LinAlgError, ValueError, TypeError):
+                continue
+            if not np.isfinite(slope):
+                continue
             if slope > 0.0001:
                 result[i] = "up"
             elif slope < -0.0001:
                 result[i] = "down"
             else:
                 result[i] = "flat"
+        return result
+
+    def _compute_trend_strength(self, ddx2: np.ndarray, window: int = 8) -> np.ndarray:
+        """DDX2 trend strength via exponentially weighted linear regression.
+
+        Formula: weighted_slope / mean(|DDX2_segment|), unitless signed value.
+        Positive = bullish capital flow strength, negative = bearish.
+        Weighted regression (decay=0.20) gives recent bars ~3x more influence
+        than bars 8 days ago.
+
+        Returns NaN where window < window or all DDX2 in segment are zero.
+        """
+        result = np.full(len(ddx2), np.nan)
+        for i in range(window - 1, len(ddx2)):
+            segment = ddx2[i - window + 1:i + 1]
+            valid = segment[~np.isnan(segment)]
+            if len(valid) < window:
+                continue
+            mean_abs = np.mean(np.abs(valid))
+            if mean_abs == 0:
+                continue
+            n = len(valid)
+            x = np.arange(n, dtype=float)
+            weights = np.exp(x * 0.20)
+            try:
+                slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+            except (np.linalg.LinAlgError, ValueError, TypeError):
+                continue
+            if not np.isfinite(slope):
+                continue
+            result[i] = slope / mean_abs
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
