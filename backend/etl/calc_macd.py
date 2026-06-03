@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from backend.etl.base import ema, to_float_safe, linear_regression_slope
+from backend.etl.base import ema, to_float_safe, linear_regression_slope, insert_dws_batch
 
 
 
@@ -270,21 +270,10 @@ class MACDCalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
-        """Batch insert all rows for one stock via DuckDB register."""
         dws_cols = ["ts_code", "trade_date", "ema_12", "ema_26", "dif", "dea",
                     "macd_bar", "divergence", "zone", "turning_point", "alert",
-                    "trend", "trend_strength", "calc_date"]
-        data_cols = dws_cols[1:]
-        for c in data_cols:
-            if c not in df.columns:
-                df[c] = None
-        batch = df[data_cols].copy()
-        batch["ts_code"] = ts_code
-        for c in ["ema_12", "ema_26", "dif", "dea", "macd_bar", "trend_strength"]:
-            batch[c] = batch[c].apply(to_float_safe)
-        batch["calc_date"] = calc_date
-        batch = batch[dws_cols]
-        self.con.register("_batch", batch)
-        cols_sql = ", ".join(dws_cols)
-        self.con.execute(f"INSERT OR REPLACE INTO {self.dws_table} ({cols_sql}) SELECT {cols_sql} FROM _batch")
-        self.con.unregister("_batch")
+                    "trend", "trend_strength", "calc_date",
+                    "input_fingerprint", "spec_version"]
+        float_cols = ["ema_12", "ema_26", "dif", "dea", "macd_bar", "trend_strength"]
+        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                         dws_cols, float_cols)

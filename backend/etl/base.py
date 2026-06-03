@@ -7,7 +7,7 @@ def ema(series: np.ndarray, period: int) -> np.ndarray:
     NaN values are skipped (carry forward) for suspension day handling."""
     result = np.full(len(series), np.nan)
     total_valid = np.sum(~np.isnan(series))
-    if total_valid < period:
+    if total_valid < min(period, 5):
         return result
 
     alpha = 2.0 / (period + 1)
@@ -80,3 +80,64 @@ def to_float_safe(val):
         return f
     except (ValueError, TypeError):
         return None
+
+
+import hashlib
+
+
+def compute_fingerprint(df: "pd.DataFrame", float_cols: list[str]) -> str:
+    """Compute content fingerprint (SHA256 truncated) for a batch of DWS data.
+
+    Takes min/max/mean/count of each float column as a deterministic summary.
+    Returns 16-char hex string.
+    """
+    import pandas as pd
+    parts = []
+    for col in sorted(float_cols):
+        if col not in df.columns:
+            continue
+        series = df[col].dropna()
+        if len(series) == 0:
+            parts.append(f"{col}:empty")
+        else:
+            parts.append(
+                f"{col}:{series.min():.6f}:{series.max():.6f}:"
+                f"{series.mean():.6f}:{len(series)}"
+            )
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def insert_dws_batch(con, table: str, df: "pd.DataFrame", ts_code: str,
+                     calc_date: str, dws_cols: list[str],
+                     float_cols: list[str],
+                     spec_version: str = "v1"):
+    """Shared DWS INSERT -- replaces individual Calculator _insert methods.
+
+    Handles: calc_date, spec_version, input_fingerprint, to_float_safe.
+    """
+    import pandas as pd
+
+    data_cols = [c for c in dws_cols if c != "ts_code"]
+    for c in data_cols:
+        if c not in df.columns:
+            df[c] = None
+
+    batch = df[data_cols].copy()
+    batch["ts_code"] = ts_code
+
+    for c in float_cols:
+        if c in batch.columns:
+            batch[c] = batch[c].apply(to_float_safe)
+
+    batch["calc_date"] = calc_date
+    batch["spec_version"] = spec_version
+    batch["input_fingerprint"] = compute_fingerprint(df, float_cols)
+
+    con.register("_batch", batch)
+    cols_sql = ", ".join(dws_cols)
+    con.execute(
+        f"INSERT OR REPLACE INTO {table} ({cols_sql}) "
+        f"SELECT {cols_sql} FROM _batch"
+    )
+    con.unregister("_batch")
