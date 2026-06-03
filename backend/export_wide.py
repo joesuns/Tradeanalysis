@@ -127,12 +127,17 @@ def export_wide_to_excel(
 
     daily = _format_numbers(daily)
 
-    # ---- Weekly data (rolling: same trade_date) ----
+    # ---- Weekly data: use latest week-end ≤ trade_date ----
+    week_end = con.execute(
+        "SELECT MAX(trade_date) FROM dim_date "
+        "WHERE trade_date <= ? AND is_week_end = 1",
+        [trade_date]
+    ).fetchone()[0]
     weekly = con.execute(
         f"SELECT * FROM {VIEW_MAP['weekly']} WHERE trade_date = ?"
         + (" AND is_st = 0" if filter_st else ""),
-        [trade_date]
-    ).df()
+        [week_end]
+    ).df() if week_end else pd.DataFrame()
     if ts_codes:
         weekly = weekly[weekly["ts_code"].isin(ts_codes)]
     weekly = _format_numbers(weekly)
