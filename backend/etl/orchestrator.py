@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 from backend.db.connection import get_connection, check_connectivity, run_checkpoint
 from backend.etl.error_handler import (
-    log_etl_start, log_etl_end, log_etl_error, check_data_completeness,
+    log_etl_start, log_etl_end, log_etl_error, check_data_completeness as _check_ods_completeness,
 )
 from backend.fetch.client import TushareClient
 from backend.fetch.ods_daily import fetch_by_date_range_parallel, get_all_active_codes
@@ -102,7 +102,7 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
 
             # Run data completeness check after fetch
             lid, t0 = log_etl_start(con, "data_completeness_check")
-            comp = check_data_completeness(con)
+            comp = _check_ods_completeness(con)
             log_etl_end(con, lid, "data_completeness_check", t0, "success",
                         data_completeness=comp)
 
@@ -197,3 +197,141 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
         run_checkpoint(con)
     finally:
         con.close()
+
+
+def check_data_completeness(con, ts_codes: list[str],
+                             min_daily_rows: int = 60) -> dict:
+    """检查指定股票在 DWD 层的数据完整度。
+
+    返回:
+        {
+            "ok": ["000001.SZ", ...],
+            "missing": {
+                "000543.SZ": {
+                    "dwd_rows": 260,
+                    "min_date": "20230601",
+                    "max_date": "20260603",
+                },
+                ...
+            },
+        }
+    """
+    ok = []
+    missing = {}
+
+    for ts_code in ts_codes:
+        row = con.execute("""
+            SELECT COUNT(*), MIN(trade_date), MAX(trade_date)
+            FROM dwd_daily_quote WHERE ts_code = ?
+        """, (ts_code,)).fetchone()
+
+        dwd_rows, min_date, max_date = row
+        if dwd_rows is not None and dwd_rows >= min_daily_rows:
+            ok.append(ts_code)
+        else:
+            missing[ts_code] = {
+                "dwd_rows": dwd_rows or 0,
+                "min_date": min_date,
+                "max_date": max_date,
+            }
+
+    return {"ok": ok, "missing": missing}
+
+
+def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
+             batch_size: int = 100):
+    """执行 DWS 计算流程。
+
+    1. 如果未指定 ts_codes，获取全市场活跃股票
+    2. 数据完整度检查
+    3. 缺数据 → auto_fetch 补拉 或 报错退出
+    4. 逐 Calculator 计算 DWS
+    """
+    import time
+    from datetime import datetime
+    from backend.fetch.ods_daily import get_all_active_codes
+    from backend.fetch.client import TushareClient
+    from backend.fetch.ods_daily import fetch_stocks_incremental
+    from backend.etl.error_handler import log_etl_start, log_etl_end
+    from backend.etl.calc_macd import MACDCalculator
+    from backend.etl.calc_ma import MACalculator
+    from backend.etl.calc_kpattern import KPatternCalculator
+    from backend.etl.calc_dde import DDECalculator
+    from backend.etl.calc_volume import VolumeCalculator
+    from backend.etl.calc_price_position import PricePositionCalculator
+
+    CALCULATORS = [MACDCalculator, MACalculator, KPatternCalculator,
+                   DDECalculator, VolumeCalculator, PricePositionCalculator]
+
+    if ts_codes is None:
+        ts_codes = get_all_active_codes(con)
+    if not ts_codes:
+        logger.warning("No stocks to calculate")
+        return
+
+    # 1. 数据完整度检查
+    completeness = check_data_completeness(con, ts_codes)
+    if completeness["missing"]:
+        missing_codes = list(completeness["missing"].keys())
+        logger.warning("%d stocks have insufficient DWD data (< %d rows)",
+                       len(missing_codes), 60)
+
+        if auto_fetch and len(missing_codes) <= 50:
+            logger.info("Auto-fetching missing data for %d stocks...",
+                        len(missing_codes))
+            client = TushareClient()
+            n = fetch_stocks_incremental(client, con, missing_codes)
+            logger.info("Fetched %d ODS rows, rebuilding DWD...", n)
+            if n > 0:
+                from backend.etl.build_dwd import build_dwd_daily_quote
+                build_dwd_daily_quote(con, missing_codes)
+                # Re-check after fetch
+                completeness = check_data_completeness(con, ts_codes)
+        elif auto_fetch and len(missing_codes) > 50:
+            logger.error(
+                "%d stocks missing data (threshold: 50). "
+                "Run 'python -m backend.cli fetch --ts-code ...' manually, "
+                "or use --no-auto-fetch to skip these stocks.",
+                len(missing_codes)
+            )
+            for code, info in completeness["missing"].items():
+                logger.error("  %s: %d DWD rows (%s~%s)",
+                             code, info["dwd_rows"],
+                             info["min_date"] or "N/A",
+                             info["max_date"] or "N/A")
+            return
+
+    # 2. 只计算数据充足的股票
+    codes_to_calc = completeness["ok"]
+    if not codes_to_calc:
+        logger.warning("No stocks with sufficient data to calculate")
+        return
+
+    # 3. 计算 DWS
+    calc_date = datetime.now().strftime("%Y%m%d")
+    lid, t0 = log_etl_start(con, "calc_dws")
+    grand_total = 0
+    calc_start = time.monotonic()
+
+    for CalcCls in CALCULATORS:
+        for freq in ("daily", "weekly"):
+            calc = CalcCls(con, freq)
+            label = f"{CalcCls.__name__} {freq}"
+            t1 = time.monotonic()
+
+            for i in range(0, len(codes_to_calc), batch_size):
+                batch = codes_to_calc[i:i + batch_size]
+                calc.calculate(batch, calc_date)
+
+            elapsed = time.monotonic() - t1
+            n = con.execute(
+                f"SELECT COUNT(*) FROM {calc.dws_table} "
+                f"WHERE calc_date = ?", (calc_date,),
+            ).fetchone()[0]
+            grand_total += n
+            logger.info("calc %-30s DONE — %d rows, %.0fs", label, n, elapsed)
+
+    total_elapsed = time.monotonic() - calc_start
+    logger.info("calc ALL DONE — %d stocks, %d rows, %.0fs",
+                len(codes_to_calc), grand_total, total_elapsed)
+    log_etl_end(con, lid, "calc_dws", t0, "success", row_count=grand_total)
