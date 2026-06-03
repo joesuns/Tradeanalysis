@@ -1,6 +1,18 @@
 """DWD layer construction — forward-adjusted prices, weekly aggregation, moneyflow mapping."""
 
 
+def rebuild_all_dwd(con, ts_codes=None) -> dict:
+    """Rebuild all 3 DWD tables in correct order. Single entry point for DWD refresh.
+
+    Returns {"daily_quote": n, "weekly_quote": n, "moneyflow": n}.
+    """
+    return {
+        "daily_quote": build_dwd_daily_quote(con, ts_codes),
+        "weekly_quote": build_dwd_weekly_quote(con, ts_codes),
+        "moneyflow": build_dwd_daily_moneyflow(con, ts_codes),
+    }
+
+
 def build_dwd_daily_quote(con, ts_codes=None) -> int:
     """Build dwd_daily_quote: single-pass batch 前复权 for all stocks.
 
@@ -49,12 +61,28 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
         params,
     )
 
-    # Step 2: Batch suspension detection (per-stock LATERAL is unavoidable
-    # for correct prev-close lookup, but at least precomputed in one pass)
+    # Step 2: Batch suspension detection.  Skip stocks with no data gaps
+    # (the vast majority) to avoid 5525 individual LATERAL JOIN queries.
     codes_to_fill = ts_codes if ts_codes else [
         r[0] for r in con.execute("SELECT ts_code FROM dim_stock").fetchall()
     ]
+    # Find stocks where dwd row count < expected trading-day count (i.e. gaps exist)
+    gap_rows = con.execute("""
+        SELECT q.ts_code
+        FROM (SELECT ts_code, COUNT(*) AS n FROM dwd_daily_quote GROUP BY ts_code) q
+        JOIN (SELECT ts_code, COUNT(*) AS n FROM ods_daily GROUP BY ts_code) o
+          ON q.ts_code = o.ts_code
+        WHERE q.n < o.n
+    """).fetchall()
+    gap_stocks = set(r[0] for r in gap_rows)
+    if gap_stocks:
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.info("Suspension fill needed: %d/%d stocks",
+                  len(gap_stocks), len(codes_to_fill))
     for ts_code in codes_to_fill:
+        if ts_code not in gap_stocks and len(gap_stocks) < len(codes_to_fill):
+            continue
         con.execute(
             """INSERT OR REPLACE INTO dwd_daily_quote
                 (ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq,

@@ -21,7 +21,7 @@ from backend.etl.error_handler import (
 from backend.fetch.client import TushareClient
 from backend.fetch.ods_daily import fetch_by_date_range_parallel, get_all_active_codes
 from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
-from backend.etl.build_dwd import build_dwd_daily_quote, build_dwd_daily_moneyflow, build_dwd_weekly_quote
+from backend.etl.build_dwd import rebuild_all_dwd
 from backend.etl.calc_macd import MACDCalculator
 from backend.etl.calc_ma import MACalculator
 from backend.etl.calc_kpattern import KPatternCalculator
@@ -126,18 +126,14 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
 
         if step in ("build-dwd", "build-all"):
             codes = ts_codes or get_all_active_codes(con)
-            for dwd_step, fn in [
-                ("build_dwd_daily_quote", build_dwd_daily_quote),
-                ("build_dwd_weekly_quote", build_dwd_weekly_quote),
-                ("build_dwd_daily_moneyflow", build_dwd_daily_moneyflow),
-            ]:
-                lid, t0 = log_etl_start(con, dwd_step)
-                try:
-                    n = fn(con, codes)
-                    log_etl_end(con, lid, dwd_step, t0, "success", row_count=n)
-                except Exception as e:
-                    log_etl_error(con, lid, dwd_step, t0, 0, e)
-                    raise
+            lid, t0 = log_etl_start(con, "build_dwd")
+            try:
+                result = rebuild_all_dwd(con, codes)
+                for name, n in result.items():
+                    log_etl_end(con, lid, f"build_dwd_{name}", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_error(con, lid, "build_dwd", t0, 0, e)
+                raise
 
         if step in ("calc-dws", "build-all"):
             codes = ts_codes or get_all_active_codes(con)
@@ -275,8 +271,7 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
             n = fetch_stocks_incremental(client, con, missing_codes)
             logger.info("Fetched %d ODS rows, rebuilding DWD...", n)
             if n > 0:
-                from backend.etl.build_dwd import build_dwd_daily_quote
-                build_dwd_daily_quote(con, missing_codes)
+                rebuild_all_dwd(con, missing_codes)
                 # Re-check after fetch
                 completeness = check_data_completeness(con, ts_codes)
         elif auto_fetch and len(missing_codes) > 50:
