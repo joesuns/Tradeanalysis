@@ -359,3 +359,79 @@ def test_integration_dde_daily(db_with_schema):
     assert abs(rows[5][1] - expected_ddx) < 0.001, (
         f"Integration DDX mismatch: expected {expected_ddx}, got {rows[5][1]}"
     )
+
+
+def test_dde_trend_weighted_regression():
+    """指数加权回归：近期 bar 权重更大，后 4 天快速上升应判 up。"""
+    calc = DDECalculator.__new__(DDECalculator)
+
+    # 前 4 天下降，后 4 天快速上升 → 加权回归应判 up
+    ddx2 = np.array([0.010, 0.008, 0.006, 0.004, 0.003,
+                     0.005, 0.008, 0.012, 0.016, 0.020])
+    result = calc._compute_trend(ddx2, window=8)
+    assert result[9] == "up", (
+        f"加权回归应捕捉近期上升势头，实际 {result[9]}"
+    )
+
+
+def test_dde_trend_weighted_flat():
+    """指数加权回归：无明显方向时应判 flat。"""
+    calc = DDECalculator.__new__(DDECalculator)
+
+    ddx2 = np.array([0.010, 0.011, 0.009, 0.010, 0.011,
+                     0.009, 0.010, 0.010, 0.011, 0.009])
+    result = calc._compute_trend(ddx2, window=8)
+    assert result[9] == "flat", (
+        f"无明显趋势应判 flat，实际 {result[9]}"
+    )
+
+
+def test_dde_trend_strength_positive():
+    """trend_strength: 单调上升返回正值。"""
+    calc = DDECalculator.__new__(DDECalculator)
+
+    ddx2 = np.array([0.001, 0.002, 0.003, 0.004, 0.005,
+                     0.006, 0.007, 0.008, 0.009, 0.010])
+    result = calc._compute_trend_strength(ddx2, window=8)
+    assert result[9] is not None, "trend_strength 不应为 None"
+    assert not np.isnan(result[9]), "trend_strength 不应为 NaN"
+    assert result[9] > 0, (
+        f"单调上升应返回正强度，实际 {result[9]}"
+    )
+
+
+def test_dde_trend_strength_negative():
+    """trend_strength: 单调下降返回负值。"""
+    calc = DDECalculator.__new__(DDECalculator)
+
+    ddx2 = np.array([0.010, 0.009, 0.008, 0.007, 0.006,
+                     0.005, 0.004, 0.003, 0.002, 0.001])
+    result = calc._compute_trend_strength(ddx2, window=8)
+    assert result[9] is not None, "trend_strength 不应为 None"
+    assert not np.isnan(result[9]), "trend_strength 不应为 NaN"
+    assert result[9] < 0, (
+        f"单调下降应返回负强度，实际 {result[9]}"
+    )
+
+
+def test_dde_trend_strength_window_insufficient():
+    """窗口不足时 trend_strength 应返回 NaN。"""
+    calc = DDECalculator.__new__(DDECalculator)
+
+    ddx2 = np.array([0.001, 0.002, 0.003])  # 只有 3 根，不足 window=8
+    result = calc._compute_trend_strength(ddx2, window=8)
+    for i in range(len(ddx2)):
+        assert np.isnan(result[i]), (
+            f"窗口不足 index {i} 应返回 NaN，实际 {result[i]}"
+        )
+
+
+def test_dde_trend_strength_zero_mean():
+    """DDX2 全为零时 trend_strength 应返回 NaN（除零保护）。"""
+    calc = DDECalculator.__new__(DDECalculator)
+
+    ddx2 = np.zeros(10)
+    result = calc._compute_trend_strength(ddx2, window=8)
+    assert np.isnan(result[9]), (
+        f"全零 DDX2 应返回 NaN，实际 {result[9]}"
+    )
