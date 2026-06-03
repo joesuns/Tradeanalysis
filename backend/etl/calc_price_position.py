@@ -50,22 +50,15 @@ class PricePositionCalculator:
 
         for window in self.WINDOWS:
             col = f"price_position_{window}d"
-            result = np.full(len(c), np.nan)
-
-            # Rolling min/max via pandas for efficiency
-            rolling_min = pd.Series(c).rolling(window, min_periods=window).min().values
-            rolling_max = pd.Series(c).rolling(window, min_periods=window).max().values
-
-            for i in range(window - 1, len(c)):
-                if pd.isna(c[i]):
-                    continue
-                lo = rolling_min[i]
-                hi = rolling_max[i]
-                if pd.isna(lo) or pd.isna(hi) or hi == lo:
-                    continue
-                result[i] = (c[i] - lo) / (hi - lo) * 100.0
-
-            df[col] = result
+            s = pd.Series(c)
+            roll_min = s.rolling(window, min_periods=window).min()
+            roll_max = s.rolling(window, min_periods=window).max()
+            denom = roll_max - roll_min
+            df[col] = np.where(
+                denom.values > 0,
+                (c - roll_min.values) / denom.values * 100.0,
+                np.nan,
+            )
 
         return df
 

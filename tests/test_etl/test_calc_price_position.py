@@ -52,7 +52,7 @@ def test_price_position_all_windows():
     calc.freq = "daily"
 
     n = 300
-    dates = [f"2026{i:03d}" for i in range(1, n + 1)]
+    dates = [f"2026{i:04d}" for i in range(1, n + 1)]
     closes = [10.0 + i * 0.02 for i in range(n)]  # steadily rising
     df = pd.DataFrame({"trade_date": dates, "close_qfq": closes})
     result = calc._compute_positions(df)
