@@ -486,16 +486,7 @@ _ADS_WIDE_VIEWS_DDL = [
 
         -- Composite volume-price signals
         CASE
-            WHEN q.close_qfq > (
-                SELECT MAX(q2.close_qfq) FROM dwd_daily_quote q2
-                WHERE q2.ts_code = c.ts_code
-                  AND q2.trade_date < c.trade_date
-                  AND q2.trade_date > (
-                    SELECT MIN(trade_date) FROM dwd_daily_quote
-                    WHERE ts_code = c.ts_code AND trade_date >= c.trade_date
-                    LIMIT 1 OFFSET 59
-                  )
-            ) AND v.volume_ratio > 1.5
+            WHEN pp.price_position_60d > 98 AND v.volume_ratio > 1.5
                 THEN 'breakout_confirmed'
             WHEN pp.price_position_60d > 85 AND v.zone = 'explosive'
                  AND q.pct_chg BETWEEN -2 AND 2
@@ -594,16 +585,7 @@ _ADS_WIDE_VIEWS_DDL = [
 
         -- Composite volume-price signals
         CASE
-            WHEN qw.close_qfq > (
-                SELECT MAX(qw2.close_qfq) FROM dwd_weekly_quote qw2
-                WHERE qw2.ts_code = cw.ts_code
-                  AND qw2.trade_date < cw.trade_date
-                  AND qw2.trade_date > (
-                    SELECT MIN(trade_date) FROM dwd_weekly_quote
-                    WHERE ts_code = cw.ts_code AND trade_date >= cw.trade_date
-                    LIMIT 1 OFFSET 59
-                  )
-            ) AND vw.volume_ratio > 1.5
+            WHEN ppw.price_position_60d > 98 AND vw.volume_ratio > 1.5
                 THEN 'breakout_confirmed'
             WHEN ppw.price_position_60d > 85 AND vw.zone = 'explosive'
                  AND qw.pct_chg BETWEEN -2 AND 2
