@@ -344,7 +344,7 @@ class KPatternCalculator:
                    "gao_kai_chang_yin", "yin_bao_yang", "yin_ke_yang"]:
             batch[c] = batch[c].fillna(0).astype(int)
         batch["strength"] = batch["strength"].apply(to_float_safe)
-        batch["calc_date"] = batch["calc_date"].astype(str)
+        batch["calc_date"] = calc_date
         batch = batch[dws_cols]  # reorder to match table
         self.con.register("_batch", batch)
         cols_sql = ", ".join(dws_cols)

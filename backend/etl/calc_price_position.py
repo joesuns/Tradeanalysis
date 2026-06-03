@@ -76,7 +76,7 @@ class PricePositionCalculator:
         batch["ts_code"] = ts_code
         for c in ["price_position_60d", "price_position_120d", "price_position_250d"]:
             batch[c] = batch[c].apply(to_float_safe)
-        batch["calc_date"] = batch["calc_date"].astype(str)
+        batch["calc_date"] = calc_date
         batch = batch[dws_cols]
         self.con.register("_batch", batch)
         cols_sql = ", ".join(dws_cols)

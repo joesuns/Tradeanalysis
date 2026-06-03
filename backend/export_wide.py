@@ -34,11 +34,11 @@ _COL_NAMES = {
     "dde_trend": "DDE趋势", "dde_trend_strength": "DDE趋势强度", "dde_alert": "DDE警惕", "dde_divergence": "DDE背离",
     "ma_vol_5": "5日均量(万手)", "pct_vol_rank": "量能百分位",
     "vol_zone": "量能区域", "vol_trend": "量能趋势",
-    "volume_ratio": "量比", "vol_trend_strength": "量能趋势强度",
+    "volume_ratio": "量比", "vol_ratio": "量比", "vol_trend_strength": "量能趋势强度",
     "vol_divergence": "量价背离",
-    "price_position_60d": "价格位置60日", "price_position_120d": "价格位置120日",
-    "price_position_250d": "价格位置250日",
-    "vol_signal": "量价复合信号",
+    "price_position_60d": "60日价格滚动分位(%)", "price_position_120d": "120日价格滚动分位(%)",
+    "price_position_250d": "250日价格滚动分位(%)",
+    "vol_signal": "量价信号",
 }
 
 # Enum value translations (English → Chinese). NULL = no signal, shown as "-"
@@ -243,12 +243,12 @@ def _reorder_signal_first(df: "pd.DataFrame") -> "pd.DataFrame":
     ]
     signals = [
         "kpattern", "kpattern_strength",
+        "price_position_60d", "price_position_120d", "price_position_250d",
         "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
         "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope",
         "dde_trend", "dde_trend_strength", "dde_alert", "dde_divergence",
         "vol_zone", "vol_trend", "volume_ratio", "vol_trend_strength", "vol_divergence",
         "vol_signal",
-        "price_position_60d", "price_position_120d", "price_position_250d",
     ]
     tail = [c for c in df.columns if c not in head and c not in signals]
     ordered = [c for c in head + signals + tail if c in df.columns]
@@ -264,7 +264,7 @@ _COL_GROUPS = {
     "dde":     {"主力净流入(万元)", "DDX", "DDX2", "DDE趋势", "DDE警惕", "DDE背离"},
     "volume":  {"5日均量(万手)", "量能百分位", "量能区域", "量能趋势",
                 "量比", "量能趋势强度", "量价背离", "量价复合信号"},
-    "price_pos": {"价格位置60日", "价格位置120日", "价格位置250日"},
+    "price_pos": {"60日价格滚动分位(%)", "120日价格滚动分位(%)", "250日价格滚动分位(%)"},
     "kline":   {"K线形态", "形态强度"},
 }
 
