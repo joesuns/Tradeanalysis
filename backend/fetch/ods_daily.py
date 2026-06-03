@@ -190,16 +190,23 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
 
         for seg_start, seg_end in ranges:
             try:
+                # 0. Fetch adj_factor per-stock first — daily API doesn't include it
+                adj_recs = client.call("adj_factor", ts_code=ts_code,
+                                       start_date=seg_start, end_date=seg_end)
+                adj_map = {a["trade_date"]: a.get("adj_factor") for a in adj_recs}
+
+                # 1. Daily OHLCV — per-stock
                 recs = client.call("daily", ts_code=ts_code,
                                    start_date=seg_start, end_date=seg_end)
                 for r in recs:
+                    adj = adj_map.get(r["trade_date"])
                     con.execute("""INSERT OR REPLACE INTO ods_daily
                         (ts_code, trade_date, open, high, low, close, vol,
                          amount, pct_chg, adj_factor, fetched_at)
                         VALUES (?,?,?,?,?,?,?,?,?,?,now())""",
                         (r["ts_code"], r["trade_date"], r["open"], r["high"],
                          r["low"], r["close"], r["vol"], r["amount"],
-                         r["pct_chg"], r.get("adj_factor")))
+                         r["pct_chg"], adj))
                     total += 1
             except Exception as e:
                 logger.error("fetch_stocks_incremental %s [%s~%s]: %s",
