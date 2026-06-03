@@ -27,9 +27,10 @@ from backend.etl.calc_ma import MACalculator
 from backend.etl.calc_kpattern import KPatternCalculator
 from backend.etl.calc_dde import DDECalculator
 from backend.etl.calc_volume import VolumeCalculator
+from backend.etl.calc_price_position import PricePositionCalculator
 
 CALCULATORS = [MACDCalculator, MACalculator, KPatternCalculator,
-               DDECalculator, VolumeCalculator]
+               DDECalculator, VolumeCalculator, PricePositionCalculator]
 
 
 def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
