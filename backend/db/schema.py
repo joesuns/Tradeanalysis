@@ -317,6 +317,7 @@ _DWS_DDL = {
         ddx            REAL,
         ddx2           REAL,
         trend          TEXT,
+        trend_strength REAL,
         alert          TEXT,
         divergence     TEXT,
         calc_date      TEXT,
@@ -424,8 +425,8 @@ _ADS_WIDE_VIEWS_DDL = [
         CASE
             WHEN k.yang_ke_yin = 1    THEN 'yang_ke_yin'
             WHEN k.yang_bao_yin = 1   THEN 'yang_bao_yin'
-            WHEN k.yin_ke_yang = 1    THEN 'yin_ke_yang'
-            WHEN k.yin_bao_yang = 1   THEN 'yin_bao_yang'
+            WHEN k.yin_ke_yang = 1    THEN 'contrarian_yin_ke_yang'
+            WHEN k.yin_bao_yang = 1   THEN 'contrarian_yin_bao_yang'
             WHEN k.mu_bei_xian = 1    THEN 'mu_bei_xian'
             WHEN k.bi_lei_zhen = 1    THEN 'bi_lei_zhen'
             WHEN k.gao_kai_chang_yin = 1 THEN 'gao_kai_chang_yin'
@@ -459,6 +460,7 @@ _ADS_WIDE_VIEWS_DDL = [
 
         d.net_mf_amount, d.ddx, d.ddx2,
         d.trend          AS dde_trend,
+        d.trend_strength AS dde_trend_strength,
         d.alert          AS dde_alert,
         d.divergence     AS dde_divergence,
 
@@ -498,8 +500,8 @@ _ADS_WIDE_VIEWS_DDL = [
         CASE
             WHEN kw.yang_ke_yin = 1    THEN 'yang_ke_yin'
             WHEN kw.yang_bao_yin = 1   THEN 'yang_bao_yin'
-            WHEN kw.yin_ke_yang = 1    THEN 'yin_ke_yang'
-            WHEN kw.yin_bao_yang = 1   THEN 'yin_bao_yang'
+            WHEN kw.yin_ke_yang = 1    THEN 'contrarian_yin_ke_yang'
+            WHEN kw.yin_bao_yang = 1   THEN 'contrarian_yin_bao_yang'
             WHEN kw.mu_bei_xian = 1    THEN 'mu_bei_xian'
             WHEN kw.bi_lei_zhen = 1    THEN 'bi_lei_zhen'
             WHEN kw.gao_kai_chang_yin = 1 THEN 'gao_kai_chang_yin'
@@ -533,9 +535,10 @@ _ADS_WIDE_VIEWS_DDL = [
         aw.turning_point AS ma_turning_point,
 
         dw.net_mf_amount, dw.ddx, dw.ddx2,
-        dw.trend         AS dde_trend,
-        dw.alert         AS dde_alert,
-        dw.divergence    AS dde_divergence,
+        dw.trend          AS dde_trend,
+        dw.trend_strength AS dde_trend_strength,
+        dw.alert          AS dde_alert,
+        dw.divergence     AS dde_divergence,
 
         vw.ma_vol_5, vw.pct_vol_rank,
         vw.zone          AS vol_zone,
@@ -566,8 +569,8 @@ _ADS_WIDE_VIEWS_DDL = [
         CASE
             WHEN k.yang_ke_yin = 1    THEN 'yang_ke_yin'
             WHEN k.yang_bao_yin = 1   THEN 'yang_bao_yin'
-            WHEN k.yin_ke_yang = 1    THEN 'yin_ke_yang'
-            WHEN k.yin_bao_yang = 1   THEN 'yin_bao_yang'
+            WHEN k.yin_ke_yang = 1    THEN 'contrarian_yin_ke_yang'
+            WHEN k.yin_bao_yang = 1   THEN 'contrarian_yin_bao_yang'
             WHEN k.mu_bei_xian = 1    THEN 'mu_bei_xian'
             WHEN k.bi_lei_zhen = 1    THEN 'bi_lei_zhen'
             WHEN k.gao_kai_chang_yin = 1 THEN 'gao_kai_chang_yin'
@@ -630,8 +633,8 @@ _ADS_WIDE_VIEWS_DDL = [
         CASE
             WHEN k.yang_ke_yin = 1    THEN 'yang_ke_yin'
             WHEN k.yang_bao_yin = 1   THEN 'yang_bao_yin'
-            WHEN k.yin_ke_yang = 1    THEN 'yin_ke_yang'
-            WHEN k.yin_bao_yang = 1   THEN 'yin_bao_yang'
+            WHEN k.yin_ke_yang = 1    THEN 'contrarian_yin_ke_yang'
+            WHEN k.yin_bao_yang = 1   THEN 'contrarian_yin_bao_yang'
             WHEN k.mu_bei_xian = 1    THEN 'mu_bei_xian'
             WHEN k.bi_lei_zhen = 1    THEN 'bi_lei_zhen'
             WHEN k.gao_kai_chang_yin = 1 THEN 'gao_kai_chang_yin'
