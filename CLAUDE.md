@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## 沟通规范
+
+- **默认中文**：所有交互使用中文，代码/术语可中英混杂
+
 ## 项目概述
 
 Tradeanalysis — 基于 tushare + DuckDB 的 A 股技术分析数据管道。拉取全市场 OHLCV/资金流/PE 等数据，计算 MACD/MA/K线形态/DDE/量能/价格位置六大类技术指标（日线+周线），通过 FastAPI 查询、CLI 导出 Excel。
