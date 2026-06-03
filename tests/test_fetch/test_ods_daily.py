@@ -1,66 +1,93 @@
-"""Tests for ods_daily.py — date-based batch fetch."""
-import pytest
-from unittest.mock import patch, MagicMock
+"""Tests for per-stock incremental fetch in backend.fetch.ods_daily."""
+
+import duckdb
+from backend.fetch.ods_daily import (
+    _get_missing_days_for_stock,
+    _get_missing_ranges_per_stock,
+    fetch_stocks_incremental,
+)
 
 
-def test_fetch_by_date_range(db_with_schema, monkeypatch):
-    monkeypatch.setenv("TUSHARE_TOKEN", "test")
+def test_get_missing_days_for_stock():
+    """per-stock detection: only filter out dates already present for THAT stock."""
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    # 000001.SZ has 5 days
+    for d in ["20260101", "20260102", "20260103", "20260104", "20260105"]:
+        con.execute("INSERT INTO ods_daily VALUES ('000001.SZ', ?)", (d,))
+    # 000002.SZ has only 1 day
+    con.execute("INSERT INTO ods_daily VALUES ('000002.SZ', '20260101')")
 
-    with patch("backend.fetch.client.ts.pro_api") as mock_pro:
-        mock = MagicMock()
+    all_days = ["20260101", "20260102", "20260103", "20260104", "20260105"]
 
-        # Mock _get_trading_days: return 2 dates
-        mock.trade_cal.return_value = MagicMock(empty=False, to_dict=lambda _: [
-            {"cal_date": "20260101"}, {"cal_date": "20260102"},
-        ])
-        # Mock adj_factor
-        mock.adj_factor.return_value = MagicMock(empty=False, to_dict=lambda _: [
-            {"ts_code": "000001.SZ", "trade_date": "20260101", "adj_factor": 1.5},
-        ])
-        # Mock daily
-        mock.daily.return_value = MagicMock(empty=False, to_dict=lambda _: [
-            {"ts_code": "000001.SZ", "trade_date": "20260101",
-             "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.2,
-             "vol": 1000000, "amount": 10000000, "pct_chg": 1.0},
-        ])
-        # Mock daily_basic
-        mock.daily_basic.return_value = MagicMock(empty=False, to_dict=lambda _: [
-            {"ts_code": "000001.SZ", "trade_date": "20260101",
-             "total_mv": 100000, "pe_ttm": 12.0, "turnover_rate": 2.5, "volume_ratio": 1.0},
-        ])
-        # Mock moneyflow
-        mock.moneyflow.return_value = MagicMock(empty=False, to_dict=lambda _: [
-            {"ts_code": "000001.SZ", "trade_date": "20260101",
-             "buy_sm_vol": 100, "buy_sm_amount": 1000, "sell_sm_vol": 50, "sell_sm_amount": 500,
-             "buy_md_vol": 200, "buy_md_amount": 2000, "sell_md_vol": 100, "sell_md_amount": 1000,
-             "buy_lg_vol": 300, "buy_lg_amount": 3000, "sell_lg_vol": 150, "sell_lg_amount": 1500,
-             "buy_elg_vol": 400, "buy_elg_amount": 4000, "sell_elg_vol": 200, "sell_elg_amount": 2000,
-             "net_mf_vol": 500, "net_mf_amount": 5000},
-        ])
-        mock_pro.return_value = mock
+    missing_1 = _get_missing_days_for_stock(con, "000001.SZ", all_days)
+    missing_2 = _get_missing_days_for_stock(con, "000002.SZ", all_days)
 
-        from backend.fetch.ods_daily import fetch_by_date_range
-        from backend.fetch.client import TushareClient
-        from backend.db.schema import create_all_tables
-        create_all_tables(db_with_schema)
-
-        total = fetch_by_date_range(TushareClient(), db_with_schema, "20260101", "20260102")
-        assert total > 0
-
-        # Verify ods_daily has adj_factor from lookup
-        row = db_with_schema.execute(
-            "SELECT close, adj_factor FROM ods_daily WHERE ts_code='000001.SZ' AND trade_date='20260101'"
-        ).fetchone()
-        assert row[0] == pytest.approx(10.2)
-        assert row[1] == pytest.approx(1.5)  # adj_factor from lookup map
+    assert len(missing_1) == 0, f"000001 should have no missing days, got {missing_1}"
+    assert len(missing_2) == 4, f"000002 should miss 4 days, got {len(missing_2)}"
+    assert "20260102" in missing_2
+    con.close()
 
 
-def test_get_all_active_codes_filters_delisted(db_with_schema):
-    from backend.db.schema import create_all_tables
-    create_all_tables(db_with_schema)
-    db_with_schema.execute("INSERT INTO ods_stock_basic (ts_code, symbol, name) VALUES ('ACTIVE.SZ','ACTIVE','Active')")
-    db_with_schema.execute("INSERT INTO ods_stock_basic (ts_code, symbol, name, delist_date) VALUES ('DELISTED.SZ','DEL','Delisted','20200101')")
-    from backend.fetch.ods_daily import get_all_active_codes
-    codes = get_all_active_codes(db_with_schema)
-    assert "ACTIVE.SZ" in codes
-    assert "DELISTED.SZ" not in codes
+def test_get_missing_ranges_merges_consecutive():
+    """Consecutive missing days should be merged into a single range."""
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    # Only the last day has data
+    con.execute("INSERT INTO ods_daily VALUES ('TEST.SZ', '20260105')")
+
+    days = ["20260101", "20260102", "20260103", "20260104", "20260105"]
+    ranges = _get_missing_ranges_per_stock(con, "TEST.SZ", days)
+
+    assert len(ranges) == 1, f"Expected 1 missing range, got {len(ranges)}: {ranges}"
+    assert ranges[0] == ("20260101", "20260104")
+    con.close()
+
+
+def test_get_missing_ranges_no_gap():
+    """When data is complete, no missing ranges should be returned."""
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    for d in ["20260101", "20260102", "20260103"]:
+        con.execute("INSERT INTO ods_daily VALUES ('FULL.SZ', ?)", (d,))
+
+    days = ["20260101", "20260102", "20260103"]
+    ranges = _get_missing_ranges_per_stock(con, "FULL.SZ", days)
+    assert len(ranges) == 0
+    con.close()
+
+
+def test_fetch_stocks_incremental_skips_when_complete():
+    """When data is already complete, only trade_cal is called — no data APIs."""
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    for d in ["20260101", "20260102", "20260103"]:
+        con.execute("INSERT INTO ods_daily VALUES ('FULL.SZ', ?)", (d,))
+
+    api_calls = []
+
+    class FakeClient:
+        def call(self, api, **kwargs):
+            api_calls.append(api)
+            if api == "trade_cal":
+                return [{"cal_date": d} for d in
+                        ["20260101", "20260102", "20260103"]]
+            return []
+
+    n = fetch_stocks_incremental(
+        FakeClient(), con, ["FULL.SZ"], start="20260101", end="20260103"
+    )
+    assert n == 0, f"Should not have fetched any data, got {n}"
+    # trade_cal is always called; daily/daily_basic/moneyflow should NOT be called
+    data_apis = [a for a in api_calls if a != "trade_cal"]
+    assert len(data_apis) == 0, f"Should not have called data APIs, got {data_apis}"
+    con.close()
+
+
+def test_get_missing_days_empty_trading_days():
+    """Empty trading day list should return empty list."""
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    result = _get_missing_days_for_stock(con, "TEST.SZ", [])
+    assert result == []
+    con.close()
