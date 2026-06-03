@@ -142,12 +142,14 @@ def _get_missing_ranges_per_stock(con, ts_code: str,
     if not missing:
         return []
 
+    day_to_idx = {d: i for i, d in enumerate(all_trading_days)}
+
     ranges = []
     seg_start = missing[0]
     prev = missing[0]
     for d in missing[1:]:
-        idx_prev = all_trading_days.index(prev)
-        idx_curr = all_trading_days.index(d)
+        idx_prev = day_to_idx[prev]
+        idx_curr = day_to_idx[d]
         if idx_curr - idx_prev > 1:
             ranges.append((seg_start, prev))
             seg_start = d
@@ -170,8 +172,11 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
     """
     import time
 
-    cal = client.call("trade_cal", exchange="SSE", start_date=start, end_date=end,
-                      is_open=1)
+    try:
+        cal = client.call("trade_cal", exchange="SSE", start_date=start, end_date=end, is_open=1)
+    except Exception as e:
+        logger.error("fetch_stocks_incremental: trade_cal API failed — %s", e)
+        return 0
     all_days = sorted([r["cal_date"] for r in cal])
     if not all_days:
         return 0
@@ -212,8 +217,9 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                          r.get("pe_ttm"), r.get("turnover_rate"),
                          r.get("volume_ratio")))
                     total += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("fetch_stocks_incremental %s [%s~%s] daily_basic skipped: %s",
+                              ts_code, seg_start, seg_end, e)
 
             try:
                 recs = client.call("moneyflow", ts_code=ts_code,
@@ -238,8 +244,9 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                          r.get("sell_elg_vol"), r.get("sell_elg_amount"),
                          r.get("net_mf_vol"), r.get("net_mf_amount")))
                     total += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("fetch_stocks_incremental %s [%s~%s] moneyflow skipped: %s",
+                              ts_code, seg_start, seg_end, e)
 
         if (i + 1) % 10 == 0:
             elapsed = time.time() - t0
