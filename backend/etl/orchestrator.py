@@ -18,6 +18,7 @@ from backend.db.connection import get_connection, check_connectivity, run_checkp
 from backend.etl.error_handler import (
     log_etl_start, log_etl_end, log_etl_error, check_data_completeness as _check_ods_completeness,
 )
+from backend.etl.base import SkipReason, CalcResult
 from backend.fetch.client import TushareClient
 from backend.fetch.ods_daily import fetch_by_date_range_parallel, get_all_active_codes
 from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
@@ -234,14 +235,137 @@ def check_data_completeness(con, ts_codes: list[str],
     return {"ok": ok, "missing": missing}
 
 
+WARMUP_TDAYS = 27  # max functional minimum across all indicators (MACD bottleneck)
+
+
+def _compute_fetch_range(con, ts_code: str, calc_date: str,
+                          lookback_tdays: int = WARMUP_TDAYS) -> tuple:
+    """Compute the date range that needs to be fetched for a stock.
+
+    Start = max(list_date, calc_date往前推lookback_tdays个交易日)
+    End   = min(calc_date, delist_date)
+
+    Returns (needed_start, needed_end) or (None, None) if already covered.
+    """
+    # 1. stock lifecycle dates
+    row = con.execute("""
+        SELECT list_date, delist_date FROM dim_stock WHERE ts_code = ?
+    """, (ts_code,)).fetchone()
+    if not row:
+        return (None, None)
+    list_date, delist_date = row
+
+    # 2. end_date: delisted stock stops at delist_date, otherwise calc_date
+    end_date = calc_date
+    if delist_date and delist_date < calc_date:
+        end_date = delist_date
+
+    # 3. needed start: end_date往前推lookback_tdays个交易日
+    needed = con.execute("""
+        SELECT trade_date FROM (
+            SELECT trade_date, ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
+            FROM dim_date WHERE is_trade_day = 1 AND trade_date <= ?
+        ) WHERE rn = ?
+    """, (end_date, lookback_tdays)).fetchone()
+    needed_start = needed[0] if needed else None
+    if not needed_start:
+        return (None, None)
+
+    # 4. clamp to list_date
+    if list_date and list_date > needed_start:
+        needed_start = list_date
+
+    # 5. check if already covered by existing ODS data
+    current = con.execute("""
+        SELECT MIN(trade_date), MAX(trade_date) FROM ods_daily WHERE ts_code = ?
+    """, (ts_code,)).fetchone()
+    current_min, current_max = current if current else (None, None)
+
+    if current_min and current_max:
+        if current_min <= needed_start and current_max >= end_date:
+            return (None, None)  # fully covered
+
+    return (needed_start, end_date)
+
+
+def _filter_delisted(con, ts_codes: list[str], calc_date: str) -> tuple:
+    """Filter out delisted stocks that already have DWS data.
+
+    Returns (active_codes, delisted_dict).
+    """
+    active = []
+    delisted = {}
+    for ts_code in ts_codes:
+        row = con.execute(
+            "SELECT delist_date FROM dim_stock WHERE ts_code = ?", (ts_code,)
+        ).fetchone()
+        if not row or not row[0]:
+            active.append(ts_code)
+            continue
+        delist_date = row[0]
+        if delist_date >= calc_date:
+            active.append(ts_code)
+            continue
+        # delisted: check if DWS already exists
+        has_dws = con.execute(
+            "SELECT 1 FROM dws_macd_daily WHERE ts_code = ? LIMIT 1", (ts_code,)
+        ).fetchone()
+        if has_dws:
+            delisted[ts_code] = f"delisted={delist_date}, DWS exists, skip"
+        else:
+            active.append(ts_code)
+            logger.info("Delisted stock %s (%s) — first calc, including",
+                        ts_code, delist_date)
+    return active, delisted
+
+
+def _classify_still_missing(con, missing: dict) -> dict:
+    """Classify still-missing stocks after fetch+rebuild into root cause categories."""
+    classified = {}
+    for ts_code, info in missing.items():
+        dwd_rows = info["dwd_rows"]
+        if dwd_rows == 0:
+            if ts_code.endswith(".BJ"):
+                reason = SkipReason.SOURCE_UNAVAILABLE
+                detail = "BSE stock: moneyflow unavailable from tushare"
+            else:
+                reason = SkipReason.NO_DWD_DATA
+                detail = "DWD rows=0 after fetch+rebuild"
+        else:
+            reason = SkipReason.INSUFFICIENT_ROWS
+            detail = (f"DWD rows={dwd_rows} "
+                      f"(min_date={info['min_date']}, max_date={info['max_date']})")
+        if reason not in classified:
+            classified[reason] = []
+        classified[reason].append((ts_code, detail))
+    return classified
+
+
+def _write_skip_log_batch(con, calc_date: str, indicator: str, freq: str,
+                           classified: dict):
+    """Write classified skip reasons to ods_calc_skip_log."""
+    rows = []
+    for reason, items in classified.items():
+        for ts_code, detail in items:
+            rows.append((calc_date, ts_code, indicator, freq, reason.value, detail))
+    if rows:
+        con.executemany(
+            """INSERT OR REPLACE INTO ods_calc_skip_log
+               (calc_date, ts_code, indicator, freq, reason, detail)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+
 def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
              batch_size: int = 100):
     """执行 DWS 计算流程。
 
     1. 如果未指定 ts_codes，获取全市场活跃股票
-    2. 数据完整度检查
-    3. 缺数据 → auto_fetch 补拉 或 报错退出
-    4. 逐 Calculator 计算 DWS
+    2. 退市股过滤
+    3. 数据完整度检查
+    4. 缺数据 → auto_fetch 补拉（warmup=27 tdays，熔断器：连续5次失败中止）
+    5. 逐 Calculator 计算 DWS
     """
     import time
     from datetime import datetime
@@ -257,58 +381,126 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         logger.warning("No stocks to calculate")
         return
 
+    # 0. 退市股过滤
+    calc_date = datetime.now().strftime("%Y%m%d")
+    ts_codes, delisted = _filter_delisted(con, ts_codes, calc_date)
+    if delisted:
+        classified = {SkipReason.DELISTED: [(c, d) for c, d in delisted.items()]}
+        _write_skip_log_batch(con, calc_date, "dwd", "both", classified)
+        logger.info("Pre-calc: %d delisted stocks skipped (DWS already exists)",
+                    len(delisted))
+    if not ts_codes:
+        logger.warning("No stocks to calculate (all delisted or empty input)")
+        return
+
     # 1. 数据完整度检查
     completeness = check_data_completeness(con, ts_codes)
     if completeness["missing"]:
         missing_codes = list(completeness["missing"].keys())
-        logger.warning("%d stocks have insufficient DWD data (< %d rows)",
-                       len(missing_codes), 60)
+        missing_pct = len(missing_codes) * 100.0 / len(ts_codes)
+        logger.info("DWD completeness: %d/%d stocks (%.1f%%) lack sufficient data (< 60 rows)",
+                    len(missing_codes), len(ts_codes), missing_pct)
 
-        if auto_fetch and len(missing_codes) <= 50:
-            logger.info("Auto-fetching missing data for %d stocks...",
-                        len(missing_codes))
-            client = TushareClient()
-            n = fetch_stocks_incremental(client, con, missing_codes)
-            logger.info("Fetched %d ODS rows, rebuilding DWD...", n)
-            if n > 0:
+        if auto_fetch:
+            # Compute per-stock fetch ranges based on warmup
+            to_fetch = []
+            for ts_code in missing_codes:
+                needed_start, needed_end = _compute_fetch_range(con, ts_code, calc_date)
+                if needed_start is None:
+                    continue
+                to_fetch.append((ts_code, needed_start, needed_end))
+
+            if to_fetch:
+                logger.info("Auto-fetching %d stocks (warmup=%d tdays, per-stock ranges)...",
+                            len(to_fetch), WARMUP_TDAYS)
+                client = TushareClient()
+
+                # Circuit breaker: abort on consecutive failures
+                consecutive_errors = 0
+                consecutive_empty = 0
+                n_fetched = 0
+                for ts_code, seg_start, seg_end in to_fetch:
+                    try:
+                        rows = fetch_stocks_incremental(
+                            client, con, [ts_code], start=seg_start, end=seg_end)
+                        if rows == 0:
+                            consecutive_empty += 1
+                            consecutive_errors = 0
+                        else:
+                            n_fetched += rows
+                            consecutive_empty = 0
+                            consecutive_errors = 0
+                    except Exception as e:
+                        consecutive_errors += 1
+                        consecutive_empty = 0
+                        logger.warning("fetch failed for %s [%s~%s]: %s",
+                                       ts_code, seg_start, seg_end, e)
+
+                    if consecutive_errors >= 5:
+                        logger.error("Circuit breaker: %d consecutive fetch errors. "
+                                     "tushare may be down. Aborting auto-fetch.",
+                                     consecutive_errors)
+                        break
+                    if consecutive_empty >= 5:
+                        logger.error("Circuit breaker: %d consecutive empty responses. "
+                                     "Date range may be invalid. Aborting auto-fetch.",
+                                     consecutive_empty)
+                        break
+
+                logger.info("Auto-fetch complete: %d ODS rows fetched", n_fetched)
+                if n_fetched > 0:
+                    rebuild_all_dwd(con, missing_codes)
+                    completeness = check_data_completeness(con, ts_codes)
+            else:
+                logger.info("All missing stocks already have ODS data. Rebuilding DWD...")
                 rebuild_all_dwd(con, missing_codes)
-                # Re-check after fetch
                 completeness = check_data_completeness(con, ts_codes)
-        elif auto_fetch and len(missing_codes) > 50:
-            logger.error(
-                "%d stocks missing data (threshold: 50). "
-                "Run 'python -m backend.cli fetch --ts-code ...' manually, "
-                "or use --no-auto-fetch to skip these stocks.",
-                len(missing_codes)
-            )
-            for code, info in completeness["missing"].items():
-                logger.error("  %s: %d DWD rows (%s~%s)",
-                             code, info["dwd_rows"],
-                             info["min_date"] or "N/A",
-                             info["max_date"] or "N/A")
-            # Still calculate stocks with sufficient data
+        else:
+            logger.info("Auto-fetch disabled. Skipping %d stocks.", len(missing_codes))
 
-    # 2. 只计算数据充足的股票
+    # 2. 分类仍缺失的股票 + 写 skip_log
+    if completeness["missing"]:
+        classified = _classify_still_missing(con, completeness["missing"])
+        _write_skip_log_batch(con, calc_date, "dwd", "both", classified)
+
+        for reason, items in classified.items():
+            count = len(items)
+            level = "info" if reason in (SkipReason.SOURCE_UNAVAILABLE,
+                                          SkipReason.INSUFFICIENT_ROWS) else "warning"
+            getattr(logger, level)(
+                "Pre-calc skip: %d stocks — %s", count, reason.value)
+            sample = [c for c, _ in items[:10]]
+            logger.info("  Sample: %s", ", ".join(sample))
+
+    # 3. 只计算数据充足的股票
     codes_to_calc = completeness["ok"]
     if not codes_to_calc:
         logger.warning("No stocks with sufficient data to calculate")
         return
 
-    # 3. 计算 DWS
-    calc_date = datetime.now().strftime("%Y%m%d")
+    # 4. 计算 DWS
     lid, t0 = log_etl_start(con, "calc_dws")
     grand_total = 0
     calc_start = time.monotonic()
 
     for CalcCls in CALCULATORS:
+        indicator_name = CalcCls.__name__.replace("Calculator", "").lower()
         for freq in ("daily", "weekly"):
             calc = CalcCls(con, freq)
             label = f"{CalcCls.__name__} {freq}"
             t1 = time.monotonic()
+            agg_result = CalcResult()
 
             for i in range(0, len(codes_to_calc), batch_size):
                 batch = codes_to_calc[i:i + batch_size]
-                calc.calculate(batch, calc_date)
+                batch_result = calc.calculate(batch, calc_date)
+                agg_result.calculated += batch_result.calculated
+                for reason, items in batch_result.skipped.items():
+                    for ts_code, detail in items:
+                        agg_result.add_skip(reason, ts_code, detail)
+
+            _write_skip_log_batch(con, calc_date, indicator_name, freq,
+                                  agg_result.skipped)
 
             elapsed = time.monotonic() - t1
             n = con.execute(
@@ -316,10 +508,20 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 f"WHERE calc_date = ?", (calc_date,),
             ).fetchone()[0]
             grand_total += n
-            logger.info("calc %-30s DONE — %d rows, %.0fs", label, n, elapsed)
+
+            skip_parts = []
+            for reason in SkipReason:
+                items = agg_result.skipped.get(reason, [])
+                if items:
+                    skip_parts.append(f"{reason.value}={len(items)}")
+            skip_str = ", ".join(skip_parts) if skip_parts else "none skipped"
+            logger.info("calc %-30s DONE — %d rows (%d calculated), %s, %.0fs",
+                        label, n, agg_result.calculated, skip_str, elapsed)
 
     total_elapsed = time.monotonic() - calc_start
-    logger.info("calc ALL DONE — %d stocks, %d rows, %.0fs",
-                len(codes_to_calc), grand_total, total_elapsed)
+    logger.info("calc ALL DONE — %d total DWS rows across %d indicator×freq pairs, %.0fs",
+                grand_total, len(CALCULATORS) * 2, total_elapsed)
+    logger.info("Skip details: SELECT reason, COUNT(*) FROM ods_calc_skip_log "
+                "WHERE calc_date='%s' GROUP BY reason", calc_date)
     log_etl_end(con, lid, "calc_dws", t0, "success", row_count=grand_total)
     run_checkpoint(con)
