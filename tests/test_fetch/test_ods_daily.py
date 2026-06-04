@@ -145,3 +145,54 @@ def test_get_trading_days_with_ts_codes_partial_coverage():
     assert "20260103" in days_both
 
     con.close()
+
+
+# ── _validate_ods_batch ──
+
+
+def test_validate_ods_batch_all_valid():
+    """Clean data should all pass validation."""
+    from backend.fetch.ods_daily import _validate_ods_batch
+
+    recs = [
+        {"ts_code": "A.SZ", "trade_date": "20260101",
+         "open": 10, "high": 12, "low": 9, "close": 11, "vol": 100, "amount": 1000},
+        {"ts_code": "B.SZ", "trade_date": "20260101",
+         "open": 20, "high": 22, "low": 19, "close": 21, "vol": 200, "amount": 2000},
+    ]
+    valid, invalid = _validate_ods_batch(recs, "daily")
+    assert valid == 2
+    assert invalid == 0
+
+
+def test_validate_ods_batch_rejects_bad_ohlc():
+    """high < low or missing close should be rejected."""
+    from backend.fetch.ods_daily import _validate_ods_batch
+
+    recs = [
+        {"ts_code": "A.SZ", "trade_date": "20260101",
+         "open": 10, "high": 12, "low": 9, "close": 11, "vol": 100, "amount": 1000},
+        {"ts_code": "B.SZ", "trade_date": "20260101",
+         "open": 10, "high": 8, "low": 9, "close": 11, "vol": 100,
+         "amount": 1000},  # high < low
+        {"ts_code": "C.SZ", "trade_date": "20260101",
+         "open": 10, "high": 12, "low": 9, "close": None, "vol": 100,
+         "amount": 1000},  # missing close
+    ]
+    valid, invalid = _validate_ods_batch(recs, "daily")
+    assert valid == 1
+    assert invalid == 2
+
+
+def test_validate_ods_batch_missing_required_field():
+    """Missing open → rejected."""
+    from backend.fetch.ods_daily import _validate_ods_batch
+
+    recs = [
+        {"ts_code": "D.SZ", "trade_date": "20260101",
+         "open": None, "high": 12, "low": 9, "close": 11,
+         "vol": 100, "amount": 1000},  # missing open
+    ]
+    valid, invalid = _validate_ods_batch(recs, "daily")
+    assert valid == 0
+    assert invalid == 1

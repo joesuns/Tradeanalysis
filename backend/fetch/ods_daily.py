@@ -142,6 +142,54 @@ def _get_trading_days(client, start: str, end: str,
     return days
 
 
+def _validate_ods_batch(recs: list[dict], api_name: str,
+                        trade_date: str = "") -> tuple[int, int]:
+    """Validate ODS batch before INSERT. Returns (valid_count, invalid_count).
+
+    Checks:
+      1. Required fields present and non-None (open/high/low/close/vol/amount)
+      2. OHLC logic: high >= low
+
+    Invalid rows are logged and counted; caller should skip them.
+    """
+    import pandas as pd
+    required = ["open", "high", "low", "close", "vol", "amount"]
+    valid = 0
+    invalid = 0
+
+    for r in recs:
+        # Check 1: required fields present and non-null
+        missing = [f for f in required if r.get(f) is None]
+        if missing:
+            invalid += 1
+            continue
+
+        # Check 2: OHLC sanity
+        try:
+            o, h, l, c = (float(r["open"]), float(r["high"]),
+                          float(r["low"]), float(r["close"]))
+        except (ValueError, TypeError):
+            invalid += 1
+            continue
+
+        if h < l:
+            invalid += 1
+            continue
+
+        # Check 3: close must be non-None (already checked, but double-check)
+        if pd.isna(c):
+            invalid += 1
+            continue
+
+        valid += 1
+
+    if invalid > 0:
+        logger.warning("_validate_ods_batch: %s %s %d/%d rows rejected",
+                       api_name, trade_date, invalid, len(recs))
+
+    return valid, invalid
+
+
 def _get_missing_days_for_stock(con, ts_code: str,
                                 all_trading_days: list[str]) -> list[str]:
     """返回该股票在交易日列表中缺失的日期。"""
