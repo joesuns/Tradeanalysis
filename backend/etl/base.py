@@ -1,6 +1,44 @@
 import numpy as np
 import pandas as pd
 
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class SkipReason(str, Enum):
+    """Root-cause classification for why a stock was skipped during calculation."""
+    NO_DWD_DATA = "no_dwd_data"              # DWD has 0 rows for this stock
+    INSUFFICIENT_ROWS = "insufficient_rows"   # DWD has rows but < functional minimum
+    SOURCE_UNAVAILABLE = "source_unavailable" # tushare doesn't support (e.g. BSE moneyflow)
+    FETCH_FAILED = "fetch_failed"            # Auto-fetch exhausted retries
+    DELISTED = "delisted"                     # Stock delisted before calc_date
+
+
+@dataclass
+class CalcResult:
+    """Return value of Calculator.calculate().
+
+    Usage:
+        result = CalcResult()
+        result.calculated += 1
+        result.add_skip(SkipReason.INSUFFICIENT_ROWS, "688001.SH", "DWD rows=15, min=27")
+    """
+    calculated: int = 0
+    skipped: dict = field(default_factory=dict)  # {SkipReason: [(ts_code, detail), ...]}
+
+    def add_skip(self, reason: SkipReason, ts_code: str, detail: str = ""):
+        if reason not in self.skipped:
+            self.skipped[reason] = []
+        self.skipped[reason].append((ts_code, detail))
+
+    @property
+    def total_skipped(self) -> int:
+        return sum(len(v) for v in self.skipped.values())
+
+    @property
+    def total_input(self) -> int:
+        return self.calculated + self.total_skipped
+
 
 def ema(series: np.ndarray, period: int) -> np.ndarray:
     """Exponential Moving Average. Seed = SMA of first 'period' valid values.
