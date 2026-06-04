@@ -291,8 +291,8 @@ def _compute_fetch_range(con, ts_code: str, calc_date: str,
         WHERE is_trade_day = 1 AND trade_date >= ? AND trade_date <= ?
     """, (needed_start, end_date)).fetchone()[0]
 
-    if actual > 0 and actual >= expected * 0.95:
-        return (None, None)  # ≥95% coverage — good enough
+    if actual > 0 and actual >= expected:
+        return (None, None)  # 100% coverage required (aligned with 123 project strict check)
 
     return (needed_start, end_date)
 

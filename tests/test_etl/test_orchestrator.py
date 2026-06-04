@@ -84,3 +84,72 @@ def test_choose_with_edge_cases():
     """Single stock or single day — boundary cases."""
     assert _choose_fetch_strategy(1, 250) is False      # 1 stock → stock-batched
     assert _choose_fetch_strategy(100, 1) is True       # 1 day, many stocks → date-batched
+
+
+# ── _compute_fetch_range coverage threshold ──
+
+
+def test_compute_fetch_range_rejects_95_percent_coverage():
+    """19/20=95% ODS coverage — old threshold accepted this, new 100% rejects."""
+    import duckdb
+    from backend.etl.orchestrator import _compute_fetch_range
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dim_stock (ts_code TEXT PRIMARY KEY,
+            list_date TEXT, delist_date TEXT)
+    """)
+    con.execute("INSERT INTO dim_stock VALUES ('TEST.SZ', '20240101', NULL)")
+    con.execute("""
+        CREATE TABLE dim_date (trade_date TEXT PRIMARY KEY, is_trade_day INTEGER)
+    """)
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+
+    # 30 trading days in dim_date
+    days = [f"202606{i:02d}" for i in range(1, 31)]  # 20260601 ~ 20260630
+    for d in days:
+        con.execute("INSERT INTO dim_date VALUES (?, 1)", (d,))
+
+    # ODS has 19 of the last 20 days (20260611~20260630, missing 20260630)
+    for d in days[-20:-1]:  # 20260611 ~ 20260629 = 19 dates
+        con.execute("INSERT INTO ods_daily VALUES ('TEST.SZ', ?)", (d,))
+
+    start, end = _compute_fetch_range(con, "TEST.SZ", "20260630", lookback_tdays=20)
+    # Coverage = 19/20 = 95%. Old: 19 >= 20*0.95=19 → skip (None,None)
+    # New: 19 < 20 → NOT skip → returns actual range
+    assert start is not None, (
+        "95% coverage should NOT skip with 100% threshold — need actual range")
+    assert end is not None
+
+    con.close()
+
+
+def test_compute_fetch_range_accepts_full_coverage():
+    """100% ODS coverage IS enough to skip."""
+    import duckdb
+    from backend.etl.orchestrator import _compute_fetch_range
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dim_stock (ts_code TEXT PRIMARY KEY,
+            list_date TEXT, delist_date TEXT)
+    """)
+    con.execute("INSERT INTO dim_stock VALUES ('FULL.SZ', '20240101', NULL)")
+    con.execute("""
+        CREATE TABLE dim_date (trade_date TEXT PRIMARY KEY, is_trade_day INTEGER)
+    """)
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+
+    days = [f"202606{i:02d}" for i in range(1, 31)]
+    for d in days:
+        con.execute("INSERT INTO dim_date VALUES (?, 1)", (d,))
+    for d in days[-20:]:  # all 20 dates
+        con.execute("INSERT INTO ods_daily VALUES ('FULL.SZ', ?)", (d,))
+
+    start, end = _compute_fetch_range(con, "FULL.SZ", "20260630", lookback_tdays=20)
+    assert start is None, f"100% coverage should skip, got start={start}"
+    assert end is None
+
+    con.close()
