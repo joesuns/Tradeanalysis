@@ -673,6 +673,10 @@ _ADS_WIDE_VIEWS_DDL = [
         END              AS kpattern,
         kw.strength      AS kpattern_strength,
 
+        ppw.price_position_60d,
+        ppw.price_position_120d,
+        ppw.price_position_250d,
+
         -- Composite volume-price signals
         CASE
             WHEN ppw.price_position_60d > 98 AND vw.volume_ratio > 1.5
@@ -725,11 +729,7 @@ _ADS_WIDE_VIEWS_DDL = [
         vw.trend          AS vol_trend,
         vw.volume_ratio   AS vol_ratio,
         vw.trend_strength AS vol_trend_strength,
-        vw.divergence     AS vol_divergence,
-
-        ppw.price_position_60d,
-        ppw.price_position_120d,
-        ppw.price_position_250d
+        vw.divergence     AS vol_divergence
 
     FROM dwd_weekly_quote qw
     LEFT JOIN dim_stock s                      ON qw.ts_code = s.ts_code
