@@ -544,8 +544,8 @@ _ADS_WIDE_VIEWS_DDL = [
     """CREATE OR REPLACE VIEW v_ads_analysis_wide_daily AS
     SELECT
         'D'             AS freq,
-        c.trade_date,
-        c.ts_code,
+        q.trade_date,
+        q.ts_code,
         s.stock_code,
         s.name           AS stock_name,
         s.exchange       AS exchange,
@@ -573,6 +573,10 @@ _ADS_WIDE_VIEWS_DDL = [
         END              AS kpattern,
         k.strength       AS kpattern_strength,
 
+        pp.price_position_60d,
+        pp.price_position_120d,
+        pp.price_position_250d,
+
         -- Composite volume-price signals
         CASE
             WHEN pp.price_position_60d > 98 AND v.volume_ratio > 1.5
@@ -595,6 +599,7 @@ _ADS_WIDE_VIEWS_DDL = [
         c.turning_point  AS macd_turning_point,
         c.alert          AS macd_alert,
         c.trend          AS macd_trend,
+        c.trend_strength AS macd_trend_strength,
 
         a.ma_5, a.ma_10,
         a.bias_ma5, a.bias_ma10,
@@ -624,27 +629,23 @@ _ADS_WIDE_VIEWS_DDL = [
         v.trend          AS vol_trend,
         v.volume_ratio   AS vol_ratio,
         v.trend_strength AS vol_trend_strength,
-        v.divergence     AS vol_divergence,
+        v.divergence     AS vol_divergence
 
-        pp.price_position_60d,
-        pp.price_position_120d,
-        pp.price_position_250d
-
-    FROM v_dws_macd_daily_latest c
-    LEFT JOIN dim_stock s              ON c.ts_code = s.ts_code
-    LEFT JOIN v_dws_kpattern_daily_latest k ON c.ts_code = k.ts_code AND c.trade_date = k.trade_date
-    LEFT JOIN v_dws_ma_daily_latest      a ON c.ts_code = a.ts_code AND c.trade_date = a.trade_date
-    LEFT JOIN v_dws_dde_daily_latest     d ON c.ts_code = d.ts_code AND c.trade_date = d.trade_date
-    LEFT JOIN v_dws_volume_daily_latest  v ON c.ts_code = v.ts_code AND c.trade_date = v.trade_date
-    LEFT JOIN v_dws_price_position_daily_latest pp ON c.ts_code = pp.ts_code AND c.trade_date = pp.trade_date
-    LEFT JOIN dwd_daily_quote            q ON c.ts_code = q.ts_code AND c.trade_date = q.trade_date""",
+    FROM dwd_daily_quote q
+    LEFT JOIN dim_stock s                  ON q.ts_code = s.ts_code
+    LEFT JOIN v_dws_macd_daily_latest           c ON q.ts_code = c.ts_code AND q.trade_date = c.trade_date
+    LEFT JOIN v_dws_kpattern_daily_latest      k ON q.ts_code = k.ts_code AND q.trade_date = k.trade_date
+    LEFT JOIN v_dws_ma_daily_latest            a ON q.ts_code = a.ts_code AND q.trade_date = a.trade_date
+    LEFT JOIN v_dws_dde_daily_latest           d ON q.ts_code = d.ts_code AND q.trade_date = d.trade_date
+    LEFT JOIN v_dws_volume_daily_latest        v ON q.ts_code = v.ts_code AND q.trade_date = v.trade_date
+    LEFT JOIN v_dws_price_position_daily_latest pp ON q.ts_code = pp.ts_code AND q.trade_date = pp.trade_date""",
 
     # 7.1 v_ads_analysis_wide_weekly
     """CREATE OR REPLACE VIEW v_ads_analysis_wide_weekly AS
     SELECT
         'W'             AS freq,
-        cw.trade_date,
-        cw.ts_code,
+        qw.trade_date,
+        qw.ts_code,
         s.stock_code,
         s.name           AS stock_name,
         s.exchange       AS exchange,
@@ -730,14 +731,14 @@ _ADS_WIDE_VIEWS_DDL = [
         ppw.price_position_120d,
         ppw.price_position_250d
 
-    FROM v_dws_macd_weekly_latest cw
-    LEFT JOIN dim_stock s                  ON cw.ts_code = s.ts_code
-    LEFT JOIN v_dws_kpattern_weekly_latest kw ON cw.ts_code = kw.ts_code AND cw.trade_date = kw.trade_date
-    LEFT JOIN v_dws_ma_weekly_latest      aw ON cw.ts_code = aw.ts_code AND cw.trade_date = aw.trade_date
-    LEFT JOIN v_dws_dde_weekly_latest     dw ON cw.ts_code = dw.ts_code AND cw.trade_date = dw.trade_date
-    LEFT JOIN v_dws_volume_weekly_latest  vw ON cw.ts_code = vw.ts_code AND cw.trade_date = vw.trade_date
-    LEFT JOIN v_dws_price_position_weekly_latest ppw ON cw.ts_code = ppw.ts_code AND cw.trade_date = ppw.trade_date
-    LEFT JOIN dwd_weekly_quote            qw ON cw.ts_code = qw.ts_code AND cw.trade_date = qw.trade_date""",
+    FROM dwd_weekly_quote qw
+    LEFT JOIN dim_stock s                      ON qw.ts_code = s.ts_code
+    LEFT JOIN v_dws_macd_weekly_latest           cw ON qw.ts_code = cw.ts_code AND qw.trade_date = cw.trade_date
+    LEFT JOIN v_dws_kpattern_weekly_latest      kw ON qw.ts_code = kw.ts_code AND qw.trade_date = kw.trade_date
+    LEFT JOIN v_dws_ma_weekly_latest            aw ON qw.ts_code = aw.ts_code AND qw.trade_date = aw.trade_date
+    LEFT JOIN v_dws_dde_weekly_latest           dw ON qw.ts_code = dw.ts_code AND qw.trade_date = dw.trade_date
+    LEFT JOIN v_dws_volume_weekly_latest        vw ON qw.ts_code = vw.ts_code AND qw.trade_date = vw.trade_date
+    LEFT JOIN v_dws_price_position_weekly_latest ppw ON qw.ts_code = ppw.ts_code AND qw.trade_date = ppw.trade_date""",
 
     # 7.1 v_ads_index_wide (uses c.trade_date, c.ts_code — NOT m.trade_date)
     """CREATE OR REPLACE VIEW v_ads_index_wide AS
