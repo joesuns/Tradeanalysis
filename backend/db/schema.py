@@ -112,6 +112,17 @@ _ODS_DDL = [
         min_trade_date    TEXT,
         max_trade_date    TEXT
     )""",
+
+    # 12.3 ods_calc_skip_log — records why a stock was skipped during calculation
+    """CREATE TABLE IF NOT EXISTS ods_calc_skip_log (
+        calc_date      TEXT NOT NULL,
+        ts_code        TEXT NOT NULL,
+        indicator      TEXT NOT NULL,
+        freq           TEXT NOT NULL,
+        reason         TEXT NOT NULL,
+        detail         TEXT,
+        PRIMARY KEY (calc_date, ts_code, indicator, freq)
+    )""",
 ]
 
 def _migrate_etl_log(con):
@@ -159,6 +170,21 @@ def _migrate_volume_new_columns(con):
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
             except Exception:
                 pass  # column already exists
+
+
+def _migrate_dws_fingerprint(con: duckdb.DuckDBPyConnection):
+    """Add input_fingerprint and spec_version columns to all existing DWS tables."""
+    for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
+        for freq in ["daily", "weekly"]:
+            table = f"dws_{ind}_{freq}"
+            for col, col_type in [
+                ("input_fingerprint", "TEXT"),
+                ("spec_version", "TEXT DEFAULT 'v1'"),
+            ]:
+                try:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
 
 
 
@@ -286,6 +312,8 @@ _DWS_DDL = {
         yin_ke_yang    INTEGER,
         strength       REAL,
         calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v1',
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (yang_bao_yin IN (0, 1)),
         CHECK (yang_ke_yin IN (0, 1)),
@@ -313,6 +341,8 @@ _DWS_DDL = {
         trend          TEXT,
         trend_strength REAL,
         calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v1',
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (divergence IN ('top_divergence', 'bottom_divergence') OR divergence IS NULL),
         CHECK (zone IN ('bull', 'bear') OR zone IS NULL),
@@ -334,6 +364,8 @@ _DWS_DDL = {
         alignment      TEXT,
         turning_point  TEXT,
         calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v1',
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (alignment IN ('bull_strong', 'bull_building', 'bull_weakening', 'bull_rolling',
                               'bear_strong', 'bear_building', 'bear_weakening', 'bear_rolling',
@@ -353,6 +385,8 @@ _DWS_DDL = {
         alert          TEXT,
         divergence     TEXT,
         calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v1',
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (trend IN ('up', 'down', 'flat')),
         CHECK (alert IN ('upturn_reverse', 'downturn_reverse', 'upturn_flat', 'downturn_flat') OR alert IS NULL),
@@ -371,6 +405,8 @@ _DWS_DDL = {
         trend_strength REAL,
         divergence     TEXT,
         calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v1',
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (pct_vol_rank >= 0 AND pct_vol_rank <= 100),
         CHECK (zone IN ('explosive', 'low_volume', 'normal')),
@@ -386,6 +422,8 @@ _DWS_DDL = {
         price_position_120d  REAL,
         price_position_250d  REAL,
         calc_date            TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v1',
         PRIMARY KEY (ts_code, trade_date, calc_date),
         CHECK (price_position_60d IS NULL OR (price_position_60d >= 0 AND price_position_60d <= 100)),
         CHECK (price_position_120d IS NULL OR (price_position_120d >= 0 AND price_position_120d <= 100)),
@@ -425,6 +463,8 @@ _ODS_INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_etl_log_step ON ods_etl_log(step_name)",
     "CREATE INDEX IF NOT EXISTS idx_etl_log_started ON ods_etl_log(started_at)",
     "CREATE INDEX IF NOT EXISTS idx_etl_log_status ON ods_etl_log(status)",
+    "CREATE INDEX IF NOT EXISTS idx_skip_log_cd ON ods_calc_skip_log(calc_date)",
+    "CREATE INDEX IF NOT EXISTS idx_skip_log_ind ON ods_calc_skip_log(indicator, reason)",
 ]
 
 _DIM_INDEX_DDL = [
@@ -449,6 +489,54 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
                 WHERE ts_code = d.ts_code AND trade_date = d.trade_date
             )
         """)
+
+_V_INDICATOR_AVAILABILITY_DDL = """
+CREATE VIEW IF NOT EXISTS v_indicator_availability AS
+WITH latest AS (
+    SELECT MAX(calc_date) AS calc_date FROM ods_calc_skip_log
+),
+indicators AS (
+    SELECT 'macd' AS indicator, 'daily' AS freq
+    UNION ALL SELECT 'macd', 'weekly'
+    UNION ALL SELECT 'ma', 'daily'
+    UNION ALL SELECT 'ma', 'weekly'
+    UNION ALL SELECT 'kpattern', 'daily'
+    UNION ALL SELECT 'kpattern', 'weekly'
+    UNION ALL SELECT 'dde', 'daily'
+    UNION ALL SELECT 'dde', 'weekly'
+    UNION ALL SELECT 'volume', 'daily'
+    UNION ALL SELECT 'volume', 'weekly'
+    UNION ALL SELECT 'price_position', 'daily'
+    UNION ALL SELECT 'price_position', 'weekly'
+),
+stock_ind AS (
+    SELECT s.ts_code, s.name, s.exchange, s.list_date, s.delist_date,
+           i.indicator, i.freq
+    FROM dim_stock s
+    CROSS JOIN indicators i
+    WHERE s.is_active = 1
+)
+SELECT
+    si.ts_code,
+    si.name,
+    si.exchange,
+    si.indicator,
+    si.freq,
+    CASE
+        WHEN sl.reason = 'source_unavailable' THEN 'unavailable'
+        WHEN sl.reason = 'delisted' THEN 'historical'
+        WHEN sl.reason = 'insufficient_rows' THEN 'partial'
+        WHEN sl.reason IN ('no_dwd_data', 'fetch_failed') THEN 'missing'
+        ELSE 'available'
+    END AS status,
+    COALESCE(sl.detail, '') AS detail
+FROM stock_ind si
+LEFT JOIN ods_calc_skip_log sl
+    ON si.ts_code = sl.ts_code
+    AND si.indicator = sl.indicator
+    AND si.freq = sl.freq
+    AND sl.calc_date = (SELECT calc_date FROM latest)
+"""
 
 _ADS_WIDE_VIEWS_DDL = [
     # 7.1 v_ads_analysis_wide_daily
@@ -836,6 +924,7 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # Migrations for existing databases
     _migrate_dde_trend_strength(con)
     _migrate_volume_new_columns(con)
+    _migrate_dws_fingerprint(con)
 
     # Latest views (10)
     for ddl in _LATEST_VIEW_DDL:
@@ -844,6 +933,9 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # ADS wide views (4)
     for ddl in _ADS_WIDE_VIEWS_DDL:
         con.execute(ddl)
+
+    # Indicator availability view
+    con.execute(_V_INDICATOR_AVAILABILITY_DDL)
 
     # Data freshness view
     con.execute(_V_DATA_FRESHNESS_DDL)
@@ -861,7 +953,8 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
     """Drop all tables and views in reverse dependency order (for testing only)."""
     # Views first
     _all_views = (
-        ["v_ads_index_wide_weekly", "v_ads_index_wide",
+        ["v_indicator_availability",
+         "v_ads_index_wide_weekly", "v_ads_index_wide",
          "v_ads_analysis_wide_weekly", "v_ads_analysis_wide_daily",
          "v_data_freshness"]
         + [f"v_dws_{ind}_{freq}_latest"
@@ -882,7 +975,7 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
         # DIM (4) — FK tables first
         + ["dim_concept_stock", "dim_concept", "dim_date", "dim_stock"]
         # ODS (7)
-        + ["ods_etl_log", "ods_concept_detail", "ods_trade_cal",
+        + ["ods_etl_log", "ods_calc_skip_log", "ods_concept_detail", "ods_trade_cal",
            "ods_moneyflow", "ods_daily_basic", "ods_daily", "ods_stock_basic"]
     )
     for table in _all_tables:
