@@ -48,11 +48,14 @@ python -m backend.cli calc --all
 python -m backend.cli calc --ts-code 000001.SZ --no-auto-fetch
 
 # ===== Excel 导出 =====
-# 直接导出（不重算）
-python -m backend.cli export --date 20260603 --ts-code 000543.SZ --output analysis.xlsx
+# 直接导出（不重算），文件自动命名为 analysis_{date}_gen{now}.xlsx
+python -m backend.cli export --date 20260603 --ts-code 000543.SZ
 
 # 重算后导出
-python -m backend.cli export --date 20260603 --ts-code 000543.SZ --output analysis.xlsx --recalc
+python -m backend.cli export --date 20260603 --ts-code 000543.SZ --recalc
+
+# 指定输出文件
+python -m backend.cli export --date 20260603 --ts-code 000543.SZ --output custom.xlsx
 
 # ===== 查询 =====
 python -m backend.cli query --ts-code 000001.SZ --freq daily

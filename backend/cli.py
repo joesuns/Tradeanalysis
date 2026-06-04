@@ -107,6 +107,11 @@ def cmd_export(args):
     from backend.db.connection import get_connection
     from backend.export_wide import export_wide_to_excel
 
+    if args.output is None:
+        from datetime import datetime
+        gen_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output = f"analysis_{args.date}_gen{gen_ts}.xlsx"
+
     ts_codes = args.ts_code if args.ts_code else None
 
     if args.recalc:
@@ -207,7 +212,8 @@ def main():
     # export
     xp = sp.add_parser("export", help="Export analysis wide table to Excel")
     xp.add_argument("--date", required=True, help="Analysis date YYYYMMDD")
-    xp.add_argument("--output", default="analysis.xlsx")
+    xp.add_argument("--output", default=None,
+                    help="Output Excel path. Default: analysis_{date}_gen{now}.xlsx")
     xp.add_argument("--ts-code", nargs="+", help="Stock codes to export")
     xp.add_argument("--db-path")
     xp.add_argument("--include-st", action="store_true")
