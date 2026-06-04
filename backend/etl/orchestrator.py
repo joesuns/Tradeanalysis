@@ -255,6 +255,7 @@ def _compute_fetch_range(con, ts_code: str, calc_date: str,
         SELECT list_date, delist_date FROM dim_stock WHERE ts_code = ?
     """, (ts_code,)).fetchone()
     if not row:
+        logger.warning("_compute_fetch_range: %s not found in dim_stock, skipping", ts_code)
         return (None, None)
     list_date, delist_date = row
 
@@ -279,14 +280,18 @@ def _compute_fetch_range(con, ts_code: str, calc_date: str,
         needed_start = list_date
 
     # 5. check if already covered by existing ODS data
-    current = con.execute("""
-        SELECT MIN(trade_date), MAX(trade_date) FROM ods_daily WHERE ts_code = ?
-    """, (ts_code,)).fetchone()
-    current_min, current_max = current if current else (None, None)
+    actual = con.execute("""
+        SELECT COUNT(DISTINCT trade_date) FROM ods_daily
+        WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ?
+    """, (ts_code, needed_start, end_date)).fetchone()[0]
 
-    if current_min and current_max:
-        if current_min <= needed_start and current_max >= end_date:
-            return (None, None)  # fully covered
+    expected = con.execute("""
+        SELECT COUNT(*) FROM dim_date
+        WHERE is_trade_day = 1 AND trade_date >= ? AND trade_date <= ?
+    """, (needed_start, end_date)).fetchone()[0]
+
+    if actual > 0 and actual >= expected * 0.95:
+        return (None, None)  # ≥95% coverage — good enough
 
     return (needed_start, end_date)
 
@@ -330,7 +335,7 @@ def _classify_still_missing(con, missing: dict) -> dict:
         if dwd_rows == 0:
             if ts_code.endswith(".BJ"):
                 reason = SkipReason.SOURCE_UNAVAILABLE
-                detail = "BSE stock: moneyflow unavailable from tushare"
+                detail = "BSE stock: DWD data unavailable (tushare may not support)"
             else:
                 reason = SkipReason.NO_DWD_DATA
                 detail = "DWD rows=0 after fetch+rebuild"
@@ -418,39 +423,54 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                             len(to_fetch), WARMUP_TDAYS)
                 client = TushareClient()
 
-                # Circuit breaker: abort on consecutive failures
-                consecutive_errors = 0
-                consecutive_empty = 0
-                n_fetched = 0
+                # Group stocks by (start, end) range for batch efficiency
+                from collections import defaultdict
+                range_buckets = defaultdict(list)
                 for ts_code, seg_start, seg_end in to_fetch:
+                    range_buckets[(seg_start, seg_end)].append(ts_code)
+
+                consecutive_errors = 0
+                n_fetched = 0
+                all_fetch_codes = {c for c, _, _ in to_fetch}
+                attempted_codes = set()
+
+                for (seg_start, seg_end), bucket_codes in range_buckets.items():
                     try:
                         rows = fetch_stocks_incremental(
-                            client, con, [ts_code], start=seg_start, end=seg_end)
-                        if rows == 0:
-                            consecutive_empty += 1
-                            consecutive_errors = 0
-                        else:
+                            client, con, bucket_codes,
+                            start=seg_start, end=seg_end)
+                        attempted_codes.update(bucket_codes)
+                        if rows > 0:
                             n_fetched += rows
-                            consecutive_empty = 0
                             consecutive_errors = 0
                     except Exception as e:
+                        attempted_codes.update(bucket_codes)
                         consecutive_errors += 1
-                        consecutive_empty = 0
-                        logger.warning("fetch failed for %s [%s~%s]: %s",
-                                       ts_code, seg_start, seg_end, e)
+                        logger.warning("fetch failed for batch [%s~%s] (%d stocks): %s",
+                                       seg_start, seg_end, len(bucket_codes), e)
 
                     if consecutive_errors >= 5:
                         logger.error("Circuit breaker: %d consecutive fetch errors. "
                                      "tushare may be down. Aborting auto-fetch.",
                                      consecutive_errors)
                         break
-                    if consecutive_empty >= 5:
-                        logger.error("Circuit breaker: %d consecutive empty responses. "
-                                     "Date range may be invalid. Aborting auto-fetch.",
-                                     consecutive_empty)
-                        break
 
-                logger.info("Auto-fetch complete: %d ODS rows fetched", n_fetched)
+                # Mark stocks whose fetch was never attempted as FETCH_FAILED
+                fetch_failed_codes = all_fetch_codes - attempted_codes
+                if fetch_failed_codes:
+                    cf = {SkipReason.FETCH_FAILED: [
+                        (c, "auto-fetch aborted by circuit breaker") for c in fetch_failed_codes
+                    ]}
+                    _write_skip_log_batch(con, calc_date, "dwd", "both", cf)
+                    logger.warning("Pre-calc skip: %d stocks — fetch_failed (circuit breaker)",
+                                   len(fetch_failed_codes))
+                    # Remove from missing so _classify_still_missing doesn't re-classify them
+                    for c in fetch_failed_codes:
+                        if c in completeness["missing"]:
+                            del completeness["missing"][c]
+
+                logger.info("Auto-fetch complete: %d ODS rows fetched (%d batches)",
+                            n_fetched, len(range_buckets))
                 if n_fetched > 0:
                     rebuild_all_dwd(con, missing_codes)
                     completeness = check_data_completeness(con, ts_codes)

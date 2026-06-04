@@ -492,8 +492,8 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
 
 _V_INDICATOR_AVAILABILITY_DDL = """
 CREATE VIEW IF NOT EXISTS v_indicator_availability AS
-WITH latest AS (
-    SELECT MAX(calc_date) AS calc_date FROM ods_calc_skip_log
+WITH latest_calc AS (
+    SELECT COALESCE(MAX(calc_date), '') AS calc_date FROM ods_calc_skip_log
 ),
 indicators AS (
     SELECT 'macd' AS indicator, 'daily' AS freq
@@ -523,6 +523,7 @@ SELECT
     si.indicator,
     si.freq,
     CASE
+        WHEN sl.reason IS NULL THEN 'unknown'
         WHEN sl.reason = 'source_unavailable' THEN 'unavailable'
         WHEN sl.reason = 'delisted' THEN 'historical'
         WHEN sl.reason = 'insufficient_rows' THEN 'partial'
@@ -535,7 +536,7 @@ LEFT JOIN ods_calc_skip_log sl
     ON si.ts_code = sl.ts_code
     AND si.indicator = sl.indicator
     AND si.freq = sl.freq
-    AND sl.calc_date = (SELECT calc_date FROM latest)
+    AND sl.calc_date = (SELECT calc_date FROM latest_calc)
 """
 
 _ADS_WIDE_VIEWS_DDL = [
