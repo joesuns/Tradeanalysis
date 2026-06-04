@@ -96,15 +96,36 @@ def fetch_by_date_range(client, con, start: str, end: str) -> int:
 
 
 def _get_trading_days(client, start: str, end: str,
-                      con=None) -> list[str]:
+                      con=None, ts_codes: list[str] = None) -> list[str]:
     """Get list of trading days in date range from tushare trade_cal.
 
-    When con is provided, queries ods_daily for already-fetched dates
-    and returns only new dates (incremental fetch).
+    When con + ts_codes: per-target-stock incremental — only skip dates
+    where ALL target stocks already have ODS data.
+    When con only: original date-global incremental (any stock → date skipped).
     """
     recs = client.call("trade_cal", exchange="SSE", start_date=start, end_date=end,
                        is_open=1)
     days = sorted([r["cal_date"] for r in recs])
+
+    if con and ts_codes:
+        # Per-target-stock: date is "covered" only when ALL target stocks have it
+        placeholders = ",".join(["?" for _ in ts_codes])
+        rows = con.execute(f"""
+            SELECT trade_date, COUNT(DISTINCT ts_code) AS n
+            FROM ods_daily
+            WHERE ts_code IN ({placeholders})
+            AND trade_date >= ? AND trade_date <= ?
+            GROUP BY trade_date
+        """, (*ts_codes, start, end)).fetchall()
+        n_targets = len(ts_codes)
+        existing = {r[0] for r in rows if r[1] >= n_targets}
+        if existing:
+            new_days = [d for d in days if d not in existing]
+            logger.info("Incremental (per-stock): %d/%d dates fully covered, "
+                        "%d new to fetch (%s~%s)",
+                        len(existing), len(days), len(new_days), start, end)
+            return new_days
+        return days
 
     if con:
         existing = set(r[0] for r in con.execute(
@@ -301,7 +322,7 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
 
     # Get trading days with incremental skip (single-threaded, 1 API call)
     client = TushareClient()
-    days = _get_trading_days(client, start, end, con=con)
+    days = _get_trading_days(client, start, end, con=con, ts_codes=ts_codes)
     if not days:
         logger.info("All dates already in DB — nothing to fetch (%s~%s)", start, end)
         return 0

@@ -91,3 +91,57 @@ def test_get_missing_days_empty_trading_days():
     result = _get_missing_days_for_stock(con, "TEST.SZ", [])
     assert result == []
     con.close()
+
+
+# ── _get_trading_days with ts_codes ──
+
+
+def test_get_trading_days_with_ts_codes_partial_coverage():
+    """Date skipped ONLY when ALL target stocks have data (per-stock check)."""
+    from backend.fetch.ods_daily import _get_trading_days
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT,
+            open REAL, high REAL, low REAL, close REAL, vol REAL,
+            amount REAL, pct_chg REAL, adj_factor REAL)
+    """)
+    # Stock A: all 3 dates. Stock B: only 20260101.
+    for d in ["20260101", "20260102", "20260103"]:
+        con.execute(
+            "INSERT INTO ods_daily VALUES ('A.SZ', ?, 10,11,9,10,100,1000,0,1)", (d,))
+    con.execute(
+        "INSERT INTO ods_daily VALUES ('B.SZ', '20260101', 10,11,9,10,100,1000,0,1)")
+
+    class FakeClient:
+        def call(self, api, **kwargs):
+            return [{"cal_date": d} for d in ["20260101", "20260102", "20260103"]]
+
+    # Without ts_codes: date-global — ANY stock has data → date skipped
+    days_all = _get_trading_days(FakeClient(), "20260101", "20260103", con=con)
+    assert len(days_all) == 0, f"date-global: all dates have SOME data, got {days_all}"
+
+    # With ts_codes=["A.SZ"]: A has all 3 dates → all skipped
+    days_a = _get_trading_days(FakeClient(), "20260101", "20260103",
+                               con=con, ts_codes=["A.SZ"])
+    assert len(days_a) == 0, f"A.SZ has all dates, got {days_a}"
+
+    # With ts_codes=["B.SZ"]: B has 20260101, missing 01/02 and 01/03
+    # → 20260101 is covered → skipped; 01/02 and 01/03 returned
+    days_b = _get_trading_days(FakeClient(), "20260101", "20260103",
+                               con=con, ts_codes=["B.SZ"])
+    assert len(days_b) == 2, (
+        f"B has 20260101 (covered), missing 01/02 and 01/03, got {days_b}")
+    assert "20260102" in days_b
+    assert "20260103" in days_b
+
+    # With ts_codes=["A.SZ", "B.SZ"]: 20260101 both have → covered → skipped
+    # 20260102 and 20260103: A has, B doesn't → not covered → returned
+    days_both = _get_trading_days(FakeClient(), "20260101", "20260103",
+                                  con=con, ts_codes=["A.SZ", "B.SZ"])
+    assert len(days_both) == 2, (
+        f"Both: only 20260101 fully covered, 01/02 and 01/03 returned, got {days_both}")
+    assert "20260102" in days_both
+    assert "20260103" in days_both
+
+    con.close()
