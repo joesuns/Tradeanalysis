@@ -3,6 +3,7 @@
 ## 沟通规范
 
 - **默认中文**：所有交互使用中文，代码/术语可中英混杂
+- **代码任务前加载 `/engineering-protocol`** — 5 步协议（全量解析→诚实判断→全量审计→等待审批→收尾核对）
 
 ## 项目概述
 
@@ -123,10 +124,12 @@ fetch（数据拉取层）
 └── per-stock 增量：每只股票独立查询 ods_daily 已有日期，只补缺
 
 calc（计算层）
+├── 退市股过滤：delist_date < calc_date 且 DWS 已有 → 跳过
 ├── 前置检查 check_data_completeness()：验证 DWD 数据完整度
-├── 缺数据 ≤50 只 → auto-fetch → rebuild_all_dwd() → 继续计算
-├── 缺数据 >50 只  → 报错列出缺口，继续计算已有数据的股票
-└── --no-auto-fetch → 禁用自动补拉
+├── 缺数据 → 无条件自动补拉（warmup=27 tdays，熔断器：连续 5 次失败中止）
+├── 补拉后 rebuild_all_dwd() → re-check → 分类原因 → 写 ods_calc_skip_log
+├── 所有 Calculator.calculate() 返回 CalcResult（calculated + skipped 分类统计）
+└── 收尾汇总：每 calc 输出 calculated/skipped 明细，skip_log 可查询
 
 export（导出层）
 ├── 默认：从 latest 视图直接导出
@@ -187,6 +190,7 @@ export（导出层）
 - **背离：** 使用原始 DDX，60 日窗口 + 邻域尖刺过滤
 - **趋势：** DDX2 8-bar 指数加权回归（decay=0.20），阈值 0.0001
 - **数据源限制：** BSE 股票（.BJ）tushare 不提供 moneyflow，DDE 不可用
+- **warmup 周期：** 系统级 warmup = 27 个交易日（MACD 功能下限，所有指标最大值）。补拉时按此窗口计算起始日期，不拉无用历史数据
 
 ## 已知问题和注意事项
 
@@ -197,6 +201,15 @@ export（导出层）
 - BSE 股票无 moneyflow 数据（DDE 不可用）
 - 上市不足 1 年的股票周线数据可能不足（MACD 需 ≥27 条，price_position 需 ≥60 条）
 - `ema()` 函数在 `total_valid < min(period, 5)` 时返回全 NaN——极短历史股票无法计算 EMA
+- **空数据处理：**
+  - `run_calc()` 无条件自动补拉缺失数据（warmup=27 tdays，熔断器：连续 5 次 fetch 异常或 5 次空返回则中止）
+  - 补拉范围 = `[max(上市日, analysis_end - 27tdays), min(calc_date, 退市日)]`，warmup=27 由 MACD 功能下限决定
+  - 补拉失败按根因分 5 类写入 `ods_calc_skip_log`：source_unavailable / insufficient_rows / no_dwd_data / fetch_failed / delisted
+  - 退市股：delist_date < calc_date 且 DWS 已有 → 跳过并记 DELISTED。首次计算退市股仍执行
+  - 所有 Calculator.calculate() 返回 `CalcResult`（calculated + skipped 分类统计）
+  - Price Position 各窗口独立：min_periods=2，数据不够窗口用已有全部数据
+  - `v_indicator_availability` 视图提供 full/partial/missing/unavailable/historical 五态
+  - 详细架构见 `docs/superpowers/plans/2026-06-04-empty-data-handling.md`
 
 ## 工作流程
 
