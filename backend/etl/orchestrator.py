@@ -297,6 +297,26 @@ def _compute_fetch_range(con, ts_code: str, calc_date: str,
     return (needed_start, end_date)
 
 
+def _count_trading_days(con, start: str, end: str) -> int:
+    """Return number of trading days between start and end (inclusive)."""
+    row = con.execute("""
+        SELECT COUNT(*) FROM dim_date
+        WHERE is_trade_day = 1 AND trade_date >= ? AND trade_date <= ?
+    """, (start, end)).fetchone()
+    return row[0] if row else 0
+
+
+def _choose_fetch_strategy(n_stocks: int, n_tdays: int) -> bool:
+    """Choose between date-batched (True) and stock-batched (False) mode.
+
+    Stock-batched cost: n_stocks × 4 API calls (per-stock adj_factor/daily/daily_basic/moneyflow).
+    Date-batched cost: n_tdays × 4 API calls (per-date, returns all stocks).
+
+    Pick the mode with fewer API calls. When equal, stock-batched is more targeted.
+    """
+    return n_stocks > n_tdays
+
+
 def _filter_delisted(con, ts_codes: list[str], calc_date: str) -> tuple:
     """Filter out delisted stocks that already have DWS data.
 
@@ -437,9 +457,26 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
 
                 for (seg_start, seg_end), bucket_codes in range_buckets.items():
                     try:
-                        rows = fetch_stocks_incremental(
-                            client, con, bucket_codes,
-                            start=seg_start, end=seg_end)
+                        tdays = _count_trading_days(con, seg_start, seg_end)
+                        if _choose_fetch_strategy(len(bucket_codes), tdays):
+                            logger.info(
+                                "Auto-fetch bucket [%s~%s]: %d stocks, %d tdays "
+                                "→ date-batched parallel mode",
+                                seg_start, seg_end, len(bucket_codes), tdays,
+                            )
+                            rows = fetch_by_date_range_parallel(
+                                seg_start, seg_end, workers=3,
+                                ts_codes=bucket_codes, con=con,
+                            )
+                        else:
+                            logger.info(
+                                "Auto-fetch bucket [%s~%s]: %d stocks, %d tdays "
+                                "→ stock-batched sequential mode",
+                                seg_start, seg_end, len(bucket_codes), tdays,
+                            )
+                            rows = fetch_stocks_incremental(
+                                client, con, bucket_codes,
+                                start=seg_start, end=seg_end)
                         attempted_codes.update(bucket_codes)
                         if rows > 0:
                             n_fetched += rows

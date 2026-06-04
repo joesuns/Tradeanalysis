@@ -1,0 +1,86 @@
+"""Tests for backend/etl/orchestrator.py — auto-fetch strategy selection."""
+
+import duckdb
+from backend.etl.orchestrator import _count_trading_days, _choose_fetch_strategy
+
+
+def test_count_trading_days_basic():
+    """Count trading days between two dates in dim_date."""
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY,
+            is_trade_day INTEGER
+        )
+    """)
+    # Insert 5 consecutive trading days
+    for i in range(1, 6):
+        con.execute(
+            "INSERT INTO dim_date VALUES (?, 1)",
+            (f"2026010{i}",),
+        )
+
+    count = _count_trading_days(con, "20260101", "20260105")
+    assert count == 5, f"Expected 5 trading days, got {count}"
+
+    con.close()
+
+
+def test_count_trading_days_skips_non_trade_days():
+    """Only counts rows where is_trade_day = 1."""
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY,
+            is_trade_day INTEGER
+        )
+    """)
+    con.execute("INSERT INTO dim_date VALUES ('20260101', 1)")
+    con.execute("INSERT INTO dim_date VALUES ('20260102', 1)")
+    con.execute("INSERT INTO dim_date VALUES ('20260103', 0)")  # weekend
+    con.execute("INSERT INTO dim_date VALUES ('20260104', 0)")  # weekend
+    con.execute("INSERT INTO dim_date VALUES ('20260105', 1)")
+
+    count = _count_trading_days(con, "20260101", "20260105")
+    assert count == 3, f"Expected 3 trading days (excl weekends), got {count}"
+
+    con.close()
+
+
+def test_count_trading_days_empty_range():
+    """Returns 0 when no trading days in range."""
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY,
+            is_trade_day INTEGER
+        )
+    """)
+    con.execute("INSERT INTO dim_date VALUES ('20260101', 1)")
+
+    count = _count_trading_days(con, "20260105", "20260110")
+    assert count == 0, f"Expected 0, got {count}"
+
+    con.close()
+
+
+# ── _choose_fetch_strategy ──
+
+
+def test_choose_date_batched_when_stocks_exceed_tdays():
+    """Date-batched when stocks > trading days: fewer API calls."""
+    assert _choose_fetch_strategy(5000, 250) is True   # full market
+    assert _choose_fetch_strategy(500, 10) is True     # many stocks, short range
+
+
+def test_choose_stock_batched_when_tdays_exceed_or_equal():
+    """Stock-batched when trading days >= stocks: more targeted."""
+    assert _choose_fetch_strategy(50, 250) is False     # few stocks
+    assert _choose_fetch_strategy(10, 500) is False     # very few stocks, long range
+    assert _choose_fetch_strategy(250, 250) is False    # equal: stock is more precise
+
+
+def test_choose_with_edge_cases():
+    """Single stock or single day — boundary cases."""
+    assert _choose_fetch_strategy(1, 250) is False      # 1 stock → stock-batched
+    assert _choose_fetch_strategy(100, 1) is True       # 1 day, many stocks → date-batched
