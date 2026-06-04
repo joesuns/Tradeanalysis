@@ -8,7 +8,7 @@
 
   【场景1】最常用：拉数据 → 算指标 → 导出 Excel（一键完成）
     python3 fetch_stocks.py \
-      --codes 000543.SZ,600580.SH,000630.SZ,002709,002837,603986 \
+      --codes 000543,600580,000630,002709,002837,603986 \
       --start 20250601 --export
 
   【场景2】只拉数据 + 算指标，不导出
@@ -45,7 +45,7 @@
   --export        ETL 完成后自动导出 Excel（格式与正式导出完全一致）
   --export-only   跳过 ETL，仅导出（数据必须已入库）
   --export-date   导出指定日期（默认自动取最新 calc_date）
-  --output        指定输出路径（默认 exports/analysis_<ts>.xlsx）
+  --output        指定输出路径（默认 analysis_{date}_gen{now}.xlsx）
 
 ═══════════════════════════════════════════════════════════════
 核心逻辑
@@ -152,7 +152,7 @@ def main():
     )
     export_group.add_argument(
         "--output",
-        help="输出 Excel 路径（默认 exports/analysis_<ts>.xlsx）",
+        help="输出 Excel 路径（默认 analysis_{date}_gen{now}.xlsx）",
     )
 
     args = parser.parse_args()
@@ -188,8 +188,12 @@ def main():
         else:
             export_date = args.export_date
 
+        if args.output is None:
+            from datetime import datetime as dt
+            gen_ts = dt.now().strftime("%Y%m%d_%H%M%S")
+            args.output = f"analysis_{export_date}_gen{gen_ts}.xlsx"
         logger.info(f"导出 {len(ts_codes)} 只标的 — 日期: {export_date}（日线+周线）")
-        n = export_wide_to_excel(DUCKDB_PATH, export_date, args.output or "", ts_codes=ts_codes)
+        n = export_wide_to_excel(DUCKDB_PATH, export_date, args.output, ts_codes=ts_codes)
         logger.info(json.dumps({
             "event": "export_complete",
             "stock_count": len(ts_codes),
@@ -241,8 +245,12 @@ def main():
             export_date = row[0] if row and row[0] else None
 
         if export_date:
+            if args.output is None:
+                from datetime import datetime as dt
+                gen_ts = dt.now().strftime("%Y%m%d_%H%M%S")
+                args.output = f"analysis_{export_date}_gen{gen_ts}.xlsx"
             logger.info(f"自动导出日期: {export_date}（日线+周线）")
-            n = export_wide_to_excel(DUCKDB_PATH, export_date, args.output or "", ts_codes=ts_codes)
+            n = export_wide_to_excel(DUCKDB_PATH, export_date, args.output, ts_codes=ts_codes)
             logger.info(json.dumps({
                 "event": "export_complete",
                 "stock_count": len(ts_codes),
