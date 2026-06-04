@@ -1,6 +1,10 @@
+import logging
+
 import numpy as np
 import pandas as pd
-from backend.etl.base import to_float_safe, insert_dws_batch
+from backend.etl.base import to_float_safe, insert_dws_batch, SkipReason, CalcResult
+
+logger = logging.getLogger(__name__)
 
 
 class PricePositionCalculator:
@@ -23,8 +27,8 @@ class PricePositionCalculator:
         self.src_table = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
         self.dws_table = f"dws_price_position_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str):
-        """Calculate price_position for a batch of stocks. INSERT results into DWS table."""
+    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+        result = CalcResult()
         for ts_code in ts_codes:
             if self.freq == "weekly":
                 df = self.con.execute(f"""
@@ -39,10 +43,22 @@ class PricePositionCalculator:
                     WHERE ts_code = ? AND is_suspended = 0
                     ORDER BY trade_date
                 """, (ts_code,)).df()
-            if df.empty or len(df) < 60:
+
+            if df.empty:
+                logger.debug("PricePosition %s skip %s: no DWD data", self.freq, ts_code)
+                result.add_skip(SkipReason.NO_DWD_DATA, ts_code, "DWD returned 0 rows")
                 continue
+            if len(df) < 2:
+                logger.debug("PricePosition %s skip %s: %d rows < 2",
+                             self.freq, ts_code, len(df))
+                result.add_skip(SkipReason.INSUFFICIENT_ROWS, ts_code,
+                                f"DWD rows={len(df)}, min=2")
+                continue
+
             df = self._compute_positions(df)
             self._insert(ts_code, df, calc_date)
+            result.calculated += 1
+        return result
 
     def _compute_positions(self, df: pd.DataFrame) -> pd.DataFrame:
         """Compute price_position for all window sizes using rolling min/max."""
@@ -51,8 +67,8 @@ class PricePositionCalculator:
         for window in self.WINDOWS:
             col = f"price_position_{window}d"
             s = pd.Series(c)
-            roll_min = s.rolling(window, min_periods=window).min()
-            roll_max = s.rolling(window, min_periods=window).max()
+            roll_min = s.rolling(window, min_periods=2).min()
+            roll_max = s.rolling(window, min_periods=2).max()
             denom = roll_max - roll_min
             with np.errstate(divide='ignore', invalid='ignore'):
                 df[col] = np.where(

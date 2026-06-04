@@ -57,11 +57,10 @@ def test_price_position_all_windows():
     df = pd.DataFrame({"trade_date": dates, "close_qfq": closes})
     result = calc._compute_positions(df)
 
-    # After 60 rows: price_position_60d should start having values
+    # After 60 rows: all window columns should have values (min_periods=2)
     assert result["price_position_60d"].iloc[59] is not None, "60d column should have value at index 59"
-    # 120d and 250d should be NaN until enough data
-    assert pd.isna(result["price_position_120d"].iloc[59]), "120d should be NaN with only 60 rows"
-    # After 120 rows: 120d column fills in
+    assert result["price_position_120d"].iloc[59] is not None, "120d column should have value with min_periods=2"
+    # After 120 rows: 120d column still fills in
     assert result["price_position_120d"].iloc[119] is not None, "120d column should have value at index 119"
     # After 250 rows: 250d column fills in
     assert result["price_position_250d"].iloc[249] is not None, "250d column should have value at index 249"

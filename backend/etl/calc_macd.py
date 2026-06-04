@@ -1,7 +1,10 @@
+import logging
+
 import numpy as np
 import pandas as pd
-from backend.etl.base import ema, to_float_safe, linear_regression_slope, insert_dws_batch
+from backend.etl.base import ema, to_float_safe, linear_regression_slope, insert_dws_batch, SkipReason, CalcResult
 
+logger = logging.getLogger(__name__)
 
 
 class MACDCalculator:
@@ -13,8 +16,9 @@ class MACDCalculator:
         self.src_table = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
         self.dws_table = f"dws_macd_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str):
-        """Calculate MACD for a batch of stocks. INSERT results into DWS table."""
+    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+        """Calculate MACD for a batch of stocks. Returns CalcResult with stats."""
+        result = CalcResult()
         for ts_code in ts_codes:
             if self.freq == "weekly":
                 df = self.con.execute(f"""
@@ -29,10 +33,22 @@ class MACDCalculator:
                     WHERE ts_code = ? AND is_suspended = 0
                     ORDER BY trade_date
                 """, (ts_code,)).df()
-            if df.empty or len(df) < 27:
+
+            if df.empty:
+                logger.debug("MACD %s skip %s: no DWD data", self.freq, ts_code)
+                result.add_skip(SkipReason.NO_DWD_DATA, ts_code, "DWD returned 0 rows")
                 continue
+            if len(df) < 27:
+                logger.debug("MACD %s skip %s: %d rows < 27",
+                             self.freq, ts_code, len(df))
+                result.add_skip(SkipReason.INSUFFICIENT_ROWS, ts_code,
+                                f"DWD rows={len(df)}, min=27")
+                continue
+
             df = self._compute_indicators(df)
             self._insert(ts_code, df, calc_date)
+            result.calculated += 1
+        return result
 
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         c = df["close_qfq"].values.astype(float)

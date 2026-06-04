@@ -1,7 +1,10 @@
+import logging
+
 import numpy as np
 import pandas as pd
-from backend.etl.base import sma, linear_regression_slope, to_float_safe
+from backend.etl.base import sma, linear_regression_slope, to_float_safe, insert_dws_batch, SkipReason, CalcResult
 
+logger = logging.getLogger(__name__)
 
 
 class VolumeCalculator:
@@ -18,8 +21,8 @@ class VolumeCalculator:
         self.src_table = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
         self.dws_table = f"dws_volume_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str):
-        """Calculate volume indicators for a batch of stocks. INSERT results into DWS table."""
+    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+        result = CalcResult()
         for ts_code in ts_codes:
             if self.freq == "weekly":
                 df = self.con.execute(f"""
@@ -34,10 +37,22 @@ class VolumeCalculator:
                     WHERE ts_code = ? AND is_suspended = 0
                     ORDER BY trade_date
                 """, (ts_code,)).df()
-            if df.empty or len(df) < 5:
+
+            if df.empty:
+                logger.debug("Volume %s skip %s: no DWD data", self.freq, ts_code)
+                result.add_skip(SkipReason.NO_DWD_DATA, ts_code, "DWD returned 0 rows")
                 continue
+            if len(df) < 5:
+                logger.debug("Volume %s skip %s: %d rows < 5",
+                             self.freq, ts_code, len(df))
+                result.add_skip(SkipReason.INSUFFICIENT_ROWS, ts_code,
+                                f"DWD rows={len(df)}, min=5")
+                continue
+
             df = self._compute_indicators(df)
             self._insert(ts_code, df, calc_date)
+            result.calculated += 1
+        return result
 
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         v = df["vol"].values.astype(float)
@@ -280,21 +295,9 @@ class VolumeCalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
-        """Batch insert all rows for one stock via DuckDB register."""
         dws_cols = ["ts_code", "trade_date", "ma_vol_5", "pct_vol_rank",
                     "zone", "trend", "volume_ratio", "trend_strength",
-                    "divergence", "calc_date"]
-        data_cols = dws_cols[1:]
-        for c in data_cols:
-            if c not in df.columns:
-                df[c] = None
-        batch = df[data_cols].copy()
-        batch["ts_code"] = ts_code
-        for c in ["ma_vol_5", "pct_vol_rank", "volume_ratio", "trend_strength"]:
-            batch[c] = batch[c].apply(to_float_safe)
-        batch["calc_date"] = calc_date
-        batch = batch[dws_cols]
-        self.con.register("_batch", batch)
-        cols_sql = ", ".join(dws_cols)
-        self.con.execute(f"INSERT OR REPLACE INTO {self.dws_table} ({cols_sql}) SELECT {cols_sql} FROM _batch")
-        self.con.unregister("_batch")
+                    "divergence", "calc_date", "input_fingerprint", "spec_version"]
+        float_cols = ["ma_vol_5", "pct_vol_rank", "volume_ratio", "trend_strength"]
+        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                         dws_cols, float_cols)

@@ -1,9 +1,11 @@
+import logging
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from backend.etl.base import ema, to_float_safe
+from backend.etl.base import ema, to_float_safe, insert_dws_batch, SkipReason, CalcResult
 
+logger = logging.getLogger(__name__)
 
 
 class DDECalculator:
@@ -25,17 +27,37 @@ class DDECalculator:
             self.quote_table = "dwd_weekly_quote"
         self.dws_table = f"dws_dde_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str):
-        """Calculate DDE indicators for a batch of stocks. INSERT results into DWS table."""
+    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+        result = CalcResult()
         for ts_code in ts_codes:
             if self.freq == "daily":
                 df = self._load_daily(ts_code)
             else:
                 df = self._load_weekly(ts_code)
-            if df.empty or len(df) < 10:
+
+            if df.empty:
+                if ts_code.endswith(".BJ"):
+                    logger.debug("DDE %s skip %s: BSE -- moneyflow unavailable",
+                                 self.freq, ts_code)
+                    result.add_skip(SkipReason.SOURCE_UNAVAILABLE, ts_code,
+                                    "BSE stocks have no moneyflow data from tushare")
+                else:
+                    logger.debug("DDE %s skip %s: no DWD moneyflow data",
+                                 self.freq, ts_code)
+                    result.add_skip(SkipReason.NO_DWD_DATA, ts_code,
+                                    "DWD moneyflow returned 0 rows")
                 continue
+            if len(df) < 10:
+                logger.debug("DDE %s skip %s: %d rows < 10",
+                             self.freq, ts_code, len(df))
+                result.add_skip(SkipReason.INSUFFICIENT_ROWS, ts_code,
+                                f"DWD rows={len(df)}, min=10")
+                continue
+
             df = self._compute_indicators(df)
             self._insert(ts_code, df, calc_date)
+            result.calculated += 1
+        return result
 
     def _load_daily(self, ts_code: str) -> pd.DataFrame:
         """Load daily moneyflow + close data."""
@@ -349,20 +371,9 @@ class DDECalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
-        """Batch insert all rows for one stock via DuckDB register."""
         dws_cols = ["ts_code", "trade_date", "net_mf_amount", "ddx", "ddx2",
-                    "trend", "trend_strength", "alert", "divergence", "calc_date"]
-        data_cols = dws_cols[1:]
-        for c in data_cols:
-            if c not in df.columns:
-                df[c] = None
-        batch = df[data_cols].copy()
-        batch["ts_code"] = ts_code
-        for c in ["net_mf_amount", "ddx", "ddx2", "trend_strength"]:
-            batch[c] = batch[c].apply(to_float_safe)
-        batch["calc_date"] = calc_date
-        batch = batch[dws_cols]
-        self.con.register("_batch", batch)
-        cols_sql = ", ".join(dws_cols)
-        self.con.execute(f"INSERT OR REPLACE INTO {self.dws_table} ({cols_sql}) SELECT {cols_sql} FROM _batch")
-        self.con.unregister("_batch")
+                    "trend", "trend_strength", "alert", "divergence",
+                    "calc_date", "input_fingerprint", "spec_version"]
+        float_cols = ["net_mf_amount", "ddx", "ddx2", "trend_strength"]
+        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                         dws_cols, float_cols)

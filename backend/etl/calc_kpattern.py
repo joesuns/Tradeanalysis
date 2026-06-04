@@ -1,8 +1,11 @@
+import logging
+
 import numpy as np
 import pandas as pd
-from backend.etl.base import sma, to_float_safe
+from backend.etl.base import sma, to_float_safe, insert_dws_batch, SkipReason, CalcResult
 from backend.kpattern_params import KPATTERN_PARAMS
 
+logger = logging.getLogger(__name__)
 
 
 class KPatternCalculator:
@@ -19,19 +22,33 @@ class KPatternCalculator:
         self.src_table = src
         self.dws_table = f"dws_kpattern_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str):
-        """Calculate K-line patterns for a batch of stocks. INSERT results into DWS table."""
+    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+        result = CalcResult()
+        min_rows = KPATTERN_PARAMS["common"]["min_data_rows"]
         for ts_code in ts_codes:
             df = self.con.execute(f"""
                 SELECT trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, pct_chg
-                FROM {self.src_table} WHERE ts_code = ? {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}
+                FROM {self.src_table} WHERE ts_code = ?
+                {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}
                 ORDER BY trade_date
             """, (ts_code,)).df()
-            if df.empty or len(df) < KPATTERN_PARAMS["common"]["min_data_rows"]:
+
+            if df.empty:
+                logger.debug("KPattern %s skip %s: no DWD data", self.freq, ts_code)
+                result.add_skip(SkipReason.NO_DWD_DATA, ts_code, "DWD returned 0 rows")
                 continue
+            if len(df) < min_rows:
+                logger.debug("KPattern %s skip %s: %d rows < %d",
+                             self.freq, ts_code, len(df), min_rows)
+                result.add_skip(SkipReason.INSUFFICIENT_ROWS, ts_code,
+                                f"DWD rows={len(df)}, min={min_rows}")
+                continue
+
             is_st = self._is_st_stock(ts_code)
             df = self._compute_patterns(df, is_st)
             self._insert(ts_code, df, calc_date)
+            result.calculated += 1
+        return result
 
     def _is_st_stock(self, ts_code: str) -> bool:
         row = self.con.execute(
@@ -329,24 +346,10 @@ class KPatternCalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
-        """Batch insert all rows for one stock via DuckDB register."""
         dws_cols = ["ts_code", "trade_date", "yang_bao_yin", "yang_ke_yin",
                     "mu_bei_xian", "bi_lei_zhen", "gao_kai_chang_yin",
-                    "yin_bao_yang", "yin_ke_yang", "strength", "calc_date"]
-        data_cols = dws_cols[1:]  # all except ts_code
-        for c in data_cols:
-            if c not in df.columns:
-                df[c] = None
-        batch = df[data_cols].copy()
-        batch["ts_code"] = ts_code
-        # Type conversions
-        for c in ["yang_bao_yin", "yang_ke_yin", "mu_bei_xian", "bi_lei_zhen",
-                   "gao_kai_chang_yin", "yin_bao_yang", "yin_ke_yang"]:
-            batch[c] = batch[c].fillna(0).astype(int)
-        batch["strength"] = batch["strength"].apply(to_float_safe)
-        batch["calc_date"] = calc_date
-        batch = batch[dws_cols]  # reorder to match table
-        self.con.register("_batch", batch)
-        cols_sql = ", ".join(dws_cols)
-        self.con.execute(f"INSERT OR REPLACE INTO {self.dws_table} ({cols_sql}) SELECT {cols_sql} FROM _batch")
-        self.con.unregister("_batch")
+                    "yin_bao_yang", "yin_ke_yang", "strength", "calc_date",
+                    "input_fingerprint", "spec_version"]
+        float_cols = ["strength"]
+        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                         dws_cols, float_cols)
