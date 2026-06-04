@@ -490,6 +490,7 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     # Indicator group colors — precise prefix match on English column names
     _GROUP_COLORS = {
         "kpattern": "C0392B",
+        "price_position_": "E74C3C",
         "ema_": "8E44AD", "macd_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
         "ma_vol_": "27AE60",  # before ma_ to avoid false match
         "ma_": "2980B9", "bias_": "2980B9", "ma5_": "2980B9", "ma10_": "2980B9",
