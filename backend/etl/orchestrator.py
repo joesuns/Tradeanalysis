@@ -199,6 +199,9 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
         con.close()
 
 
+WARMUP_TDAYS = 27  # max functional minimum across all indicators (MACD bottleneck)
+
+
 def check_data_completeness(con, ts_codes: list[str],
                              min_daily_rows: int = WARMUP_TDAYS) -> dict:
     """检查指定股票在 DWD 层的数据完整度。
@@ -237,8 +240,6 @@ def check_data_completeness(con, ts_codes: list[str],
 
     return {"ok": ok, "missing": missing}
 
-
-WARMUP_TDAYS = 27  # max functional minimum across all indicators (MACD bottleneck)
 
 
 def _compute_fetch_range(con, ts_code: str, calc_date: str,
