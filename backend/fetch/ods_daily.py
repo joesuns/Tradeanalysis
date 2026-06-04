@@ -46,48 +46,56 @@ def fetch_by_date_range(client, con, start: str, end: str) -> int:
             adj_map = {a["ts_code"]: a.get("adj_factor") for a in adj_recs}
             total += len(adj_recs)
 
-            # 1. Daily OHLCV — all stocks in one call, with adj_factor from lookup
+            # 1. Daily OHLCV — batch INSERT via executemany
             recs = client.call("daily", trade_date=trade_date)
-            for r in recs:
-                adj = adj_map.get(r["ts_code"])
-                con.execute("""INSERT OR REPLACE INTO ods_daily
-                    (ts_code, trade_date, open, high, low, close, vol, amount, pct_chg, adj_factor, fetched_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,now())""",
-                    (r["ts_code"], r["trade_date"], r["open"], r["high"], r["low"],
-                     r["close"], r["vol"], r["amount"], r["pct_chg"], adj))
-                total += 1
+            daily_rows = [(r["ts_code"], r["trade_date"], r["open"], r["high"],
+                           r["low"], r["close"], r["vol"], r["amount"],
+                           r["pct_chg"], adj_map.get(r["ts_code"]))
+                          for r in recs]
+            if daily_rows:
+                con.executemany("""INSERT OR REPLACE INTO ods_daily
+                    (ts_code, trade_date, open, high, low, close, vol,
+                     amount, pct_chg, adj_factor, fetched_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,now())""", daily_rows)
+                total += len(daily_rows)
 
-            # 2. Daily basic — all stocks in one call
+            # 2. Daily basic — batch INSERT via executemany
             recs = client.call("daily_basic", trade_date=trade_date)
-            for r in recs:
-                con.execute("""INSERT OR REPLACE INTO ods_daily_basic
-                    (ts_code, trade_date, total_mv, pe_ttm, turnover_rate, volume_ratio, fetched_at)
-                    VALUES (?,?,?,?,?,?,now())""",
-                    (r["ts_code"], r["trade_date"], r.get("total_mv"), r.get("pe_ttm"),
-                     r.get("turnover_rate"), r.get("volume_ratio")))
-                total += 1
+            basic_rows = [(r["ts_code"], r["trade_date"], r.get("total_mv"),
+                           r.get("pe_ttm"), r.get("turnover_rate"),
+                           r.get("volume_ratio"))
+                          for r in recs]
+            if basic_rows:
+                con.executemany("""INSERT OR REPLACE INTO ods_daily_basic
+                    (ts_code, trade_date, total_mv, pe_ttm,
+                     turnover_rate, volume_ratio, fetched_at)
+                    VALUES (?,?,?,?,?,?,now())""", basic_rows)
+                total += len(basic_rows)
 
-            # 3. Moneyflow — all stocks in one call
+            # 3. Moneyflow — batch INSERT via executemany
             recs = client.call("moneyflow", trade_date=trade_date)
-            for r in recs:
-                con.execute("""INSERT OR REPLACE INTO ods_moneyflow
-                    (ts_code, trade_date, buy_sm_vol, buy_sm_amount, sell_sm_vol, sell_sm_amount,
-                     buy_md_vol, buy_md_amount, sell_md_vol, sell_md_amount,
-                     buy_lg_vol, buy_lg_amount, sell_lg_vol, sell_lg_amount,
-                     buy_elg_vol, buy_elg_amount, sell_elg_vol, sell_elg_amount,
-                     net_mf_vol, net_mf_amount, fetched_at)
+            mf_rows = [(r["ts_code"], r["trade_date"],
+                        r.get("buy_sm_vol"), r.get("buy_sm_amount"),
+                        r.get("sell_sm_vol"), r.get("sell_sm_amount"),
+                        r.get("buy_md_vol"), r.get("buy_md_amount"),
+                        r.get("sell_md_vol"), r.get("sell_md_amount"),
+                        r.get("buy_lg_vol"), r.get("buy_lg_amount"),
+                        r.get("sell_lg_vol"), r.get("sell_lg_amount"),
+                        r.get("buy_elg_vol"), r.get("buy_elg_amount"),
+                        r.get("sell_elg_vol"), r.get("sell_elg_amount"),
+                        r.get("net_mf_vol"), r.get("net_mf_amount"))
+                       for r in recs]
+            if mf_rows:
+                con.executemany("""INSERT OR REPLACE INTO ods_moneyflow
+                    (ts_code, trade_date, buy_sm_vol, buy_sm_amount,
+                     sell_sm_vol, sell_sm_amount, buy_md_vol, buy_md_amount,
+                     sell_md_vol, sell_md_amount, buy_lg_vol, buy_lg_amount,
+                     sell_lg_vol, sell_lg_amount, buy_elg_vol, buy_elg_amount,
+                     sell_elg_vol, sell_elg_amount, net_mf_vol, net_mf_amount,
+                     fetched_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,now())""",
-                    (r["ts_code"], r["trade_date"],
-                     r.get("buy_sm_vol"), r.get("buy_sm_amount"),
-                     r.get("sell_sm_vol"), r.get("sell_sm_amount"),
-                     r.get("buy_md_vol"), r.get("buy_md_amount"),
-                     r.get("sell_md_vol"), r.get("sell_md_amount"),
-                     r.get("buy_lg_vol"), r.get("buy_lg_amount"),
-                     r.get("sell_lg_vol"), r.get("sell_lg_amount"),
-                     r.get("buy_elg_vol"), r.get("buy_elg_amount"),
-                     r.get("sell_elg_vol"), r.get("sell_elg_amount"),
-                     r.get("net_mf_vol"), r.get("net_mf_amount")))
-                total += 1
+                    mf_rows)
+                total += len(mf_rows)
 
         except Exception as e:
             logger.error(f"Failed trade_date={trade_date}: {e}")
@@ -399,50 +407,62 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
                 total += len(adj_recs)
 
                 recs = thread_client.call("daily", trade_date=trade_date)
+                daily_rows = []
                 for r in recs:
                     if code_set and r["ts_code"] not in code_set:
                         continue
                     adj = adj_map.get(r["ts_code"])
-                    thread_con.execute("""INSERT OR REPLACE INTO ods_daily
-                        (ts_code, trade_date, open, high, low, close, vol, amount, pct_chg, adj_factor, fetched_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,now())""",
-                        (r["ts_code"], r["trade_date"], r["open"], r["high"], r["low"],
-                         r["close"], r["vol"], r["amount"], r["pct_chg"], adj))
-                    total += 1
+                    daily_rows.append((r["ts_code"], r["trade_date"],
+                        r["open"], r["high"], r["low"], r["close"],
+                        r["vol"], r["amount"], r["pct_chg"], adj))
+                if daily_rows:
+                    thread_con.executemany("""INSERT OR REPLACE INTO ods_daily
+                        (ts_code, trade_date, open, high, low, close,
+                         vol, amount, pct_chg, adj_factor, fetched_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,now())""", daily_rows)
+                    total += len(daily_rows)
 
                 recs = thread_client.call("daily_basic", trade_date=trade_date)
+                basic_rows = []
                 for r in recs:
                     if code_set and r["ts_code"] not in code_set:
                         continue
-                    thread_con.execute("""INSERT OR REPLACE INTO ods_daily_basic
-                        (ts_code, trade_date, total_mv, pe_ttm, turnover_rate, volume_ratio, fetched_at)
-                        VALUES (?,?,?,?,?,?,now())""",
-                        (r["ts_code"], r["trade_date"], r.get("total_mv"), r.get("pe_ttm"),
-                         r.get("turnover_rate"), r.get("volume_ratio")))
-                    total += 1
+                    basic_rows.append((r["ts_code"], r["trade_date"],
+                        r.get("total_mv"), r.get("pe_ttm"),
+                        r.get("turnover_rate"), r.get("volume_ratio")))
+                if basic_rows:
+                    thread_con.executemany("""INSERT OR REPLACE INTO ods_daily_basic
+                        (ts_code, trade_date, total_mv, pe_ttm,
+                         turnover_rate, volume_ratio, fetched_at)
+                        VALUES (?,?,?,?,?,?,now())""", basic_rows)
+                    total += len(basic_rows)
 
                 recs = thread_client.call("moneyflow", trade_date=trade_date)
+                mf_rows = []
                 for r in recs:
                     if code_set and r["ts_code"] not in code_set:
                         continue
-                    thread_con.execute("""INSERT OR REPLACE INTO ods_moneyflow
-                        (ts_code, trade_date, buy_sm_vol, buy_sm_amount, sell_sm_vol, sell_sm_amount,
-                         buy_md_vol, buy_md_amount, sell_md_vol, sell_md_amount,
-                         buy_lg_vol, buy_lg_amount, sell_lg_vol, sell_lg_amount,
-                         buy_elg_vol, buy_elg_amount, sell_elg_vol, sell_elg_amount,
-                         net_mf_vol, net_mf_amount, fetched_at)
+                    mf_rows.append((r["ts_code"], r["trade_date"],
+                        r.get("buy_sm_vol"), r.get("buy_sm_amount"),
+                        r.get("sell_sm_vol"), r.get("sell_sm_amount"),
+                        r.get("buy_md_vol"), r.get("buy_md_amount"),
+                        r.get("sell_md_vol"), r.get("sell_md_amount"),
+                        r.get("buy_lg_vol"), r.get("buy_lg_amount"),
+                        r.get("sell_lg_vol"), r.get("sell_lg_amount"),
+                        r.get("buy_elg_vol"), r.get("buy_elg_amount"),
+                        r.get("sell_elg_vol"), r.get("sell_elg_amount"),
+                        r.get("net_mf_vol"), r.get("net_mf_amount")))
+                if mf_rows:
+                    thread_con.executemany("""INSERT OR REPLACE INTO ods_moneyflow
+                        (ts_code, trade_date, buy_sm_vol, buy_sm_amount,
+                         sell_sm_vol, sell_sm_amount, buy_md_vol, buy_md_amount,
+                         sell_md_vol, sell_md_amount, buy_lg_vol, buy_lg_amount,
+                         sell_lg_vol, sell_lg_amount, buy_elg_vol, buy_elg_amount,
+                         sell_elg_vol, sell_elg_amount, net_mf_vol, net_mf_amount,
+                         fetched_at)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,now())""",
-                        (r["ts_code"], r["trade_date"],
-                         r.get("buy_sm_vol"), r.get("buy_sm_amount"),
-                         r.get("sell_sm_vol"), r.get("sell_sm_amount"),
-                         r.get("buy_md_vol"), r.get("buy_md_amount"),
-                         r.get("sell_md_vol"), r.get("sell_md_amount"),
-                         r.get("buy_lg_vol"), r.get("buy_lg_amount"),
-                         r.get("sell_lg_vol"), r.get("sell_lg_amount"),
-                         r.get("buy_elg_vol"), r.get("buy_elg_amount"),
-                         r.get("sell_elg_vol"), r.get("sell_elg_amount"),
-                         r.get("net_mf_vol"), r.get("net_mf_amount")))
-                    total += 1
+                        mf_rows)
+                    total += len(mf_rows)
 
                 # Thread-safe progress: log every 20 days
                 with progress_lock:
