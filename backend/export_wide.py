@@ -75,7 +75,8 @@ _ENUM_VALUES = {
 # Signal columns — NULL means "no signal today" (shown as "-")
 _SIGNAL_COLS = {"kpattern", "kpattern_strength", "macd_divergence", "macd_turning_point",
                 "macd_alert", "ma_turning_point", "dde_alert", "dde_divergence",
-                "vol_divergence", "vol_signal"}
+                "vol_divergence", "vol_signal",
+                "price_position_60d", "price_position_120d", "price_position_250d"}
 
 # Columns to round to 2 decimal places
 _ROUND_2DP = {"close", "pct_chg", "pe_ttm", "turnover_rate", "net_mf_amount",
@@ -172,6 +173,7 @@ def export_wide_to_excel(
     wb.remove(wb.active)
     # ---- Signal-only analysis sheet (first sheet) ----
     _SIGNAL_ONLY = {"kpattern", "kpattern_strength",
+                    "price_position_60d", "price_position_120d", "price_position_250d",
                     "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
                     "macd_trend_strength",
                     "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
@@ -202,6 +204,11 @@ def export_wide_to_excel(
         output_dir = "exports"
         os.makedirs(output_dir, exist_ok=True)
         output_path = f"{output_dir}/analysis_{ts}.xlsx"
+    else:
+        # Ensure parent directory exists (e.g. "exports/" passed by caller)
+        parent = os.path.dirname(os.path.abspath(output_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
 
     wb.save(output_path)
     return len(merged)
