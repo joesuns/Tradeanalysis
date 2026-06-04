@@ -200,7 +200,7 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
 
 
 def check_data_completeness(con, ts_codes: list[str],
-                             min_daily_rows: int = 60) -> dict:
+                             min_daily_rows: int = WARMUP_TDAYS) -> dict:
     """检查指定股票在 DWD 层的数据完整度。
 
     返回:
@@ -406,8 +406,8 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     if completeness["missing"]:
         missing_codes = list(completeness["missing"].keys())
         missing_pct = len(missing_codes) * 100.0 / len(ts_codes)
-        logger.info("DWD completeness: %d/%d stocks (%.1f%%) lack sufficient data (< 60 rows)",
-                    len(missing_codes), len(ts_codes), missing_pct)
+        logger.info("DWD completeness: %d/%d stocks (%.1f%%) lack sufficient data (< %d rows)",
+                    len(missing_codes), len(ts_codes), missing_pct, WARMUP_TDAYS)
 
         if auto_fetch:
             # Compute per-stock fetch ranges based on warmup
