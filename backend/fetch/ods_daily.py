@@ -159,7 +159,7 @@ def _get_missing_ranges_per_stock(con, ts_code: str,
 
 
 def fetch_stocks_incremental(client, con, ts_codes: list[str],
-                              start: str = "20150101",
+                              start: str = None,
                               end: str = "20991231") -> int:
     """Stock-batched 增量拉取：每只股票独立检测缺失日期。
 
@@ -171,6 +171,13 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
     返回写入的总行数。
     """
     import time
+
+    if start is None:
+        # Default: 90 calendar-day lookback (~60 trading days) instead of 2015-01-01.
+        # Callers needing precise warmup should pass explicit start.
+        from datetime import datetime as dt, timedelta
+        end_dt = dt.strptime(end[:8], "%Y%m%d") if len(end) >= 8 else dt.now()
+        start = (end_dt - timedelta(days=90)).strftime("%Y%m%d")
 
     try:
         cal = client.call("trade_cal", exchange="SSE", start_date=start, end_date=end, is_open=1)

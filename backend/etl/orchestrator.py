@@ -39,6 +39,9 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             batch_size: int = 100, force_full: bool = False):
     """Run the ETL pipeline.
 
+    NOTE: Legacy full-pipeline entry point. For calc-only with skip-classification
+    and auto-fetch, use run_calc(). This function ignores CalcResult from calculate().
+
     Parameters
     ----------
     step : str
