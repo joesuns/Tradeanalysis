@@ -199,7 +199,7 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
         con.close()
 
 
-WARMUP_TDAYS = 27  # max functional minimum across all indicators (MACD bottleneck)
+WARMUP_TDAYS = 250  # max across all indicators: PP250d window (pp120=120, divergence=60, MACD=27)
 
 
 def check_data_completeness(con, ts_codes: list[str],
