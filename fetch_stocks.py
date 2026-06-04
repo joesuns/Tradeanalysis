@@ -6,33 +6,23 @@
 使用方式
 ═══════════════════════════════════════════════════════════════
 
-  【场景1】最常用：拉数据 → 算指标 → 导出 Excel（一键完成）
-    python3 fetch_stocks.py \
-      --codes 000543,600580,000630,002709,002837,603986 \
-      --start 20250601 --export
+  【场景1】默认：重算 6 只标的 → 导出 Excel（一键完成）
+    python3 fetch_stocks.py
 
-  【场景2】只拉数据 + 算指标，不导出
-    python3 fetch_stocks.py \
-      --codes 002709,002837,603986 --start 20250601
+  【场景2】指定股票 + 指定分析日期
+    python3 fetch_stocks.py --codes 002709,002837,603986 --date 20260603
 
-  【场景3】数据已入库，直接导出 Excel
-    python3 fetch_stocks.py \
-      --codes 000543.SZ,600580.SH --export-only
+  【场景3】只重算不导出
+    python3 fetch_stocks.py --no-export
 
-  【场景4】导出指定日期的数据
-    python3 fetch_stocks.py \
-      --codes 000543.SZ,600580.SH --export-only --export-date 20260602
+  【场景4】数据已入库，直接导出
+    python3 fetch_stocks.py --export-only
 
   【场景5】只拉原始数据（不计算指标）
-    python3 fetch_stocks.py \
-      --codes 000543.SZ --step fetch-ods --start 20250601
+    python3 fetch_stocks.py --codes 000543.SZ --step fetch-ods
 
-  【场景6】追加新股 — 已有全市场数据，只需给新股算指标
-    python3 fetch_stocks.py \
-      --codes 002837,603986 --start 20250601 --step calc-dws
-
-  【场景7】股票代码自动补全（002709 → 002709.SZ，603986 → 603986.SH）
-    python3 fetch_stocks.py --codes 002709,002837,603986 --start 20250601
+  【场景6】股票代码自动补全（002709 → 002709.SZ，603986 → 603986.SH）
+    python3 fetch_stocks.py --codes 002709,002837,603986
 
 ═══════════════════════════════════════════════════════════════
 参数说明
@@ -42,7 +32,7 @@
   --start         起始日期 YYYYMMDD（默认 20250601）
   --end           结束日期 YYYYMMDD（默认今天）
   --step          ETL 步骤：fetch-ods / build-dim / build-dwd / calc-dws / build-all（默认）
-  --export        ETL 完成后自动导出 Excel（格式与正式导出完全一致）
+  --no-export     跳过自动导出（默认导出）
   --export-only   跳过 ETL，仅导出（数据必须已入库）
   --export-date   导出指定日期（默认自动取最新 calc_date）
   --output        指定输出路径（默认 analysis_{date}_gen{now}.xlsx）
@@ -115,16 +105,12 @@ def main():
         """,
     )
     parser.add_argument(
-        "--codes", required=True,
-        help="股票代码，逗号分隔。支持简写（如 002709 自动补全为 002709.SZ）",
+        "--codes", default="000543,600580,000630,002709,002837,603986",
+        help="股票代码，逗号分隔。支持简写（默认 6 只标的）",
     )
     parser.add_argument(
-        "--start", default="20250601",
-        help="起始日期 YYYYMMDD（默认 20250601）",
-    )
-    parser.add_argument(
-        "--end", default=None,
-        help="结束日期 YYYYMMDD（默认今天）",
+        "--date",
+        help="分析日期 YYYYMMDD（默认今天）。start 自动取 date 往前250个交易日",
     )
     parser.add_argument(
         "--step", default="build-all",
@@ -137,10 +123,10 @@ def main():
     )
 
     # 导出选项
-    export_group = parser.add_argument_group("导出 Excel")
+    export_group = parser.add_argument_group("导出 Excel（默认导出）")
     export_group.add_argument(
-        "--export", action="store_true",
-        help="ETL 完成后自动导出 Excel（格式与正式导出完全一致）",
+        "--no-export", action="store_true",
+        help="跳过自动导出",
     )
     export_group.add_argument(
         "--export-only", action="store_true",
@@ -148,7 +134,7 @@ def main():
     )
     export_group.add_argument(
         "--export-date",
-        help="导出指定日期 YYYYMMDD（默认自动取最新 calc_date）",
+        help="导出指定日期 YYYYMMDD（默认取 --date）",
     )
     export_group.add_argument(
         "--output",
@@ -168,6 +154,27 @@ def main():
     if not ts_codes:
         logger.error("没有有效的股票代码")
         sys.exit(1)
+
+    # 自动计算日期
+    from datetime import datetime as dt, timedelta
+    if args.date:
+        analysis_date = args.date
+    else:
+        analysis_date = dt.now().strftime("%Y%m%d")
+
+    # start = analysis_date 往前推 250 个交易日
+    con = duckdb.connect(DUCKDB_PATH)
+    row = con.execute("""
+        SELECT trade_date FROM (
+            SELECT trade_date, ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
+            FROM dim_date WHERE is_trade_day = 1 AND trade_date <= ?
+        ) WHERE rn = 250
+    """, (analysis_date,)).fetchone()
+    etl_start = row[0] if row else None
+    con.close()
+    if not etl_start:
+        logger.warning("dim_date 无数据，fallback 到365天前")
+        etl_start = (dt.strptime(analysis_date, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
 
     # ── 仅导出模式 ──
     if args.export_only:
@@ -208,17 +215,18 @@ def main():
         "event": "etl_start",
         "stock_count": len(ts_codes),
         "step": args.step,
-        "date_range": {"start": args.start, "end": args.end},
+        "analysis_date": analysis_date,
+        "date_range": {"start": etl_start, "end": analysis_date},
     }, ensure_ascii=False))
     logger.info(f"目标标的 ({len(ts_codes)} 只): {', '.join(ts_codes)}")
-    logger.info(f"日期范围: {args.start} ~ {args.end or '今天'}")
+    logger.info(f"分析日期: {analysis_date}，自动拉取范围: {etl_start} ~ {analysis_date} (warmup=250 tdays)")
     logger.info(f"ETL 步骤: {args.step}")
 
     run_etl(
         step=args.step,
         ts_codes=ts_codes,
-        start=args.start,
-        end=args.end,
+        start=etl_start,
+        end=analysis_date,
         batch_size=args.batch_size,
     )
 
@@ -229,7 +237,7 @@ def main():
     logger.info(f"完成！{len(ts_codes)} 只标的数据已入库")
 
     # ── ETL 后自动导出 ──
-    if args.export:
+    if not args.no_export:
         if args.export_date:
             export_date = args.export_date
         else:
