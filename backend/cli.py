@@ -150,6 +150,54 @@ def cmd_export(args):
     print(f"Exported {n} rows -> {args.output}")
 
 
+# ── run ──
+
+def cmd_run(args):
+    """One-command daily analysis: fetch → calc → export.
+
+    Resolves the target trading date, auto-fetches any missing ODS data,
+    rebuilds DWD, runs all DWS calculators, and exports the Excel report.
+    """
+    import time
+    from backend.db.connection import get_connection
+    from backend.export_wide import export_wide_to_excel
+
+    con = get_connection()
+    try:
+        # 1. Resolve date
+        date = _resolve_trade_date(con, args.date)
+        date = _ensure_trade_date(con, date)
+
+        # 2. Fetch — always full market, per-stock incremental detection
+        print(f"=== Step 1/3: Fetching data for {date} ===")
+        cmd_fetch(args)
+
+        # 3. Calc — auto-fetches missing data before computing
+        print(f"=== Step 2/3: Computing indicators for {date} ===")
+        cmd_calc(args)
+
+        # 4. Export
+        print(f"=== Step 3/3: Exporting analysis for {date} ===")
+        if args.output is None:
+            from datetime import datetime
+            gen_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            args.output = f"analysis_{date}_gen{gen_ts}.xlsx"
+
+        ts_codes = args.ts_code if args.ts_code else None
+        n = export_wide_to_excel(
+            args.db_path or "data/tradeanalysis.duckdb",
+            date,
+            args.output,
+            filter_st=not args.include_st,
+            include_index=not args.no_index,
+            ts_codes=ts_codes,
+        )
+        print(f"Exported {n} rows -> {args.output}")
+        print("Done.")
+    finally:
+        con.close()
+
+
 # ── query / status ──
 
 def cmd_query(args):
@@ -236,6 +284,15 @@ def main():
     qp.add_argument("--ts-code", required=True)
     qp.add_argument("--freq", default="daily")
 
+    # run
+    rp = sp.add_parser("run", help="One-command daily analysis: fetch → calc → export")
+    rp.add_argument("--date", help="Analysis date YYYYMMDD (default: today)")
+    rp.add_argument("--ts-code", nargs="+", help="Stock codes (omitted = all stocks)")
+    rp.add_argument("--output", default=None,
+                    help="Output Excel path. Default: analysis_{date}_gen{now}.xlsx")
+    rp.add_argument("--include-st", action="store_true")
+    rp.add_argument("--no-index", action="store_true")
+
     sp.add_parser("status", help="Show database table stats")
 
     args = p.parse_args()
@@ -244,6 +301,7 @@ def main():
         "fetch": cmd_fetch,
         "calc": cmd_calc,
         "export": cmd_export,
+        "run": cmd_run,
         "query": cmd_query,
         "status": cmd_status,
     }

@@ -119,3 +119,29 @@ def test_cli_export_help_omits_recalc():
     assert result.returncode == 0
     assert "--recalc" not in result.stdout
     assert "--no-auto-fetch" not in result.stdout
+
+
+# ── run command ──
+
+
+def test_cli_run_help_shows():
+    """run 命令应有帮助信息。"""
+    env = {**os.environ, "TUSHARE_TOKEN": "test"}
+    result = subprocess.run(
+        [sys.executable, "-m", "backend.cli", "run", "--help"],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0
+    assert "--date" in result.stdout
+    assert "--ts-code" in result.stdout
+
+
+def test_cli_help_lists_run():
+    """主 help 应列出 run 命令。"""
+    env = {**os.environ, "TUSHARE_TOKEN": "test"}
+    result = subprocess.run(
+        [sys.executable, "-m", "backend.cli", "--help"],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0
+    assert "run" in result.stdout
