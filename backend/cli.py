@@ -18,6 +18,36 @@ from backend.log_config import setup_logging
 setup_logging()
 
 
+def _resolve_trade_date(con, date: str = None) -> str:
+    """解析分析日期：指定则用指定，不指定则用今天。
+
+    Returns YYYYMMDD string.
+    """
+    if date:
+        return date
+    from datetime import datetime
+    return datetime.now().strftime("%Y%m%d")
+
+
+def _ensure_trade_date(con, date: str) -> str:
+    """确保 date 是交易日；不是则往前找最近交易日。
+
+    Queries dim_date to validate and rollback. Prints a warning if
+    the original date was not a trading day.
+    """
+    row = con.execute(
+        "SELECT MAX(trade_date) FROM dim_date "
+        "WHERE trade_date <= ? AND is_trade_day = 1",
+        (date,),
+    ).fetchone()
+    if not row or not row[0]:
+        return date  # dim_date may be empty — trust the caller
+    trade_date = row[0]
+    if trade_date != date:
+        print(f"Warning: {date} is not a trading day, using {trade_date} instead")
+    return trade_date
+
+
 # ── check ──
 
 def cmd_check(_args):
