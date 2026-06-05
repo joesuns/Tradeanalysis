@@ -210,6 +210,9 @@ export（导出层）
   只有 ALL 目标股票都已有 ODS 数据时该日才跳过，不再受其他股票残留数据污染。
 - **Fetch 覆盖率:** `_compute_fetch_range` 要求 100% ODS 覆盖才跳过（对齐 123 项目严格检查模式）。
 - **数据质量门禁:** `_validate_ods_batch` 在 ODS INSERT 前校验 OHLC 逻辑（high >= low）和必需字段非空。
+- **DWS 指纹跳过:** `check_dwd_unchanged()` 在 calc 前比对 DWD 输入数据 SHA256 指纹。
+  相同 → 跳过计算；不同 → 重算。重复跑同一天从 ~107min 降到秒级。
+  `input_fingerprint` 存储于每张 DWS 表的每行中，由 `insert_dws_batch()` 写入。
 
 ## 工作流程
 
