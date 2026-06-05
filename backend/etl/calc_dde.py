@@ -3,7 +3,10 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from backend.etl.base import ema, to_float_safe, insert_dws_batch, SkipReason, CalcResult
+from backend.etl.base import (
+    ema, to_float_safe, insert_dws_batch, compute_fingerprint, check_dwd_unchanged,
+    SkipReason, CalcResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +57,14 @@ class DDECalculator:
                                 f"DWD rows={len(df)}, min=10")
                 continue
 
+            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df):
+                result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
+                                "DWD fingerprint match")
+                continue
+
+            fp = compute_fingerprint(df)
             df = self._compute_indicators(df)
-            self._insert(ts_code, df, calc_date)
+            self._insert(ts_code, df, calc_date, input_fingerprint=fp)
             result.calculated += 1
         return result
 
@@ -370,10 +379,12 @@ class DDECalculator:
 
         return result
 
-    def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
+    def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
+                input_fingerprint: str = None):
         dws_cols = ["ts_code", "trade_date", "net_mf_amount", "ddx", "ddx2",
                     "trend", "trend_strength", "alert", "divergence",
                     "calc_date", "input_fingerprint", "spec_version"]
         float_cols = ["net_mf_amount", "ddx", "ddx2", "trend_strength"]
         insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                         dws_cols, float_cols)
+                         dws_cols, float_cols,
+                         input_fingerprint=input_fingerprint)

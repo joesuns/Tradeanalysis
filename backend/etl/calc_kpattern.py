@@ -2,7 +2,10 @@ import logging
 
 import numpy as np
 import pandas as pd
-from backend.etl.base import sma, to_float_safe, insert_dws_batch, SkipReason, CalcResult
+from backend.etl.base import (
+    sma, to_float_safe, insert_dws_batch, compute_fingerprint, check_dwd_unchanged,
+    SkipReason, CalcResult,
+)
 from backend.kpattern_params import KPATTERN_PARAMS
 
 logger = logging.getLogger(__name__)
@@ -44,9 +47,15 @@ class KPatternCalculator:
                                 f"DWD rows={len(df)}, min={min_rows}")
                 continue
 
+            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df):
+                result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
+                                "DWD fingerprint match")
+                continue
+
+            fp = compute_fingerprint(df)
             is_st = self._is_st_stock(ts_code)
             df = self._compute_patterns(df, is_st)
-            self._insert(ts_code, df, calc_date)
+            self._insert(ts_code, df, calc_date, input_fingerprint=fp)
             result.calculated += 1
         return result
 
@@ -345,11 +354,13 @@ class KPatternCalculator:
 
         return result
 
-    def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
+    def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
+                input_fingerprint: str = None):
         dws_cols = ["ts_code", "trade_date", "yang_bao_yin", "yang_ke_yin",
                     "mu_bei_xian", "bi_lei_zhen", "gao_kai_chang_yin",
                     "yin_bao_yang", "yin_ke_yang", "strength", "calc_date",
                     "input_fingerprint", "spec_version"]
         float_cols = ["strength"]
         insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                         dws_cols, float_cols)
+                         dws_cols, float_cols,
+                         input_fingerprint=input_fingerprint)

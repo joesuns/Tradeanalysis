@@ -2,7 +2,10 @@ import logging
 
 import numpy as np
 import pandas as pd
-from backend.etl.base import to_float_safe, insert_dws_batch, SkipReason, CalcResult
+from backend.etl.base import (
+    to_float_safe, insert_dws_batch, compute_fingerprint, check_dwd_unchanged,
+    SkipReason, CalcResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +58,14 @@ class PricePositionCalculator:
                                 f"DWD rows={len(df)}, min=2")
                 continue
 
+            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df):
+                result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
+                                "DWD fingerprint match")
+                continue
+
+            fp = compute_fingerprint(df)
             df = self._compute_positions(df)
-            self._insert(ts_code, df, calc_date)
+            self._insert(ts_code, df, calc_date, input_fingerprint=fp)
             result.calculated += 1
         return result
 
@@ -79,10 +88,12 @@ class PricePositionCalculator:
 
         return df
 
-    def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str):
+    def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
+                input_fingerprint: str = None):
         pos_cols = [f"price_position_{w}d" for w in self.WINDOWS]
         dws_cols = ["ts_code", "trade_date"] + pos_cols + [
             "calc_date", "input_fingerprint", "spec_version"]
         float_cols = pos_cols
         insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                         dws_cols, float_cols)
+                         dws_cols, float_cols,
+                         input_fingerprint=input_fingerprint)
