@@ -52,6 +52,7 @@
 import argparse
 import json
 import sys
+from typing import Optional
 
 import duckdb
 
@@ -86,6 +87,19 @@ def fix_ts_code(code: str) -> str:
     else:
         logger.warning(f"无法推断交易所，跳过: {code}")
         return None
+
+
+def _build_output_path(export_date: str, output: Optional[str] = None) -> str:
+    """构建 Excel 输出路径。
+
+    - output 显式指定时 → 原样返回
+    - output 为 None 时 → 自动生成 exports/analysis_{date}_gen{timestamp}.xlsx
+    """
+    if output is not None:
+        return output
+    from datetime import datetime as _dt
+    gen_ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    return f"exports/analysis_{export_date}_gen{gen_ts}.xlsx"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -195,19 +209,17 @@ def main():
         else:
             export_date = args.export_date
 
-        if args.output is None:
-            from datetime import datetime as dt
-            gen_ts = dt.now().strftime("%Y%m%d_%H%M%S")
-            args.output = f"analysis_{export_date}_gen{gen_ts}.xlsx"
+        output_path = _build_output_path(export_date, args.output)
         logger.info(f"导出 {len(ts_codes)} 只标的 — 日期: {export_date}（日线+周线）")
-        n = export_wide_to_excel(DUCKDB_PATH, export_date, args.output, ts_codes=ts_codes)
+        n = export_wide_to_excel(DUCKDB_PATH, export_date, output_path, ts_codes=ts_codes)
         logger.info(json.dumps({
             "event": "export_complete",
             "stock_count": len(ts_codes),
             "row_count": n,
             "export_date": export_date,
+            "output_path": output_path,
         }, ensure_ascii=False))
-        logger.info(f"已导出 {n} 行")
+        logger.info(f"已导出 {n} 行 → {output_path}")
         return
 
     # ── ETL 模式 ──
@@ -253,19 +265,17 @@ def main():
             export_date = row[0] if row and row[0] else None
 
         if export_date:
-            if args.output is None:
-                from datetime import datetime as dt
-                gen_ts = dt.now().strftime("%Y%m%d_%H%M%S")
-                args.output = f"analysis_{export_date}_gen{gen_ts}.xlsx"
+            output_path = _build_output_path(export_date, args.output)
             logger.info(f"自动导出日期: {export_date}（日线+周线）")
-            n = export_wide_to_excel(DUCKDB_PATH, export_date, args.output, ts_codes=ts_codes)
+            n = export_wide_to_excel(DUCKDB_PATH, export_date, output_path, ts_codes=ts_codes)
             logger.info(json.dumps({
                 "event": "export_complete",
                 "stock_count": len(ts_codes),
                 "row_count": n,
                 "export_date": export_date,
+                "output_path": output_path,
             }, ensure_ascii=False))
-            logger.info(f"已导出 {n} 行")
+            logger.info(f"已导出 {n} 行 → {output_path}")
         else:
             logger.warning("未找到导出数据，请检查 ETL 是否成功")
 

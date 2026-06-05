@@ -120,3 +120,41 @@ def test_export_without_index():
             os.unlink(wal)
         if os.path.exists(out_path):
             os.unlink(out_path)
+
+
+def test_wide_view_column_symmetry():
+    """v_ads_analysis_wide_daily must have macd_trend_strength — column parity with weekly."""
+    fd, db_path = tempfile.mkstemp(suffix=".duckdb")
+    os.close(fd)
+    os.unlink(db_path)
+
+    con = duckdb.connect(db_path)
+    create_all_tables(con)
+
+    from backend.db.schema import _ADS_WIDE_VIEWS_DDL
+    for sql in _ADS_WIDE_VIEWS_DDL:
+        con.execute(sql)
+
+    daily_cols = {r[0] for r in con.execute("DESCRIBE v_ads_analysis_wide_daily").fetchall()}
+    weekly_cols = {r[0] for r in con.execute("DESCRIBE v_ads_analysis_wide_weekly").fetchall()}
+
+    # macd_trend_strength must exist in both
+    assert "macd_trend_strength" in daily_cols, \
+        f"v_ads_analysis_wide_daily missing macd_trend_strength"
+    assert "macd_trend_strength" in weekly_cols, \
+        f"v_ads_analysis_wide_weekly missing macd_trend_strength"
+
+    # Key signal columns must have parity across daily/weekly
+    signal_cols = {
+        "macd_trend", "macd_trend_strength",
+        "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert",
+        "dde_trend", "dde_trend_strength", "dde_alert", "dde_divergence",
+        "vol_trend", "vol_trend_strength", "vol_divergence", "vol_zone",
+    }
+    missing_daily = signal_cols - daily_cols
+    missing_weekly = signal_cols - weekly_cols
+    assert not missing_daily, f"Daily view missing signal columns: {missing_daily}"
+    assert not missing_weekly, f"Weekly view missing signal columns: {missing_weekly}"
+
+    con.close()
+    os.unlink(db_path)

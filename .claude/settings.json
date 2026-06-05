@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"from backend.export_wide import export_wide_to_excel; import inspect; print\\(inspect.signature\\(export_wide_to_excel\\)\\)\")",
+      "Bash(python3 -c \"from backend.etl.orchestrator import run_etl; import inspect; print\\(inspect.signature\\(run_etl\\)\\)\")",
+      "Bash(python3 -m backend.cli fetch --help)",
+      "Bash(python3 -m backend.cli calc --help)",
+      "Bash(python3 -m backend.cli export --help)",
+      "Bash(python3 -m backend.cli etl --help)",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(pytest tests/ -v --tb=short)",
+      "Bash(git stash *)",
+      "Bash(pytest tests/test_export_wide.py -v --tb=short)",
+      "Bash(pytest tests/test_cli.py -v --tb=short)",
+      "Bash(python3 -m pytest tests/test_etl/ -v --tb=short)"
+    ]
+  }
+}

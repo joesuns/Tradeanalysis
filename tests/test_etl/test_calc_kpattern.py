@@ -326,3 +326,161 @@ def test_integration_kpattern(db_with_schema):
     # Check the last row (day 35) has yang_bao_yin = 1
     last_row = rows[-1]
     assert last_row[1] == 1, f"Expected yang_bao_yin on day 35, got: {last_row}"
+
+
+def test_yang_ke_yin_requires_prev_bear():
+    """阳克阴: 前日阳线 + 满足量价条件 → 不应触发（缺少对立颜色前置条件）."""
+    calc = KPatternCalculator.__new__(KPatternCalculator)
+
+    n = 35
+    dates = [f"202601{i:02d}" for i in range(1, n + 1)]
+    opens = [10.0] * n
+    highs = [10.5] * n
+    lows = [9.5] * n
+    closes = [10.0] * n
+    vols = [1000000] * n
+    pct_chg = [0.0] * n
+
+    # Day 33 (index 32): BULL day — not bear!
+    opens[32] = 10.0
+    highs[32] = 11.0
+    lows[32] = 9.5
+    closes[32] = 11.0   # bullish, close > open
+    vols[32] = 1000000
+    pct_chg[32] = 2.0
+
+    # Day 34 (index 33): would satisfy yang_ke_yin conditions IF prev were bear
+    # volume spike > MA5 * 1.2, max(o,c) > prev max(o,c), close > MA10
+    opens[33] = 10.5
+    highs[33] = 12.5
+    lows[33] = 9.5
+    closes[33] = 12.0
+    vols[33] = 1500000   # > 1,000,000 * 1.2
+    pct_chg[33] = 5.0    # < 9.9%, not limit-filtered
+
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "open_qfq": opens,
+        "high_qfq": highs,
+        "low_qfq": lows,
+        "close_qfq": closes,
+        "vol": vols,
+        "pct_chg": pct_chg,
+    })
+
+    result = calc._compute_patterns(df, is_st=False)
+
+    # Prev day is BULL, so yang_ke_yin should NOT trigger
+    assert result["yang_ke_yin"].iloc[33] == 0, (
+        f"阳克阴要求前日阴线，前日阳线不应触发，实际为 {result['yang_ke_yin'].iloc[33]}"
+    )
+
+
+def test_yin_ke_yang_requires_prev_bull():
+    """阴克阳: 前日阴线 + 满足量价条件 → 不应触发（缺少对立颜色前置条件）."""
+    calc = KPatternCalculator.__new__(KPatternCalculator)
+
+    n = 35
+    dates = [f"202601{i:02d}" for i in range(1, n + 1)]
+    opens = [10.0] * n
+    highs = [10.5] * n
+    lows = [9.5] * n
+    closes = [10.0] * n
+    vols = [1000000] * n
+    pct_chg = [0.0] * n
+
+    # Day 33 (index 32): BEAR day — not bull!
+    opens[32] = 11.0
+    highs[32] = 11.5
+    lows[32] = 9.5
+    closes[32] = 9.5    # bearish, close < open
+    vols[32] = 1000000
+    pct_chg[32] = -2.0
+
+    # Day 34 (index 33): would satisfy yin_ke_yang conditions IF prev were bull
+    # volume spike > MA5 * 1.2, min(o,c) < prev min(o,c), close < MA10
+    opens[33] = 10.0
+    highs[33] = 10.5
+    lows[33] = 8.5
+    closes[33] = 9.0
+    vols[33] = 1500000   # > 1,000,000 * 1.2
+    pct_chg[33] = -5.0   # < 9.9%, not limit-filtered
+
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "open_qfq": opens,
+        "high_qfq": highs,
+        "low_qfq": lows,
+        "close_qfq": closes,
+        "vol": vols,
+        "pct_chg": pct_chg,
+    })
+
+    result = calc._compute_patterns(df, is_st=False)
+
+    # Prev day is BEAR, so yin_ke_yang should NOT trigger
+    assert result["yin_ke_yang"].iloc[33] == 0, (
+        f"阴克阳要求前日阳线，前日阴线不应触发，实际为 {result['yin_ke_yang'].iloc[33]}"
+    )
+
+
+def test_yang_ke_yin_strength_uses_ma5_volume():
+    """阳克阴强度计算: 量能维度使用 MA5 成交量（与检测逻辑对齐），非前日量."""
+    calc = KPatternCalculator.__new__(KPatternCalculator)
+
+    n = 35
+    dates = [f"202601{i:02d}" for i in range(1, n + 1)]
+    opens = [10.0] * n
+    highs = [10.5] * n
+    lows = [9.5] * n
+    closes = [10.0] * n
+    vols = [1000000] * n
+    pct_chg = [0.0] * n
+
+    # Day 33 (index 32): bear day — satisfies yang_ke_yin prev-bear precondition
+    opens[32] = 12.0
+    highs[32] = 12.5
+    lows[32] = 9.5
+    closes[32] = 10.0   # bearish, close < open
+    vols[32] = 1000000
+    pct_chg[32] = -3.0
+
+    # Day 34 (index 33): triggers only yang_ke_yin, NOT yang_bao_yin
+    # open > prev_close (11 > 10) → breaks engulfing condition, avoids double-trigger
+    # volume spike but moderate so vs differs measurably between prev_vol and MA5
+    opens[33] = 11.0   # > c[32]=10 → yang_bao_yin engulf fails (open must be <= prev close)
+    highs[33] = 13.5
+    lows[33] = 8.5
+    closes[33] = 13.0
+    vols[33] = 1300000   # > ma5 * 1.2 = 1,060,000 * 1.2 = 1,272,000
+    pct_chg[33] = 5.0
+
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "open_qfq": opens,
+        "high_qfq": highs,
+        "low_qfq": lows,
+        "close_qfq": closes,
+        "vol": vols,
+        "pct_chg": pct_chg,
+    })
+
+    result = calc._compute_patterns(df, is_st=False)
+
+    # Verify only yang_ke_yin triggers, not yang_bao_yin
+    assert result["yang_ke_yin"].iloc[33] == 1, "Test setup should trigger yang_ke_yin"
+    assert result["yang_bao_yin"].iloc[33] == 0, "yang_bao_yin should NOT trigger"
+
+    # Old prev_vol formula: vr=1.3M/1M=1.3, vs=min((1.3-1.2)/0.8, 1)=0.125
+    #   → strength = 0.4*1.0 + 0.4*0.125 + 0.2*0.9 = 0.630
+    # New MA5 formula: vs=min(1.3M/1.06M/1.5, 1)=0.818
+    #   → strength = 0.4*1.0 + 0.4*0.818 + 0.2*0.9 = 0.907
+    # The test expects strength > 0.80 (MA5-based), which the current prev_vol
+    # code (~0.63) will fail — proving the bug exists.
+    actual_strength = result["strength"].iloc[33]
+    assert not pd.isna(actual_strength), "Strength should not be NaN for triggered pattern"
+
+    assert actual_strength > 0.80, (
+        f"阳克阴强度应使用 MA5 量能基准（预期 > 0.80），"
+        f"实际为 {actual_strength:.4f}。若使用前日量会得到 ~0.63"
+    )
