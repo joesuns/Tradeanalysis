@@ -153,3 +153,37 @@ def test_compute_fetch_range_accepts_full_coverage():
     assert end is None
 
     con.close()
+
+
+# ── check_data_completeness batch ──
+
+
+def test_check_data_completeness_batch_results():
+    """Robust to both per-stock and batch implementations."""
+    import duckdb
+    from backend.etl.orchestrator import check_data_completeness
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dwd_daily_quote (
+            ts_code TEXT, trade_date TEXT)""")
+    # A.SZ: 260 rows (>= 250, OK)
+    # B.SZ: 100 rows (< 250, missing)
+    # C.SZ: 0 rows (not in DWD at all)
+    for i in range(260):
+        con.execute("INSERT INTO dwd_daily_quote VALUES ('A.SZ', ?)",
+                    (f"2026{i//12:02d}{i%12+1:02d}",))
+    for i in range(100):
+        con.execute("INSERT INTO dwd_daily_quote VALUES ('B.SZ', ?)",
+                    (f"2026{i//12:02d}{i%12+1:02d}",))
+
+    result = check_data_completeness(
+        con, ["A.SZ", "B.SZ", "C.SZ"], min_daily_rows=250)
+
+    assert result["ok"] == ["A.SZ"]
+    assert "B.SZ" in result["missing"]
+    assert result["missing"]["B.SZ"]["dwd_rows"] == 100
+    assert "C.SZ" in result["missing"]
+    assert result["missing"]["C.SZ"]["dwd_rows"] == 0
+
+    con.close()

@@ -222,20 +222,29 @@ def check_data_completeness(con, ts_codes: list[str],
     ok = []
     missing = {}
 
-    for ts_code in ts_codes:
-        row = con.execute("""
-            SELECT COUNT(*), MIN(trade_date), MAX(trade_date)
-            FROM dwd_daily_quote WHERE ts_code = ?
-        """, (ts_code,)).fetchone()
+    if not ts_codes:
+        return {"ok": ok, "missing": missing}
 
-        dwd_rows, min_date, max_date = row
-        if dwd_rows is not None and dwd_rows >= min_daily_rows:
+    # Batch query: one GROUP BY instead of per-stock loop
+    placeholders = ",".join(["?" for _ in ts_codes])
+    rows = con.execute(f"""
+        SELECT ts_code, COUNT(*), MIN(trade_date), MAX(trade_date)
+        FROM dwd_daily_quote WHERE ts_code IN ({placeholders})
+        GROUP BY ts_code
+    """, ts_codes).fetchall()
+
+    dwd_data = {r[0]: {"dwd_rows": r[1], "min_date": r[2], "max_date": r[3]}
+                for r in rows}
+
+    for ts_code in ts_codes:
+        info = dwd_data.get(ts_code)
+        if info is not None and info["dwd_rows"] >= min_daily_rows:
             ok.append(ts_code)
         else:
             missing[ts_code] = {
-                "dwd_rows": dwd_rows or 0,
-                "min_date": min_date,
-                "max_date": max_date,
+                "dwd_rows": info["dwd_rows"] if info else 0,
+                "min_date": info["min_date"] if info else None,
+                "max_date": info["max_date"] if info else None,
             }
 
     return {"ok": ok, "missing": missing}
