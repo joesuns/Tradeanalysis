@@ -1,12 +1,13 @@
 """CLI entry point for the Tradeanalysis data pipeline.
 
 Usage:
+    python -m backend.cli run
+    python -m backend.cli run --date 20260604
     python -m backend.cli check
-    python -m backend.cli fetch --all
-    python -m backend.cli fetch --ts-code 000543.SZ --start 20150101
-    python -m backend.cli calc --all
-    python -m backend.cli calc --ts-code 000543.SZ
-    python -m backend.cli export --date 20260529 --ts-code 000543.SZ --output analysis.xlsx
+    python -m backend.cli fetch [--ts-code 000543.SZ] [--start 20150101]
+    python -m backend.cli calc [--ts-code 000543.SZ]
+    python -m backend.cli export --date 20260529 [--ts-code 000543.SZ]
+    python -m backend.cli query --ts-code 000001.SZ
     python -m backend.cli status
 """
 
@@ -70,9 +71,8 @@ def cmd_check(_args):
 def cmd_fetch(args):
     """Pull ODS data into DuckDB.
 
-    --ts-code mode (recommended for <=500 stocks): stock-batched, each stock
-      independently detects missing dates.
-    --all mode (default): date-batched, iterates trading days for the full market.
+    No --ts-code: date-batched parallel mode for full market.
+    --ts-code: stock-batched mode, per-stock incremental detection.
     """
     from backend.db.connection import get_connection
     from backend.fetch.client import TushareClient
@@ -108,8 +108,8 @@ def cmd_fetch(args):
 def cmd_calc(args):
     """Compute DWS indicators.
 
-    Pre-check: validates DWD data completeness per stock.
-    Missing data → auto-fetch (unless --no-auto-fetch) or error.
+    Auto-fetches missing data before calculating.
+    No --ts-code: calculate all active stocks.
     """
     from backend.db.connection import get_connection
     from backend.etl.orchestrator import run_calc
@@ -117,11 +117,7 @@ def cmd_calc(args):
     con = get_connection()
     try:
         ts_codes = args.ts_code if args.ts_code else None
-        run_calc(
-            con,
-            ts_codes=ts_codes,
-            auto_fetch=not args.no_auto_fetch,
-        )
+        run_calc(con, ts_codes=ts_codes, auto_fetch=True)
     finally:
         con.close()
 
@@ -131,10 +127,9 @@ def cmd_calc(args):
 def cmd_export(args):
     """Export analysis wide table to Excel.
 
-    Default: export directly from latest views (no recalculation).
-    --recalc: re-run calc-dws before exporting.
+    Reads DWS data directly from the database. No recalculation.
+    Use 'calc' then 'export' separately if fresh data is needed.
     """
-    from backend.db.connection import get_connection
     from backend.export_wide import export_wide_to_excel
 
     if args.output is None:
@@ -143,15 +138,6 @@ def cmd_export(args):
         args.output = f"analysis_{args.date}_gen{gen_ts}.xlsx"
 
     ts_codes = args.ts_code if args.ts_code else None
-
-    if args.recalc:
-        print("Recalculating DWS before export...")
-        from backend.etl.orchestrator import run_calc
-        con = get_connection()
-        try:
-            run_calc(con, ts_codes=ts_codes, auto_fetch=not args.no_auto_fetch)
-        finally:
-            con.close()
 
     n = export_wide_to_excel(
         args.db_path or "data/tradeanalysis.duckdb",
@@ -225,19 +211,15 @@ def main():
 
     # fetch
     fp = sp.add_parser("fetch", help="Pull ODS data into DuckDB")
-    fp.add_argument("--ts-code", nargs="+", help="Stock code(s) to fetch (stock-batched mode)")
+    fp.add_argument("--ts-code", nargs="+",
+                    help="Stock codes to fetch (omitted = all stocks)")
     fp.add_argument("--start", help="Start date YYYYMMDD (default 20150101)")
     fp.add_argument("--end", help="End date YYYYMMDD (default today)")
-    fp.add_argument("--all", action="store_true",
-                    help="Fetch all active stocks (date-batched mode, default)")
 
     # calc
     cp = sp.add_parser("calc", help="Compute DWS indicators")
-    cp.add_argument("--ts-code", nargs="+", help="Stock codes to calculate")
-    cp.add_argument("--all", action="store_true",
-                    help="Calculate all active stocks (default)")
-    cp.add_argument("--no-auto-fetch", action="store_true",
-                    help="Disable auto-fetch when data is missing")
+    cp.add_argument("--ts-code", nargs="+",
+                    help="Stock codes to calculate (omitted = all stocks)")
 
     # export
     xp = sp.add_parser("export", help="Export analysis wide table to Excel")
@@ -248,10 +230,6 @@ def main():
     xp.add_argument("--db-path")
     xp.add_argument("--include-st", action="store_true")
     xp.add_argument("--no-index", action="store_true")
-    xp.add_argument("--recalc", action="store_true",
-                    help="Recalculate DWS before export")
-    xp.add_argument("--no-auto-fetch", action="store_true",
-                    help="Disable auto-fetch when recalculating")
 
     # query
     qp = sp.add_parser("query", help="Query DWS indicators")

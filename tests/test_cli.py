@@ -82,3 +82,40 @@ def test_ensure_trade_date_weekend_rollback():
     result = _ensure_trade_date(con, "20260607")
     assert result == "20260605", f"Expected 20260605, got {result}"
     con.close()
+
+
+# ── parameter cleanup ──
+
+
+def test_cli_fetch_help_omits_all_param():
+    """fetch help should NOT mention --all (removed)."""
+    env = {**os.environ, "TUSHARE_TOKEN": "test"}
+    result = subprocess.run(
+        [sys.executable, "-m", "backend.cli", "fetch", "--help"],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0
+    assert "--all" not in result.stdout
+
+
+def test_cli_calc_help_omits_no_auto_fetch():
+    """calc help should NOT mention --no-auto-fetch (removed)."""
+    env = {**os.environ, "TUSHARE_TOKEN": "test"}
+    result = subprocess.run(
+        [sys.executable, "-m", "backend.cli", "calc", "--help"],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0
+    assert "--no-auto-fetch" not in result.stdout
+
+
+def test_cli_export_help_omits_recalc():
+    """export help should NOT mention --recalc or --no-auto-fetch (removed)."""
+    env = {**os.environ, "TUSHARE_TOKEN": "test"}
+    result = subprocess.run(
+        [sys.executable, "-m", "backend.cli", "export", "--help"],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode == 0
+    assert "--recalc" not in result.stdout
+    assert "--no-auto-fetch" not in result.stdout
