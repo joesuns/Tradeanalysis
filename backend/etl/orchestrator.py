@@ -395,6 +395,53 @@ def _write_skip_log_batch(con, calc_date: str, indicator: str, freq: str,
         )
 
 
+def _calc_stock_chunk(chunk: list[str], calc_date: str) -> int:
+    """Worker: run all calculators for one stock chunk in a dedicated connection."""
+    import duckdb
+    from backend.config import DUCKDB_PATH
+
+    con = duckdb.connect(DUCKDB_PATH)
+    try:
+        chunk_total = 0
+        for CalcCls in CALCULATORS:
+            indicator_name = CalcCls.__name__.replace("Calculator", "").lower()
+            for freq in ("daily", "weekly"):
+                calc = CalcCls(con, freq)
+                agg_result = CalcResult()
+
+                for i in range(0, len(chunk), 100):
+                    batch = chunk[i:i + 100]
+                    batch_result = calc.calculate(batch, calc_date)
+                    agg_result.calculated += batch_result.calculated
+                    for reason, items in batch_result.skipped.items():
+                        for ts_code, detail in items:
+                            agg_result.add_skip(reason, ts_code, detail)
+
+                _write_skip_log_batch(con, calc_date, indicator_name, freq,
+                                      agg_result.skipped)
+
+                n = con.execute(
+                    f"SELECT COUNT(*) FROM {calc.dws_table} "
+                    f"WHERE calc_date = ?", (calc_date,),
+                ).fetchone()[0]
+                chunk_total += n
+
+                skip_parts = []
+                for reason in SkipReason:
+                    items = agg_result.skipped.get(reason, [])
+                    if items:
+                        skip_parts.append(f"{reason.value}={len(items)}")
+                skip_str = ", ".join(skip_parts) if skip_parts else "none skipped"
+                logger.info(
+                    "calc %-30s DONE — %d rows (%d calculated), %s",
+                    f"{CalcCls.__name__} {freq}", n,
+                    agg_result.calculated, skip_str,
+                )
+        return chunk_total
+    finally:
+        con.close()
+
+
 def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
              batch_size: int = 100):
     """执行 DWS 计算流程。
@@ -548,45 +595,25 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         logger.warning("No stocks with sufficient data to calculate")
         return
 
-    # 4. 计算 DWS
+    # 4. 计算 DWS — multi-threaded by stock chunk
+    import concurrent.futures
+    WORKERS = 3
+    chunk_size = max(1, (len(codes_to_calc) + WORKERS - 1) // WORKERS)
+    chunks = [codes_to_calc[i:i + chunk_size]
+              for i in range(0, len(codes_to_calc), chunk_size)]
+
+    logger.info("calc %d stocks with %d threads (%d stocks/thread)",
+                len(codes_to_calc), WORKERS, chunk_size)
+
     lid, t0 = log_etl_start(con, "calc_dws")
     grand_total = 0
     calc_start = time.monotonic()
 
-    for CalcCls in CALCULATORS:
-        indicator_name = CalcCls.__name__.replace("Calculator", "").lower()
-        for freq in ("daily", "weekly"):
-            calc = CalcCls(con, freq)
-            label = f"{CalcCls.__name__} {freq}"
-            t1 = time.monotonic()
-            agg_result = CalcResult()
-
-            for i in range(0, len(codes_to_calc), batch_size):
-                batch = codes_to_calc[i:i + batch_size]
-                batch_result = calc.calculate(batch, calc_date)
-                agg_result.calculated += batch_result.calculated
-                for reason, items in batch_result.skipped.items():
-                    for ts_code, detail in items:
-                        agg_result.add_skip(reason, ts_code, detail)
-
-            _write_skip_log_batch(con, calc_date, indicator_name, freq,
-                                  agg_result.skipped)
-
-            elapsed = time.monotonic() - t1
-            n = con.execute(
-                f"SELECT COUNT(*) FROM {calc.dws_table} "
-                f"WHERE calc_date = ?", (calc_date,),
-            ).fetchone()[0]
-            grand_total += n
-
-            skip_parts = []
-            for reason in SkipReason:
-                items = agg_result.skipped.get(reason, [])
-                if items:
-                    skip_parts.append(f"{reason.value}={len(items)}")
-            skip_str = ", ".join(skip_parts) if skip_parts else "none skipped"
-            logger.info("calc %-30s DONE — %d rows (%d calculated), %s, %.0fs",
-                        label, n, agg_result.calculated, skip_str, elapsed)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = [pool.submit(_calc_stock_chunk, chunk, calc_date)
+                   for chunk in chunks]
+        for f in concurrent.futures.as_completed(futures):
+            grand_total += f.result()
 
     total_elapsed = time.monotonic() - calc_start
     logger.info("calc ALL DONE — %d total DWS rows across %d indicator×freq pairs, %.0fs",
