@@ -12,6 +12,7 @@ class SkipReason(str, Enum):
     SOURCE_UNAVAILABLE = "source_unavailable" # tushare doesn't support (e.g. BSE moneyflow)
     FETCH_FAILED = "fetch_failed"            # Auto-fetch exhausted retries
     DELISTED = "delisted"                     # Stock delisted before calc_date
+    FINGERPRINT_MATCH = "fingerprint_match"   # DWD input unchanged since last calc
 
 
 @dataclass
@@ -123,13 +124,18 @@ def to_float_safe(val):
 import hashlib
 
 
-def compute_fingerprint(df: "pd.DataFrame", float_cols: list[str]) -> str:
-    """Compute content fingerprint (SHA256 truncated) for a batch of DWS data.
+def compute_fingerprint(df: "pd.DataFrame", float_cols: list[str] = None) -> str:
+    """Compute content fingerprint (SHA256 truncated) for a DataFrame.
 
-    Takes min/max/mean/count of each float column as a deterministic summary.
-    Returns 16-char hex string.
+    When float_cols is None, auto-detects all numeric columns (excluding
+    ts_code and trade_date). Takes min/max/mean/count as a deterministic
+    summary. Returns 16-char hex string.
     """
     import pandas as pd
+    if float_cols is None:
+        float_cols = [c for c in df.columns
+                      if c not in ("ts_code", "trade_date")
+                      and pd.api.types.is_numeric_dtype(df[c])]
     parts = []
     for col in sorted(float_cols):
         if col not in df.columns:
@@ -146,13 +152,33 @@ def compute_fingerprint(df: "pd.DataFrame", float_cols: list[str]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def check_dwd_unchanged(con, dws_table: str, ts_code: str,
+                        df: "pd.DataFrame") -> bool:
+    """Check if DWD input data is unchanged since last calculation.
+
+    Computes fingerprint of df, queries the DWS table for the most
+    recent input_fingerprint for this stock, and compares them.
+
+    Returns True if unchanged (calculation can be skipped).
+    """
+    new_fp = compute_fingerprint(df)
+    row = con.execute(f"""
+        SELECT input_fingerprint FROM {dws_table}
+        WHERE ts_code = ? AND input_fingerprint IS NOT NULL
+        ORDER BY calc_date DESC LIMIT 1
+    """, (ts_code,)).fetchone()
+    return row is not None and row[0] == new_fp
+
+
 def insert_dws_batch(con, table: str, df: "pd.DataFrame", ts_code: str,
                      calc_date: str, dws_cols: list[str],
                      float_cols: list[str],
-                     spec_version: str = "v1"):
+                     spec_version: str = "v1",
+                     input_fingerprint: str = None):
     """Shared DWS INSERT -- replaces individual Calculator _insert methods.
 
     Handles: calc_date, spec_version, input_fingerprint, to_float_safe.
+    When input_fingerprint is provided, uses it directly instead of computing.
     """
     import pandas as pd
 
@@ -170,7 +196,7 @@ def insert_dws_batch(con, table: str, df: "pd.DataFrame", ts_code: str,
 
     batch["calc_date"] = calc_date
     batch["spec_version"] = spec_version
-    batch["input_fingerprint"] = compute_fingerprint(df, float_cols)
+    batch["input_fingerprint"] = input_fingerprint or compute_fingerprint(df, float_cols)
 
     con.register("_batch", batch)
     cols_sql = ", ".join(dws_cols)
