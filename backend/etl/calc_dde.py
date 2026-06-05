@@ -81,105 +81,82 @@ class DDECalculator:
         """, (ts_code,)).df()
 
     def _load_weekly(self, ts_code: str) -> pd.DataFrame:
-        """Aggregate daily moneyflow to weekly granularity using week-end trade dates."""
-        # Get week-end dates for this stock
-        weeks = self.con.execute(f"""
-            SELECT d.trade_date FROM {self.quote_table} d
-            JOIN dim_date dd ON d.trade_date = dd.trade_date
-            WHERE d.ts_code = ? AND dd.is_week_end = 1
-            ORDER BY d.trade_date
-        """, (ts_code,)).df()
-        if weeks.empty:
-            return weeks
+        """Aggregate daily moneyflow to weekly granularity — single-query.
 
-        week_dates = weeks["trade_date"].tolist()
-
-        # For each week ending date, sum moneyflow from the prior week's daily data
-        rows = []
-        for i, week_end in enumerate(week_dates):
-            # Determine the start of this week's daily range
-            if i == 0:
-                week_start = week_end  # first week: just that day's range
-            else:
-                week_start = week_dates[i - 1]
-
-            # Compute 7-day lookback for first week's expected_days query
-            if i == 0:
-                we_dt = datetime.strptime(week_end, "%Y%m%d")
-                week_start_7d = (we_dt - timedelta(days=7)).strftime("%Y%m%d")
-            else:
-                week_start_7d = week_start
-
-            if i == 0:
-                agg = self.con.execute(f"""
-                    SELECT
-                        SUM(mf.buy_lg_vol) AS buy_lg_vol,
-                        SUM(mf.sell_lg_vol) AS sell_lg_vol,
-                        SUM(mf.buy_elg_vol) AS buy_elg_vol,
-                        SUM(mf.sell_elg_vol) AS sell_elg_vol,
-                        SUM(mf.total_vol) AS total_vol,
-                        SUM(mf.net_mf_amount) AS net_mf_amount,
-                        COUNT(DISTINCT mf.trade_date) AS active_days
-                    FROM {self.src_table} mf
-                    JOIN dwd_daily_quote q ON mf.ts_code = q.ts_code AND mf.trade_date = q.trade_date
-                    WHERE mf.ts_code = ?
-                      AND mf.trade_date > ?
-                      AND mf.trade_date <= ?
-                      AND q.is_suspended = 0
-                """, (ts_code, week_start_7d, week_end)).fetchone()
-            else:
-                agg = self.con.execute(f"""
-                    SELECT
-                        SUM(mf.buy_lg_vol) AS buy_lg_vol,
-                        SUM(mf.sell_lg_vol) AS sell_lg_vol,
-                        SUM(mf.buy_elg_vol) AS buy_elg_vol,
-                        SUM(mf.sell_elg_vol) AS sell_elg_vol,
-                        SUM(mf.total_vol) AS total_vol,
-                        SUM(mf.net_mf_amount) AS net_mf_amount,
-                        COUNT(DISTINCT mf.trade_date) AS active_days
-                    FROM {self.src_table} mf
-                    JOIN dwd_daily_quote q ON mf.ts_code = q.ts_code AND mf.trade_date = q.trade_date
-                    WHERE mf.ts_code = ? AND mf.trade_date > ? AND mf.trade_date <= ?
-                      AND q.is_suspended = 0
-                """, (ts_code, week_start, week_end)).fetchone()
-
-            # Also get the close price from weekly quote
-            close_row = self.con.execute(f"""
-                SELECT close_qfq FROM {self.quote_table}
-                WHERE ts_code = ? AND trade_date = ?
-            """, (ts_code, week_end)).fetchone()
-
-            if close_row is None:
-                continue
-
-            # 查该周应有交易日数（考虑假期），对比 moneyflow 覆盖
-            expected_days = self.con.execute("""
-                SELECT COUNT(*) FROM dim_date
-                WHERE trade_date > ? AND trade_date <= ? AND is_trade_day = 1
-            """, (week_start_7d, week_end)).fetchone()[0]
-
-            active_days = agg[6] if agg[6] else 0
-            skip_dde = False
-            if expected_days == 0:
-                continue  # 无交易日（如黄金周），不应存在周线
-            if active_days < expected_days * 0.6:
-                skip_dde = True  # moneyflow 覆盖不足 60%
-
-            rows.append({
-                "trade_date": week_end,
-                "buy_lg_vol": agg[0] if agg[0] else 0,
-                "sell_lg_vol": agg[1] if agg[1] else 0,
-                "buy_elg_vol": agg[2] if agg[2] else 0,
-                "sell_elg_vol": agg[3] if agg[3] else 0,
-                "total_vol": agg[4] if agg[4] else 0,
-                "net_mf_amount": agg[5] if agg[5] else 0,
-                "close_qfq": close_row[0],
-                "_skip_dde": skip_dde,
-            })
-
-        if not rows:
-            return pd.DataFrame()
-        return pd.DataFrame(rows)
+        Uses LAG window function to determine week boundaries, then SUM
+        aggregates moneyflow between consecutive week-end dates in one pass.
+        Replaces ~50 per-week SQL calls with 1 call (~150x fewer roundtrips).
+        """
+        return self.con.execute(f"""
+            WITH week_ranges AS (
+                SELECT
+                    wq.ts_code,
+                    wq.trade_date AS week_end,
+                    COALESCE(
+                        LAG(wq.trade_date) OVER (
+                            PARTITION BY wq.ts_code ORDER BY wq.trade_date
+                        ),
+                        strftime(
+                            CAST(
+                                SUBSTR(wq.trade_date, 1, 4) || '-' ||
+                                SUBSTR(wq.trade_date, 5, 2) || '-' ||
+                                SUBSTR(wq.trade_date, 7, 2)
+                                AS DATE
+                            ) - INTERVAL 7 DAY,
+                            '%Y%m%d'
+                        )
+                    ) AS week_start
+                FROM dwd_weekly_quote wq
+                JOIN dim_date dd ON wq.trade_date = dd.trade_date
+                WHERE wq.ts_code = ? AND dd.is_week_end = 1
+            ),
+            weekly_agg AS (
+                SELECT
+                    wr.week_end,
+                    COALESCE(SUM(mf.buy_lg_vol),   0) AS buy_lg_vol,
+                    COALESCE(SUM(mf.sell_lg_vol),  0) AS sell_lg_vol,
+                    COALESCE(SUM(mf.buy_elg_vol),  0) AS buy_elg_vol,
+                    COALESCE(SUM(mf.sell_elg_vol), 0) AS sell_elg_vol,
+                    COALESCE(SUM(mf.total_vol),    0) AS total_vol,
+                    COALESCE(SUM(mf.net_mf_amount),0) AS net_mf_amount,
+                    COUNT(DISTINCT mf.trade_date) AS active_days,
+                    COUNT(DISTINCT dd_t.trade_date) AS expected_days
+                FROM week_ranges wr
+                JOIN {self.src_table} mf
+                    ON wr.ts_code = mf.ts_code
+                    AND mf.trade_date > wr.week_start
+                    AND mf.trade_date <= wr.week_end
+                JOIN dwd_daily_quote q
+                    ON mf.ts_code = q.ts_code
+                    AND mf.trade_date = q.trade_date
+                    AND q.is_suspended = 0
+                JOIN dim_date dd_t
+                    ON dd_t.trade_date > wr.week_start
+                    AND dd_t.trade_date <= wr.week_end
+                    AND dd_t.is_trade_day = 1
+                GROUP BY wr.week_end
+            )
+            SELECT
+                wa.week_end   AS trade_date,
+                wa.buy_lg_vol,
+                wa.sell_lg_vol,
+                wa.buy_elg_vol,
+                wa.sell_elg_vol,
+                wa.total_vol,
+                wa.net_mf_amount,
+                wa.active_days,
+                wa.expected_days,
+                wq.close_qfq,
+                CASE
+                    WHEN wa.active_days < wa.expected_days * 0.6
+                    THEN 1 ELSE 0
+                END AS _skip_dde
+            FROM weekly_agg wa
+            JOIN dwd_weekly_quote wq
+                ON wq.ts_code = ? AND wq.trade_date = wa.week_end
+            WHERE wa.expected_days > 0
+            ORDER BY wa.week_end
+        """, (ts_code, ts_code)).df()
 
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Compute DDX, DDX2, divergence, trend, alerts, and turning points."""

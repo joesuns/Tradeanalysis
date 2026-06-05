@@ -435,3 +435,133 @@ def test_dde_trend_strength_zero_mean():
     assert np.isnan(result[9]), (
         f"全零 DDX2 应返回 NaN，实际 {result[9]}"
     )
+
+
+# ── _load_weekly contract ──
+
+
+def test_load_weekly_produces_weekly_rows():
+    """_load_weekly should return one row per week-end for a stock."""
+    import duckdb
+    from backend.etl.calc_dde import DDECalculator
+
+    con = duckdb.connect(":memory:")
+    for ddl in [
+        """CREATE TABLE dwd_daily_moneyflow (
+            ts_code TEXT, trade_date TEXT, buy_lg_vol REAL, sell_lg_vol REAL,
+            buy_elg_vol REAL, sell_elg_vol REAL, total_vol REAL,
+            net_mf_amount REAL, PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dwd_daily_quote (
+            ts_code TEXT, trade_date TEXT, close_qfq REAL, is_suspended INTEGER,
+            PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dwd_weekly_quote (
+            ts_code TEXT, trade_date TEXT, close_qfq REAL,
+            PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_week_end INTEGER,
+            is_trade_day INTEGER)""",
+    ]:
+        con.execute(ddl)
+
+    # 3 weeks × 5 trading days for TEST.SZ
+    for w in range(1, 4):
+        for d in range(1, 6):
+            day = f"202601{w*7+d:02d}"
+            con.execute("INSERT OR REPLACE INTO dwd_daily_moneyflow "
+                        "VALUES ('TEST.SZ', ?, 100,50,80,30,300,500)", (day,))
+            con.execute("INSERT OR REPLACE INTO dwd_daily_quote "
+                        "VALUES ('TEST.SZ', ?, 10.0, 0)", (day,))
+            is_we = 1 if d == 5 else 0
+            con.execute("INSERT OR REPLACE INTO dim_date VALUES (?, ?, 1)",
+                        (day, is_we))
+            if is_we:
+                con.execute("INSERT OR REPLACE INTO dwd_weekly_quote "
+                            "VALUES ('TEST.SZ', ?, 10.0)", (day,))
+
+    calc = DDECalculator(con, "weekly")
+    df = calc._load_weekly("TEST.SZ")
+
+    assert len(df) == 3, f"Expected 3 weekly rows, got {len(df)}"
+    assert "_skip_dde" in df.columns
+    assert "close_qfq" in df.columns
+    assert "buy_lg_vol" in df.columns
+    assert "net_mf_amount" in df.columns
+    # All weeks fully covered (5 active out of 5 expected = 100%)
+    assert (df["_skip_dde"] == 0).all(), "Full coverage weeks should _skip_dde=0"
+
+    con.close()
+
+
+def test_load_weekly_empty_stock():
+    """Stock with no week-end data → empty DataFrame."""
+    import duckdb
+    from backend.etl.calc_dde import DDECalculator
+
+    con = duckdb.connect(":memory:")
+    for ddl in [
+        """CREATE TABLE dwd_daily_moneyflow (
+            ts_code TEXT, trade_date TEXT, buy_lg_vol REAL, sell_lg_vol REAL,
+            buy_elg_vol REAL, sell_elg_vol REAL, total_vol REAL,
+            net_mf_amount REAL, PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dwd_daily_quote (
+            ts_code TEXT, trade_date TEXT, close_qfq REAL, is_suspended INTEGER,
+            PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dwd_weekly_quote (
+            ts_code TEXT, trade_date TEXT, close_qfq REAL,
+            PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_week_end INTEGER,
+            is_trade_day INTEGER)""",
+    ]:
+        con.execute(ddl)
+
+    calc = DDECalculator(con, "weekly")
+    df = calc._load_weekly("NO_DATA.SZ")
+    assert df.empty, f"Expected empty, got {len(df)} rows"
+    con.close()
+
+
+def test_load_weekly_moneyflow_insufficient_coverage():
+    """Weeks with <60% moneyflow coverage should be _skip_dde=1."""
+    import duckdb
+    from backend.etl.calc_dde import DDECalculator
+
+    con = duckdb.connect(":memory:")
+    for ddl in [
+        """CREATE TABLE dwd_daily_moneyflow (
+            ts_code TEXT, trade_date TEXT, buy_lg_vol REAL, sell_lg_vol REAL,
+            buy_elg_vol REAL, sell_elg_vol REAL, total_vol REAL,
+            net_mf_amount REAL, PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dwd_daily_quote (
+            ts_code TEXT, trade_date TEXT, close_qfq REAL, is_suspended INTEGER,
+            PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dwd_weekly_quote (
+            ts_code TEXT, trade_date TEXT, close_qfq REAL,
+            PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_week_end INTEGER,
+            is_trade_day INTEGER)""",
+    ]:
+        con.execute(ddl)
+
+    # 1 week of 5 trading days, but only 2 days have moneyflow (2/5 = 40% < 60%)
+    for d in range(1, 6):
+        day = f"2026010{d}"
+        con.execute("INSERT OR REPLACE INTO dwd_daily_quote "
+                    "VALUES ('TEST.SZ', ?, 10.0, 0)", (day,))
+        con.execute("INSERT OR REPLACE INTO dim_date VALUES (?, ?, 1)",
+                    (day, 1 if d == 5 else 0))
+        if d <= 2:
+            con.execute("INSERT OR REPLACE INTO dwd_daily_moneyflow "
+                        "VALUES ('TEST.SZ', ?, 100,50,80,30,300,500)", (day,))
+    con.execute("INSERT OR REPLACE INTO dwd_weekly_quote "
+                "VALUES ('TEST.SZ', '20260105', 10.0)")
+
+    calc = DDECalculator(con, "weekly")
+    df = calc._load_weekly("TEST.SZ")
+
+    assert len(df) == 1
+    assert df["_skip_dde"].iloc[0] == 1, (
+        f"2/5=40% < 60% → _skip_dde should be 1, got {df['_skip_dde'].iloc[0]}")
+
+    con.close()
