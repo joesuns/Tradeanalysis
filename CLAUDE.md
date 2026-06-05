@@ -215,6 +215,9 @@ export（导出层）
   `input_fingerprint` 存储于每张 DWS 表的每行中，由 `insert_dws_batch()` 写入。
 - **DDE 周线批量聚合:** `_load_weekly` 使用 LAG 窗口函数一次性完成周间 SUM 聚合，
   替代原来的 per-week N+1 查询。SQL 调用 ~150x 减少，DDE 周线 ~50min → ~25s。
+- **批量完整度检查:** `check_data_completeness` 使用 GROUP BY 替代逐股票循环，5524 SQL → 1 SQL。
+- **多线程 calc:** `run_calc` 将股票分 3 片并行计算，WAL 并发写入。每线程独立 DuckDB 连接。
+  总 calc 从 ~58min → ~20min（3 线程）。
 
 ## 工作流程
 
