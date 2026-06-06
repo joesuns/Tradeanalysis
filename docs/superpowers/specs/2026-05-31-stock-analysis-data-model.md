@@ -676,6 +676,8 @@ CREATE TABLE dws_volume_daily (
 
 **周线窗口说明：** 周线 `dws_volume_weekly` 的 120 窗口指 **120 根 week-end bar**（约 2.5 年），非 120 个交易日。fetch/calc 门禁 `WEEKLY_WARMUP_WEEKS=120` 与 `dim_date.is_week_end=1` 对齐。
 
+**calc 与 fetch 门禁分离：** 新股 `daily_ok` 即可 calc（周线 volume 窗口不足导出 N/A）；仅 mature 股 history 不足时进入 `weekly_fetch` 补拉。
+
 **区域判定**（基于 MA5_vol 在近 120 日的百分位）：
 
 | 切换方向 | 条件 | 参数 |

@@ -463,7 +463,8 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         "MACD转折": {"金叉": green, "死叉": red}, "MACD区域": {"多头": green, "空头": red},
         "MACD背离": {"顶背离": red, "底背离": green},
         "均线形态": {"多头强势": green, "多头初建": green, "多头衰竭": blue, "多头翻转": blue,
-                     "空头强势": red, "空头初建": red, "空头衰竭": blue, "空头翻转": blue, "均线缠绕": blue},
+                     "空头强势": red, "空头初建": red, "空头衰竭": blue, "空头翻转": blue,
+                     "均线缠绕": blue, "均线走平": blue},
         "均线转折": {"金叉": green, "死叉": red}, "DDE趋势": {"上升": green, "下降": red},
         "DDE背离": {"顶背离": red, "底背离": green}, "量能区域": {"爆量": red, "地量": blue},
         "量能趋势": {"放量": green, "缩量": red},
@@ -484,8 +485,14 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
                 col_idx = list(df.columns).index(lookup) + 1
                 for row_idx in range(3, len(df) + 3):
                     val = ws.cell(row=row_idx, column=col_idx).value
-                    if val in value_colors:
-                        ws.cell(row=row_idx, column=col_idx).fill = value_colors[val]
+                    fill = value_colors.get(val)
+                    if fill is None and isinstance(val, str):
+                        for prefix, color in value_colors.items():
+                            if val.startswith(prefix):
+                                fill = color
+                                break
+                    if fill is not None:
+                        ws.cell(row=row_idx, column=col_idx).fill = fill
     if "K线形态" in df.columns:
         col_idx = list(df.columns).index("K线形态") + 1
         for row_idx in range(3, len(df) + 3):

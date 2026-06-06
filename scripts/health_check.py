@@ -47,6 +47,18 @@ class Checker:
         except Exception as e:
             print(f"  [ERR ] {label}: {e}")
 
+    def expect_min(self, label, sql, minimum: int):
+        try:
+            v = self._scalar(sql) or 0
+        except Exception as e:
+            print(f"  [ERR ] {label}: {e}")
+            self.failures += 1
+            return
+        ok = v >= minimum
+        if not ok:
+            self.failures += 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {v:,} (min {minimum:,})")
+
 
 def run(con) -> int:
     c = Checker(con)
@@ -156,15 +168,34 @@ def run(con) -> int:
            "(SELECT 1 FROM dwd_daily_moneyflow mf WHERE mf.ts_code=q.ts_code AND mf.trade_date=q.trade_date)")
     c.info("dim_stock 有 delist_date(已知=0)", "SELECT COUNT(*) FROM dim_stock WHERE delist_date IS NOT NULL")
 
-    print("=== I. 周线 volume 状态指标 ===")
-    c.info("volume_weekly pct_vol_rank 非空",
-           "SELECT COUNT(*) FROM v_dws_volume_weekly_latest v "
-           "JOIN dim_date d ON v.trade_date=d.trade_date AND d.is_week_end=1 "
-           "WHERE v.pct_vol_rank IS NOT NULL")
-    c.info("volume_weekly zone 非空",
-           "SELECT COUNT(*) FROM v_dws_volume_weekly_latest v "
-           "JOIN dim_date d ON v.trade_date=d.trade_date AND d.is_week_end=1 "
-           "WHERE v.zone IS NOT NULL")
+    print("=== I. 周线 volume 状态指标（成熟股） ===")
+    mature_list_cutoff = """
+        SELECT trade_date FROM (
+            SELECT trade_date,
+                   ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
+            FROM dim_date WHERE is_trade_day=1 AND is_week_end=1
+        ) WHERE rn = 120
+    """
+    mature_vol_rank_sql = f"""
+        SELECT COUNT(*) FROM v_dws_volume_weekly_latest v
+        JOIN dim_date d ON v.trade_date = d.trade_date AND d.is_week_end = 1
+        JOIN dim_stock s ON v.ts_code = s.ts_code
+        WHERE v.pct_vol_rank IS NOT NULL
+          AND s.list_date IS NOT NULL
+          AND s.list_date <= ({mature_list_cutoff})
+    """
+    mature_universe_sql = f"""
+        SELECT COUNT(*) FROM dim_stock s
+        WHERE s.list_date IS NOT NULL
+          AND s.list_date <= ({mature_list_cutoff})
+    """
+    c.info("成熟股 universe", mature_universe_sql)
+    c.expect_min("volume_weekly pct_vol_rank 非空(成熟股)", mature_vol_rank_sql, minimum=4000)
+    c.expect_min(
+        "volume_weekly zone 非空(成熟股)",
+        mature_vol_rank_sql.replace("pct_vol_rank", "zone"),
+        minimum=4000,
+    )
 
     print()
     if c.failures == 0:

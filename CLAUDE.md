@@ -227,8 +227,11 @@ export（导出层）
   - `v_indicator_availability` 视图提供 full/partial/missing/unavailable/historical 五态
   - 详细架构见 `docs/superpowers/plans/2026-06-04-empty-data-handling.md`
 - **Date-batched per-stock 增量检测:** 全市场 fetch 传入 active codes；`_get_trading_days(..., ts_codes=...)` 仅当**全部**目标股已有该日 ODS 才跳过。避免 partial day（如 623/5524）导致整日误跳过。
-- **Freshness 三门禁（calc）：** G1 warmup（DWD≥250 行 + week-end≥120 根）+ G2 stale ODS（max<calc_date）+ G3 stale DWD（ODS 有当日 DWD 无）。`run` 先 fetch 故 calc 设 `skip_stale_fetch=True`。
-- **双轨 warmup：** 日线 `WARMUP_TDAYS=250`；周线 volume `WEEKLY_WARMUP_WEEKS=120`（week-end bar）。fetch/calc 门禁取两者较早起点。`check_data_completeness` 检查 `dwd_rows≥250` 且 `week_end_bars≥120`。
+- **Freshness 三门禁（calc）：** G1 calc 准入（DWD≥250 行）+ G2 stale ODS + G3 stale DWD。`run` 先 fetch 故 calc 设 `skip_stale_fetch=True`。
+- **双轨 warmup（拆分门禁）：**
+  - **calc 准入：** `dwd_rows ≥ 250`（`check_data_completeness.ok`）
+  - **fetch 门禁：** 成熟股（available week-end ≥ 120）且 `week_end_bars < 120` → `weekly_fetch` 桶，触发 auto-fetch；**上市不足 120 周除外**（`weekly_required = min(120, available)`）
+  - fetch 起点：`min(250td_start, 120 week-end_start, list_date)`
 - **导出语义：** `-`=当日无事件信号；`N/A`=不可算或源端无数据（如亏损股 PE、历史不足量能分位）。
 - **Fetch 覆盖率:** `_compute_fetch_range` 要求 100% ODS 覆盖才跳过（对齐 123 项目严格检查模式）。
 - **数据质量门禁:** `_validate_ods_batch` 已接入全部 3 条 `daily` 写库路径（`fetch_by_date_range` / `_fetch_chunk` 并行 / `fetch_stocks_incremental`）。在 ODS INSERT 前校验 OHLC 逻辑（high >= low）和必需字段（open/high/low/close/vol/amount）非空，**返回过滤后的有效记录列表**，无效行丢弃并按批次打 WARNING。仅作用于 daily（OHLCV），daily_basic/moneyflow 不校验。

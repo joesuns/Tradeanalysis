@@ -245,6 +245,24 @@ def _needed_history_start(con, end_date: str, list_date: str = None,
     return needed
 
 
+def _available_week_ends_batch(con, ts_codes: list[str], end_date: str) -> dict:
+    """Count week-end bars on dim_date between list_date and end_date (inclusive)."""
+    if not ts_codes:
+        return {}
+    placeholders = ",".join(["?" for _ in ts_codes])
+    rows = con.execute(f"""
+        SELECT s.ts_code, COUNT(d.trade_date)
+        FROM dim_stock s
+        LEFT JOIN dim_date d
+          ON d.is_trade_day = 1 AND d.is_week_end = 1
+         AND d.trade_date <= ?
+         AND (s.list_date IS NULL OR d.trade_date >= s.list_date)
+        WHERE s.ts_code IN ({placeholders})
+        GROUP BY s.ts_code
+    """, [end_date] + ts_codes).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def _count_week_end_bars_batch(con, ts_codes: list[str]) -> dict:
     if not ts_codes:
         return {}
@@ -263,30 +281,31 @@ def _count_week_end_bars_batch(con, ts_codes: list[str]) -> dict:
 
 
 def check_data_completeness(con, ts_codes: list[str],
+                             calc_date: str = None,
                              min_daily_rows: int = WARMUP_TDAYS,
                              min_week_end_bars: int = WEEKLY_WARMUP_WEEKS) -> dict:
-    """检查指定股票在 DWD 层的数据完整度。
+    """检查 DWD 完整度，拆分 calc 准入与 weekly fetch 需求。
 
     返回:
         {
-            "ok": ["000001.SZ", ...],
-            "missing": {
-                "000543.SZ": {
-                    "dwd_rows": 260,
-                    "min_date": "20230601",
-                    "max_date": "20260603",
-                },
-                ...
-            },
+            "ok": [...],              # daily_ok → 可进入 calc
+            "missing": {...},         # NOT daily_ok → 不可 calc，可 auto-fetch
+            "weekly_fetch": {...},    # daily_ok 但成熟股 week-end 仍不足 → 仅 fetch
         }
     """
     ok = []
     missing = {}
+    weekly_fetch = {}
 
     if not ts_codes:
-        return {"ok": ok, "missing": missing}
+        return {"ok": ok, "missing": missing, "weekly_fetch": weekly_fetch}
 
-    # Batch query: one GROUP BY instead of per-stock loop
+    if calc_date is None:
+        row = con.execute(
+            "SELECT MAX(trade_date) FROM dim_date WHERE is_trade_day = 1"
+        ).fetchone()
+        calc_date = row[0] if row and row[0] else datetime.now().strftime("%Y%m%d")
+
     placeholders = ",".join(["?" for _ in ts_codes])
     rows = con.execute(f"""
         SELECT ts_code, COUNT(*), MIN(trade_date), MAX(trade_date)
@@ -298,32 +317,38 @@ def check_data_completeness(con, ts_codes: list[str],
                 for r in rows}
 
     week_end_counts = _count_week_end_bars_batch(con, ts_codes)
+    available_counts = _available_week_ends_batch(con, ts_codes, calc_date)
 
     for ts_code in ts_codes:
         info = dwd_data.get(ts_code)
         dwd_rows = info["dwd_rows"] if info else 0
         week_end_bars = week_end_counts.get(ts_code, 0)
+        available_we = available_counts.get(ts_code, 0)
+        weekly_required = min(min_week_end_bars, available_we)
         daily_ok = info is not None and dwd_rows >= min_daily_rows
-        weekly_ok = week_end_bars >= min_week_end_bars
+        weekly_ok = week_end_bars >= weekly_required
 
-        if daily_ok and weekly_ok:
+        base = {
+            "dwd_rows": dwd_rows,
+            "week_end_bars": week_end_bars,
+            "weekly_required": weekly_required,
+            "available_week_ends": available_we,
+            "min_date": info["min_date"] if info else None,
+            "max_date": info["max_date"] if info else None,
+        }
+
+        if daily_ok:
             ok.append(ts_code)
+            if not weekly_ok and available_we >= min_week_end_bars:
+                weekly_fetch[ts_code] = {**base, "reason": "weekly_warmup"}
         else:
-            if not daily_ok and not weekly_ok:
+            if not weekly_ok:
                 reason = "both"
-            elif not daily_ok:
-                reason = "daily_warmup"
             else:
-                reason = "weekly_warmup"
-            missing[ts_code] = {
-                "dwd_rows": dwd_rows,
-                "week_end_bars": week_end_bars,
-                "min_date": info["min_date"] if info else None,
-                "max_date": info["max_date"] if info else None,
-                "reason": reason,
-            }
+                reason = "daily_warmup"
+            missing[ts_code] = {**base, "reason": reason}
 
-    return {"ok": ok, "missing": missing}
+    return {"ok": ok, "missing": missing, "weekly_fetch": weekly_fetch}
 
 
 def find_stale_ods_codes(con, ts_codes: list[str], analysis_date: str) -> list[str]:
@@ -549,8 +574,12 @@ def _classify_still_missing(con, missing: dict) -> dict:
                 detail = "DWD rows=0 after fetch+rebuild"
         else:
             reason = SkipReason.INSUFFICIENT_ROWS
-            detail = (f"DWD rows={dwd_rows} "
-                      f"(min_date={info['min_date']}, max_date={info['max_date']})")
+            detail = (
+                f"DWD rows={dwd_rows}, week_end_bars={info.get('week_end_bars', '?')}"
+                f"/{info.get('weekly_required', '?')}"
+                f" (min_date={info['min_date']}, max_date={info['max_date']},"
+                f" reason={info.get('reason', '?')})"
+            )
         if reason not in classified:
             classified[reason] = []
         classified[reason].append((ts_code, detail))
@@ -659,110 +688,107 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         return
 
     # 1. 数据完整度检查
-    completeness = check_data_completeness(con, ts_codes)
+    completeness = check_data_completeness(con, ts_codes, calc_date=calc_date)
+    weekly_fetch = completeness.get("weekly_fetch", {})
+    logger.info(
+        "DWD completeness: calc_ok=%d/%d, missing=%d, weekly_fetch=%d",
+        len(completeness["ok"]), len(ts_codes),
+        len(completeness["missing"]), len(weekly_fetch),
+    )
     if completeness["missing"]:
-        missing_codes = list(completeness["missing"].keys())
-        missing_pct = len(missing_codes) * 100.0 / len(ts_codes)
-        logger.info(
-            "DWD completeness: %d/%d stocks (%.1f%%) lack sufficient data "
-            "(daily>=%d rows, weekly>=%d week-ends)",
-            len(missing_codes), len(ts_codes), missing_pct,
-            WARMUP_TDAYS, WEEKLY_WARMUP_WEEKS,
-        )
         reason_counts = {}
-        for c in missing_codes:
+        for c in completeness["missing"]:
             r = completeness["missing"][c].get("reason", "unknown")
             reason_counts[r] = reason_counts.get(r, 0) + 1
         logger.info("Missing breakdown by reason: %s", reason_counts)
 
-        if auto_fetch:
-            # Compute per-stock fetch ranges based on warmup
-            to_fetch = []
-            for ts_code in missing_codes:
-                needed_start, needed_end = _compute_fetch_range(con, ts_code, calc_date)
-                if needed_start is None:
-                    continue
-                to_fetch.append((ts_code, needed_start, needed_end))
+    if auto_fetch and (completeness["missing"] or weekly_fetch):
+        fetch_candidates = list(completeness["missing"].keys()) + list(weekly_fetch.keys())
+        to_fetch = []
+        for ts_code in fetch_candidates:
+            needed_start, needed_end = _compute_fetch_range(con, ts_code, calc_date)
+            if needed_start is None:
+                continue
+            to_fetch.append((ts_code, needed_start, needed_end))
 
-            if to_fetch:
-                logger.info("Auto-fetching %d stocks (warmup=%d tdays, per-stock ranges)...",
-                            len(to_fetch), WARMUP_TDAYS)
-                client = TushareClient()
+        if to_fetch:
+            logger.info(
+                "Auto-fetching %d stocks (daily>=%d, weekly>=%d week-ends)...",
+                len(to_fetch), WARMUP_TDAYS, WEEKLY_WARMUP_WEEKS,
+            )
+            client = TushareClient()
 
-                # Group stocks by (start, end) range for batch efficiency
-                from collections import defaultdict
-                range_buckets = defaultdict(list)
-                for ts_code, seg_start, seg_end in to_fetch:
-                    range_buckets[(seg_start, seg_end)].append(ts_code)
+            from collections import defaultdict
+            range_buckets = defaultdict(list)
+            for ts_code, seg_start, seg_end in to_fetch:
+                range_buckets[(seg_start, seg_end)].append(ts_code)
 
-                consecutive_errors = 0
-                n_fetched = 0
-                all_fetch_codes = {c for c, _, _ in to_fetch}
-                attempted_codes = set()
+            consecutive_errors = 0
+            n_fetched = 0
+            all_fetch_codes = {c for c, _, _ in to_fetch}
+            attempted_codes = set()
 
-                for (seg_start, seg_end), bucket_codes in range_buckets.items():
-                    try:
-                        tdays = _count_trading_days(con, seg_start, seg_end)
-                        if _choose_fetch_strategy(len(bucket_codes), tdays):
-                            logger.info(
-                                "Auto-fetch bucket [%s~%s]: %d stocks, %d tdays "
-                                "→ date-batched parallel mode",
-                                seg_start, seg_end, len(bucket_codes), tdays,
-                            )
-                            rows = fetch_by_date_range_parallel(
-                                seg_start, seg_end, workers=3,
-                                ts_codes=bucket_codes, con=con,
-                            )
-                        else:
-                            logger.info(
-                                "Auto-fetch bucket [%s~%s]: %d stocks, %d tdays "
-                                "→ stock-batched sequential mode",
-                                seg_start, seg_end, len(bucket_codes), tdays,
-                            )
-                            rows = fetch_stocks_incremental(
-                                client, con, bucket_codes,
-                                start=seg_start, end=seg_end)
-                        attempted_codes.update(bucket_codes)
-                        if rows > 0:
-                            n_fetched += rows
-                            consecutive_errors = 0
-                    except Exception as e:
-                        attempted_codes.update(bucket_codes)
-                        consecutive_errors += 1
-                        logger.warning("fetch failed for batch [%s~%s] (%d stocks): %s",
-                                       seg_start, seg_end, len(bucket_codes), e)
+            for (seg_start, seg_end), bucket_codes in range_buckets.items():
+                try:
+                    tdays = _count_trading_days(con, seg_start, seg_end)
+                    if _choose_fetch_strategy(len(bucket_codes), tdays):
+                        logger.info(
+                            "Auto-fetch bucket [%s~%s]: %d stocks, %d tdays "
+                            "→ date-batched parallel mode",
+                            seg_start, seg_end, len(bucket_codes), tdays,
+                        )
+                        rows = fetch_by_date_range_parallel(
+                            seg_start, seg_end, workers=3,
+                            ts_codes=bucket_codes, con=con,
+                        )
+                    else:
+                        logger.info(
+                            "Auto-fetch bucket [%s~%s]: %d stocks, %d tdays "
+                            "→ stock-batched sequential mode",
+                            seg_start, seg_end, len(bucket_codes), tdays,
+                        )
+                        rows = fetch_stocks_incremental(
+                            client, con, bucket_codes,
+                            start=seg_start, end=seg_end)
+                    attempted_codes.update(bucket_codes)
+                    if rows > 0:
+                        n_fetched += rows
+                        consecutive_errors = 0
+                except Exception as e:
+                    attempted_codes.update(bucket_codes)
+                    consecutive_errors += 1
+                    logger.warning("fetch failed for batch [%s~%s] (%d stocks): %s",
+                                   seg_start, seg_end, len(bucket_codes), e)
 
-                    if consecutive_errors >= 5:
-                        logger.error("Circuit breaker: %d consecutive fetch errors. "
-                                     "tushare may be down. Aborting auto-fetch.",
-                                     consecutive_errors)
-                        break
+                if consecutive_errors >= 5:
+                    logger.error("Circuit breaker: %d consecutive fetch errors. "
+                                 "tushare may be down. Aborting auto-fetch.",
+                                 consecutive_errors)
+                    break
 
-                # Mark stocks whose fetch was never attempted as FETCH_FAILED
-                fetch_failed_codes = all_fetch_codes - attempted_codes
-                if fetch_failed_codes:
-                    cf = {SkipReason.FETCH_FAILED: [
-                        (c, "auto-fetch aborted by circuit breaker") for c in fetch_failed_codes
-                    ]}
-                    _write_skip_log_batch(con, calc_date, "dwd", "both", cf)
-                    logger.warning("Pre-calc skip: %d stocks — fetch_failed (circuit breaker)",
-                                   len(fetch_failed_codes))
-                    # Remove from missing so _classify_still_missing doesn't re-classify them
-                    for c in fetch_failed_codes:
-                        if c in completeness["missing"]:
-                            del completeness["missing"][c]
+            fetch_failed_codes = all_fetch_codes - attempted_codes
+            if fetch_failed_codes:
+                cf = {SkipReason.FETCH_FAILED: [
+                    (c, "auto-fetch aborted by circuit breaker") for c in fetch_failed_codes
+                ]}
+                _write_skip_log_batch(con, calc_date, "dwd", "both", cf)
+                logger.warning("Pre-calc skip: %d stocks — fetch_failed (circuit breaker)",
+                               len(fetch_failed_codes))
+                for c in fetch_failed_codes:
+                    if c in completeness["missing"]:
+                        del completeness["missing"][c]
 
-                logger.info("Auto-fetch complete: %d ODS rows fetched (%d batches)",
-                            n_fetched, len(range_buckets))
-                if n_fetched > 0:
-                    rebuild_all_dwd(con, missing_codes)
-                    completeness = check_data_completeness(con, ts_codes)
-            else:
-                logger.info("All missing stocks already have ODS data. Rebuilding DWD...")
-                rebuild_all_dwd(con, missing_codes)
-                completeness = check_data_completeness(con, ts_codes)
+            logger.info("Auto-fetch complete: %d ODS rows fetched (%d batches)",
+                        n_fetched, len(range_buckets))
+            if n_fetched > 0:
+                fetched_codes = list({c for c, _, _ in to_fetch})
+                rebuild_all_dwd(con, fetched_codes)
+                completeness = check_data_completeness(con, ts_codes, calc_date=calc_date)
         else:
-            logger.info("Auto-fetch disabled. Skipping %d stocks.", len(missing_codes))
+            logger.info("No ODS gaps to fetch; skipping DWD rebuild")
+    elif not auto_fetch and completeness["missing"]:
+        logger.info("Auto-fetch disabled. Skipping %d missing stocks.",
+                    len(completeness["missing"]))
 
     # 1b. Stale ODS tail — stocks with warmup OK but missing latest trade_date
     if auto_fetch and not skip_stale_fetch:

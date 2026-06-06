@@ -242,6 +242,106 @@ def test_compute_fetch_range_uses_weekly_warmup_when_deeper():
 # ── check_data_completeness batch ──
 
 
+def test_available_week_ends_respects_list_date():
+    """available_week_ends = [list_date, end_date] 内 dim_date week-end 数。"""
+    import duckdb
+    from backend.etl.orchestrator import _available_week_ends_batch
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dim_stock (
+            ts_code TEXT PRIMARY KEY, list_date TEXT, delist_date TEXT)
+    """)
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_trade_day INTEGER, is_week_end INTEGER)
+    """)
+    con.execute("INSERT INTO dim_stock VALUES ('IPO.SZ', '20260101', NULL)")
+    con.execute("INSERT INTO dim_stock VALUES ('OLD.SZ', '20200101', NULL)")
+    for td in _seq_week_end_dates(130, start=(2020, 1, 3)):
+        con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
+    for td in _seq_week_end_dates(10, start=(2026, 1, 2)):
+        con.execute("INSERT OR IGNORE INTO dim_date VALUES (?, 1, 1)", [td])
+
+    end = "20261231"
+    counts_ipo = _available_week_ends_batch(con, ["IPO.SZ"], end)
+    counts_old = _available_week_ends_batch(con, ["OLD.SZ"], "20251231")
+    assert counts_ipo["IPO.SZ"] == 10
+    assert counts_old["OLD.SZ"] == 130
+
+    con.close()
+
+
+def test_check_data_completeness_ipo_exempt_from_weekly_gate():
+    """上市不足 120 周：daily_ok 即 ok，weekly 不足不阻断 calc。"""
+    import duckdb
+    from backend.etl.orchestrator import check_data_completeness
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_trade_day INTEGER, is_week_end INTEGER)
+    """)
+    con.execute("""
+        CREATE TABLE dim_stock (
+            ts_code TEXT PRIMARY KEY, list_date TEXT, delist_date TEXT)
+    """)
+    con.execute("INSERT INTO dim_stock VALUES ('IPO.SZ', '20260101', NULL)")
+    for td in _seq_trade_dates(260):
+        con.execute("INSERT INTO dwd_daily_quote VALUES ('IPO.SZ', ?)", [td])
+    for td in _seq_week_end_dates(50, start=(2026, 1, 2)):
+        con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
+        con.execute("INSERT INTO dwd_weekly_quote VALUES ('IPO.SZ', ?)", [td])
+
+    result = check_data_completeness(
+        con, ["IPO.SZ"], calc_date="20261231", min_daily_rows=250)
+    assert "IPO.SZ" in result["ok"]
+    assert "IPO.SZ" not in result["missing"]
+    assert "IPO.SZ" not in result.get("weekly_fetch", {})
+
+    con.close()
+
+
+def test_check_data_completeness_mature_weekly_fetch_bucket():
+    """成熟股 week-end 不足：仍可 calc，但进 weekly_fetch 触发补历史。"""
+    import duckdb
+    from backend.etl.orchestrator import check_data_completeness, WEEKLY_WARMUP_WEEKS
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_trade_day INTEGER, is_week_end INTEGER)
+    """)
+    con.execute("""
+        CREATE TABLE dim_stock (
+            ts_code TEXT PRIMARY KEY, list_date TEXT, delist_date TEXT)
+    """)
+    con.execute("INSERT INTO dim_stock VALUES ('OLD.SZ', '20200101', NULL)")
+    for td in _seq_week_end_dates(130, start=(2020, 1, 3)):
+        con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
+    for td in _seq_trade_dates(260):
+        con.execute("INSERT INTO dwd_daily_quote VALUES ('OLD.SZ', ?)", [td])
+    for td in _seq_week_end_dates(50, start=(2025, 1, 3)):
+        con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
+        con.execute("INSERT INTO dwd_weekly_quote VALUES ('OLD.SZ', ?)", [td])
+
+    result = check_data_completeness(
+        con, ["OLD.SZ"], calc_date="20261231", min_daily_rows=250)
+    assert "OLD.SZ" in result["ok"]
+    assert "OLD.SZ" not in result["missing"]
+    assert "OLD.SZ" in result["weekly_fetch"]
+    wf = result["weekly_fetch"]["OLD.SZ"]
+    assert wf["week_end_bars"] == 50
+    assert wf["weekly_required"] == WEEKLY_WARMUP_WEEKS
+    assert wf["available_week_ends"] >= WEEKLY_WARMUP_WEEKS
+
+    con.close()
+
+
 def test_check_data_completeness_batch_results():
     """Robust to both per-stock and batch implementations."""
     import duckdb
@@ -258,6 +358,12 @@ def test_check_data_completeness_batch_results():
         CREATE TABLE dim_date (
             trade_date TEXT PRIMARY KEY, is_trade_day INTEGER, is_week_end INTEGER)
     """)
+    con.execute("""
+        CREATE TABLE dim_stock (
+            ts_code TEXT PRIMARY KEY, list_date TEXT, delist_date TEXT)
+    """)
+    for code in ("A.SZ", "B.SZ", "C.SZ"):
+        con.execute("INSERT INTO dim_stock VALUES (?, '20200101', NULL)", [code])
     # A.SZ: 260 rows (>= 250, OK) + 125 week-end bars (>= 120, OK)
     # B.SZ: 100 rows (< 250, missing)
     # C.SZ: 0 rows (not in DWD at all)
@@ -271,7 +377,7 @@ def test_check_data_completeness_batch_results():
         con.execute("INSERT INTO dwd_daily_quote VALUES ('B.SZ', ?)", (td,))
 
     result = check_data_completeness(
-        con, ["A.SZ", "B.SZ", "C.SZ"], min_daily_rows=250)
+        con, ["A.SZ", "B.SZ", "C.SZ"], calc_date="20261231", min_daily_rows=250)
 
     assert result["ok"] == ["A.SZ"]
     assert "B.SZ" in result["missing"]
@@ -282,8 +388,8 @@ def test_check_data_completeness_batch_results():
     con.close()
 
 
-def test_check_data_completeness_requires_week_end_bars():
-    """dwd_rows 够但 week_end_bars < 120 → missing（weekly_warmup）。"""
+def test_check_data_completeness_mature_low_week_ends_goes_to_weekly_fetch():
+    """成熟股 week-end 不足：ok 可 calc，weekly_fetch 触发 fetch。"""
     import duckdb
     from backend.etl.orchestrator import check_data_completeness, WEEKLY_WARMUP_WEEKS
 
@@ -299,19 +405,76 @@ def test_check_data_completeness_requires_week_end_bars():
             ts_code TEXT PRIMARY KEY, list_date TEXT, delist_date TEXT)
     """)
     con.execute("INSERT INTO dim_stock VALUES ('W.SZ', '20200101', NULL)")
-
+    for td in _seq_week_end_dates(130, start=(2020, 1, 3)):
+        con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
     for td in _seq_trade_dates(260):
         con.execute("INSERT INTO dwd_daily_quote VALUES ('W.SZ', ?)", [td])
     for td in _seq_week_end_dates(50, start=(2025, 1, 3)):
         con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
         con.execute("INSERT INTO dwd_weekly_quote VALUES ('W.SZ', ?)", [td])
 
-    result = check_data_completeness(con, ["W.SZ"], min_daily_rows=250)
-    assert "W.SZ" in result["missing"]
-    assert result["missing"]["W.SZ"]["week_end_bars"] == 50
-    assert result["missing"]["W.SZ"]["reason"] == "weekly_warmup"
+    result = check_data_completeness(
+        con, ["W.SZ"], calc_date="20261231", min_daily_rows=250)
+    assert "W.SZ" in result["ok"]
+    assert "W.SZ" not in result["missing"]
+    assert "W.SZ" in result["weekly_fetch"]
+    assert result["weekly_fetch"]["W.SZ"]["week_end_bars"] == 50
     assert WEEKLY_WARMUP_WEEKS == 120
 
+    con.close()
+
+
+def test_classify_still_missing_includes_week_end_bars_in_detail():
+    from backend.etl.orchestrator import _classify_still_missing
+    from backend.etl.base import SkipReason
+
+    missing = {
+        "X.SZ": {
+            "dwd_rows": 100,
+            "week_end_bars": 50,
+            "weekly_required": 120,
+            "available_week_ends": 130,
+            "min_date": "20250101",
+            "max_date": "20260601",
+            "reason": "daily_warmup",
+        }
+    }
+    classified = _classify_still_missing(None, missing)
+    detail = classified[SkipReason.INSUFFICIENT_ROWS][0][1]
+    assert "week_end_bars=50" in detail
+    assert "50/120" in detail
+
+
+def test_run_calc_skips_rebuild_when_only_weekly_fetch_and_ods_full(monkeypatch):
+    """weekly_fetch + ODS 已满 + to_fetch 空 → 不得 rebuild_all_dwd。"""
+    import duckdb
+    from backend.etl import orchestrator as orch
+
+    con = duckdb.connect(":memory:")
+    rebuild_calls = []
+
+    def fake_rebuild(con, ts_codes=None):
+        rebuild_calls.append(list(ts_codes) if ts_codes else None)
+        return {"daily_quote": 0, "weekly_quote": 0, "moneyflow": 0}
+
+    monkeypatch.setattr(orch, "rebuild_all_dwd", fake_rebuild)
+    monkeypatch.setattr(orch, "_filter_delisted", lambda c, codes, d: (codes, {}))
+    monkeypatch.setattr(orch, "check_data_completeness", lambda c, codes, **kw: {
+        "ok": ["OLD.SZ"],
+        "missing": {},
+        "weekly_fetch": {"OLD.SZ": {"reason": "weekly_warmup", "week_end_bars": 50}},
+    })
+    monkeypatch.setattr(orch, "_compute_fetch_range", lambda *a, **k: (None, None))
+    monkeypatch.setattr(orch, "find_stale_ods_codes", lambda *a, **k: [])
+    monkeypatch.setattr(orch, "_calc_stock_chunk", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start", lambda *a: ("lid", 0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "run_checkpoint", lambda *a: None)
+
+    orch.run_calc(con, ["OLD.SZ"], calc_date="20260605", auto_fetch=True,
+                  skip_stale_fetch=True)
+
+    assert rebuild_calls == []
     con.close()
 
 
