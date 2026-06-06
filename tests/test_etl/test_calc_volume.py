@@ -3,6 +3,109 @@ import numpy as np
 from backend.etl.calc_volume import VolumeCalculator
 
 
+# ── B2 golden-master: frozen pre-vectorization oracles (compacted log-vol) ──
+
+def _oracle_vol_trend(vol_series, window=10):
+    n = len(vol_series)
+    result = [None] * n
+    decay = 0.20
+    for i in range(n):
+        if i < window - 1:
+            continue
+        segment = vol_series[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        valid_pos = valid[valid > 0]
+        if len(valid_pos) < 5:
+            continue
+        log_segment = np.log(valid_pos)
+        m = len(log_segment)
+        x = np.arange(m, dtype=float)
+        weights = np.exp(x * decay)
+        try:
+            slope = float(np.polyfit(x, log_segment, 1, w=weights)[0])
+        except (np.linalg.LinAlgError, ValueError, TypeError):
+            continue
+        if not np.isfinite(slope):
+            continue
+        if slope > 0.008:
+            result[i] = "expanding"
+        elif slope < -0.008:
+            result[i] = "shrinking"
+        else:
+            result[i] = "flat"
+    return result
+
+
+def _oracle_vol_strength(vol_series, window=10):
+    n = len(vol_series)
+    result = np.full(n, np.nan)
+    for i in range(window - 1, n):
+        segment = vol_series[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        valid_pos = valid[valid > 0]
+        if len(valid_pos) < 5:
+            continue
+        log_segment = np.log(valid_pos)
+        m = len(log_segment)
+        x = np.arange(m, dtype=float)
+        weights = np.exp(x * 0.20)
+        try:
+            slope = float(np.polyfit(x, log_segment, 1, w=weights)[0])
+        except (np.linalg.LinAlgError, ValueError, TypeError):
+            continue
+        if not np.isfinite(slope):
+            continue
+        scale = np.mean(np.abs(log_segment))
+        if scale < 1e-6:
+            result[i] = 0.0
+        else:
+            result[i] = slope / scale
+    return result
+
+
+def _rand_vol(rng):
+    vol = rng.lognormal(mean=11.0, sigma=0.5, size=rng.integers(10, 90))
+    r = rng.random()
+    if r < 0.4:  # sprinkle NaNs
+        idx = rng.integers(0, len(vol), size=max(1, len(vol) // 6))
+        vol[idx] = np.nan
+    if r > 0.6:  # sprinkle zeros / negatives
+        idx = rng.integers(0, len(vol), size=max(1, len(vol) // 8))
+        vol[idx] = 0.0
+    return vol
+
+
+def test_vol_trend_matches_oracle_random():
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+    rng = np.random.default_rng(41)
+    for _ in range(60):
+        vol = _rand_vol(rng)
+        assert calc._compute_trend(vol, 10) == _oracle_vol_trend(vol, 10)
+
+
+def test_vol_trend_strength_matches_oracle_random():
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+    rng = np.random.default_rng(43)
+    for _ in range(60):
+        vol = _rand_vol(rng)
+        got = calc._compute_trend_strength(vol, window=10)
+        exp = _oracle_vol_strength(vol, 10)
+        np.testing.assert_array_equal(np.isnan(got), np.isnan(exp))
+        m = ~np.isnan(exp)
+        np.testing.assert_allclose(got[m], exp[m], rtol=0, atol=1e-9)
+
+
+def test_vol_all_positive_full_window_matches_oracle():
+    """Common case: no NaN, all positive → fast path must equal oracle."""
+    calc = VolumeCalculator.__new__(VolumeCalculator)
+    rng = np.random.default_rng(45)
+    vol = rng.lognormal(11.0, 0.4, size=80)
+    assert calc._compute_trend(vol, 10) == _oracle_vol_trend(vol, 10)
+    got = calc._compute_trend_strength(vol, window=10)
+    exp = _oracle_vol_strength(vol, 10)
+    np.testing.assert_allclose(got[~np.isnan(exp)], exp[~np.isnan(exp)], atol=1e-9)
+
+
 def test_ma_vol_5_formula():
     """Verify MA5_vol = SMA(vol, 5)."""
     calc = VolumeCalculator.__new__(VolumeCalculator)
@@ -246,3 +349,22 @@ def test_volume_divergence_dedup():
                 gap = top_indices[j] - top_indices[j - 1]
                 assert gap >= 5, \
                     f"Dedup failed: top_divergence repeated after {gap} days"
+
+
+def test_weekly_pct_vol_rank_with_130_week_end_bars():
+    """130 根 week-end bar 时 pct_vol_rank 末行非 NaN。"""
+    import numpy as np
+    import pandas as pd
+    from backend.etl.calc_volume import VolumeCalculator
+
+    n = 130
+    df = pd.DataFrame({
+        "trade_date": [f"2020{(i // 52) + 1:02d}{(i % 52) + 1:02d}" for i in range(n)],
+        "vol": np.random.uniform(1e6, 5e6, n),
+        "close_qfq": np.linspace(10, 20, n),
+    })
+    calc = VolumeCalculator(con=None, freq="weekly")
+    out = calc._compute_indicators(df)
+    ranks = out["pct_vol_rank"].values
+    assert np.isfinite(ranks[-1])
+    assert out["zone"].iloc[-1] in ("normal", "explosive", "low_volume")

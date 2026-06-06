@@ -480,14 +480,17 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
     for _freq in ["daily", "weekly"]:
         _table = f"dws_{_indicator}_{_freq}"
         _view = f"v_dws_{_indicator}_{_freq}_latest"
+        # Pick the newest snapshot per (ts_code, trade_date). QUALIFY +
+        # ROW_NUMBER() scans the table once, vs the old correlated subquery
+        # that re-ran MAX(calc_date) for every row (O(snapshots) per row).
         _LATEST_VIEW_DDL.append(f"""
             CREATE OR REPLACE VIEW {_view} AS
             SELECT *
-            FROM {_table} d
-            WHERE calc_date = (
-                SELECT MAX(calc_date) FROM {_table}
-                WHERE ts_code = d.ts_code AND trade_date = d.trade_date
-            )
+            FROM {_table}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY ts_code, trade_date
+                ORDER BY calc_date DESC
+            ) = 1
         """)
 
 _V_INDICATOR_AVAILABILITY_DDL = """
@@ -613,6 +616,7 @@ _ADS_WIDE_VIEWS_DDL = [
             WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
             WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
             WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'      THEN '均线走平 — 双斜率近零，方向待定'
             WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
             ELSE NULL
         END              AS ma_alignment,
@@ -713,6 +717,7 @@ _ADS_WIDE_VIEWS_DDL = [
             WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
             WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
             WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'      THEN '均线走平 — 双斜率近零，方向待定'
             WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
             ELSE NULL
         END              AS ma_alignment,
@@ -786,6 +791,7 @@ _ADS_WIDE_VIEWS_DDL = [
             WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
             WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
             WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'      THEN '均线走平 — 双斜率近零，方向待定'
             WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
             ELSE NULL
         END              AS ma_alignment,
@@ -851,6 +857,7 @@ _ADS_WIDE_VIEWS_DDL = [
             WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
             WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
             WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'      THEN '均线走平 — 双斜率近零，方向待定'
             WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
             ELSE NULL
         END              AS ma_alignment,

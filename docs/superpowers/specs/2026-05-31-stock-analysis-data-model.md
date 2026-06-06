@@ -674,6 +674,8 @@ CREATE TABLE dws_volume_daily (
 
 #### 计算口径
 
+**周线窗口说明：** 周线 `dws_volume_weekly` 的 120 窗口指 **120 根 week-end bar**（约 2.5 年），非 120 个交易日。fetch/calc 门禁 `WEEKLY_WARMUP_WEEKS=120` 与 `dim_date.is_week_end=1` 对齐。
+
 **区域判定**（基于 MA5_vol 在近 120 日的百分位）：
 
 | 切换方向 | 条件 | 参数 |
@@ -1965,7 +1967,9 @@ DDY/DDZ 因 tushare 无法提供逐单数据，从方案中移除。
 ### 12.23 增量策略改为 INSERT-only 快照模式（Independent Review 发现）
 
 > DELETE+INSERT 破坏性滑动窗口与 calc_date 回测快照存在架构冲突——DELETE 会销毁旧快照。
-> 改为 INSERT-only：每日跑批只 INSERT 新 calc_date 行，旧 calc_date 永不清除。每只股票最近 60 日 window 内的行每个交易日产出一个新快照，60 日前的行冻结。所有 DWS 表 PK 扩展为 `(ts_code, trade_date, calc_date)`。
+> 改为 INSERT-only：每日跑批只 INSERT 新 calc_date 行。每只股票最近 60 日 window 内的行每个交易日产出一个新快照，60 日前的行冻结。所有 DWS 表 PK 扩展为 `(ts_code, trade_date, calc_date)`。
+>
+> **快照保留策略（2026-06-05 修订）**：原"旧 calc_date 永不清除"导致 DWS 无界增长（实测 12 表 10.96M 行 / 3.1 GB）。改为**窗口保留**：提供 `prune_dws_snapshots(con, keep_runs=N)`（默认 `keep_runs=5`）与 CLI `prune --keep N` 子命令。清理只删除被更新 calc_date 覆盖（superseded）的旧快照行，**绝不删除任一 `(ts_code, trade_date)` 的 `MAX(calc_date)` 行**——因此 `v_*_latest` 视图结果逐行不变（即使指纹跳过导致某键最新值落在旧 calc_date 也安全保留）。`keep_runs=1` 完全坍缩为纯 latest，`>1` 保留最近 N 次运行的审计窗口。清理为逻辑删除 + `CHECKPOINT`（文件内空间复用），不挂进 `run_calc`（避免隐式删除），由运维显式执行。
 
 ### 12.24 dim_stock.sector 推导规则
 
@@ -2135,6 +2139,12 @@ WHERE calc_date = (
 ### 12.55 total_vol 口径说明（Data Architect Review 未优化项）
 
 > dwd_daily_moneyflow.total_vol 选用买入侧求和（buy_sm + buy_md + buy_lg + buy_elg），与 DDX 分子的大单+超大单净买入方向一致。注明了 tushare 买卖分类基于主动方向，两侧合计理论上等价但实际可能有微小偏差。
+
+### 12.56 周划分改用 date_trunc('week')，修正跨年周切分（Data Architect Review 发现）
+
+> 原 `dim_date.is_week_end`（build_dim）与 `dwd_weekly_quote` 滚动周线分区（build_dwd）均用 `strftime(dt, '%Y-%W')` 作为周键。`%Y` 为日历年、`%W` 年初不满一周记为第 `00` 周，导致**跨年自然周被切成两段**（如 2025-12-29 周一~2026-01-02 周五被分为 `2025-52` 与 `2026-00`）。后果：跨年周周线 bar 的 open/high/low/pct_chg/active_days 错误，且该周出现两个 `is_week_end=1`（上一年尾 + 新年头），下游 6 个周线指标在年初多算一根假周末 bar。每年元旦附近发生一次。
+> **修复**：两处统一改为 `date_trunc('week', dt)`（周一锚点，跨年自然周天然归入同一分区）。`week_of_year` 展示字段无下游计算依赖，保留 `%W`。
+> **实库副作用**：需重建 `dim_date` + `dwd_weekly_quote` 并重算周线 DWS，历史跨年周数据才会纠正。
 
 ### 12.56 ods_etl_log DDL 一致性修正（Data Architect Review 未优化项）
 

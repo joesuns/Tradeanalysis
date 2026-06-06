@@ -90,7 +90,7 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
                                      min_trade_date=start, max_trade_date=end)
             rows = fetch_by_date_range_parallel(
                 start or "20150101", end or "20991231", workers=3,
-                ts_codes=ts_codes, con=con)
+                ts_codes=codes, con=con)
             log_etl_end(con, lid, "fetch_market_data", t0, "success",
                         row_count=rows,
                         min_trade_date=start, max_trade_date=end)
@@ -200,10 +200,71 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
 
 
 WARMUP_TDAYS = 250  # max across all indicators: PP250d window (pp120=120, divergence=60, MACD=27)
+WEEKLY_WARMUP_WEEKS = 120  # volume weekly pct_rank/zone window (120 week-end bars)
+
+
+def resolve_weekly_warmup_start(con, end_date: str,
+                                  n_weeks: int = WEEKLY_WARMUP_WEEKS):
+    """Return trade_date of the n_weeks-th week-end bar looking back from end_date."""
+    row = con.execute("""
+        SELECT trade_date FROM (
+            SELECT trade_date,
+                   ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
+            FROM dim_date
+            WHERE is_trade_day = 1 AND is_week_end = 1 AND trade_date <= ?
+        ) WHERE rn = ?
+    """, [end_date, n_weeks]).fetchone()
+    return row[0] if row else None
+
+
+def _needed_history_start(con, end_date: str, list_date: str = None,
+                          daily_lookback: int = WARMUP_TDAYS,
+                          include_weekly: bool = True) -> Optional[str]:
+    """Earliest trade_date required for daily+weekly warmup (more history = smaller date)."""
+    daily_row = con.execute("""
+        SELECT trade_date FROM (
+            SELECT trade_date,
+                   ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
+            FROM dim_date WHERE is_trade_day = 1 AND trade_date <= ?
+        ) WHERE rn = ?
+    """, [end_date, daily_lookback]).fetchone()
+    daily_start = daily_row[0] if daily_row else None
+
+    weekly_start = None
+    if include_weekly and daily_lookback == WARMUP_TDAYS:
+        weekly_start = resolve_weekly_warmup_start(con, end_date)
+
+    if daily_start and weekly_start:
+        needed = min(daily_start, weekly_start)
+    else:
+        needed = daily_start or weekly_start
+    if not needed:
+        return None
+    if list_date and list_date > needed:
+        return list_date
+    return needed
+
+
+def _count_week_end_bars_batch(con, ts_codes: list[str]) -> dict:
+    if not ts_codes:
+        return {}
+    try:
+        placeholders = ",".join(["?" for _ in ts_codes])
+        rows = con.execute(f"""
+            SELECT w.ts_code, COUNT(*)
+            FROM dwd_weekly_quote w
+            JOIN dim_date d ON w.trade_date = d.trade_date AND d.is_week_end = 1
+            WHERE w.ts_code IN ({placeholders})
+            GROUP BY w.ts_code
+        """, ts_codes).fetchall()
+        return {r[0]: r[1] for r in rows}
+    except Exception:
+        return {}
 
 
 def check_data_completeness(con, ts_codes: list[str],
-                             min_daily_rows: int = WARMUP_TDAYS) -> dict:
+                             min_daily_rows: int = WARMUP_TDAYS,
+                             min_week_end_bars: int = WEEKLY_WARMUP_WEEKS) -> dict:
     """检查指定股票在 DWD 层的数据完整度。
 
     返回:
@@ -236,19 +297,141 @@ def check_data_completeness(con, ts_codes: list[str],
     dwd_data = {r[0]: {"dwd_rows": r[1], "min_date": r[2], "max_date": r[3]}
                 for r in rows}
 
+    week_end_counts = _count_week_end_bars_batch(con, ts_codes)
+
     for ts_code in ts_codes:
         info = dwd_data.get(ts_code)
-        if info is not None and info["dwd_rows"] >= min_daily_rows:
+        dwd_rows = info["dwd_rows"] if info else 0
+        week_end_bars = week_end_counts.get(ts_code, 0)
+        daily_ok = info is not None and dwd_rows >= min_daily_rows
+        weekly_ok = week_end_bars >= min_week_end_bars
+
+        if daily_ok and weekly_ok:
             ok.append(ts_code)
         else:
+            if not daily_ok and not weekly_ok:
+                reason = "both"
+            elif not daily_ok:
+                reason = "daily_warmup"
+            else:
+                reason = "weekly_warmup"
             missing[ts_code] = {
-                "dwd_rows": info["dwd_rows"] if info else 0,
+                "dwd_rows": dwd_rows,
+                "week_end_bars": week_end_bars,
                 "min_date": info["min_date"] if info else None,
                 "max_date": info["max_date"] if info else None,
+                "reason": reason,
             }
 
     return {"ok": ok, "missing": missing}
 
+
+def find_stale_ods_codes(con, ts_codes: list[str], analysis_date: str) -> list[str]:
+    """Stocks that should have ODS through analysis_date but do not."""
+    if not ts_codes:
+        return []
+
+    placeholders = ",".join(["?" for _ in ts_codes])
+    params = list(ts_codes) + list(ts_codes)
+    rows = con.execute(f"""
+        SELECT s.ts_code, s.list_date, s.delist_date, o.ods_max
+        FROM dim_stock s
+        LEFT JOIN (
+            SELECT ts_code, MAX(trade_date) AS ods_max
+            FROM ods_daily
+            WHERE ts_code IN ({placeholders})
+            GROUP BY ts_code
+        ) o ON s.ts_code = o.ts_code
+        WHERE s.ts_code IN ({placeholders})
+    """, params).fetchall()
+
+    stale = []
+    for ts_code, list_date, delist_date, ods_max in rows:
+        if list_date and list_date > analysis_date:
+            continue
+        if delist_date and delist_date < analysis_date:
+            continue
+        if not ods_max or ods_max < analysis_date:
+            stale.append(ts_code)
+    return stale
+
+
+def find_stale_dwd_codes(con, ts_codes: list[str], analysis_date: str) -> list[str]:
+    """Stocks with ODS on analysis_date but DWD max trade_date behind."""
+    if not ts_codes:
+        return []
+
+    placeholders = ",".join(["?" for _ in ts_codes])
+    rows = con.execute(f"""
+        SELECT o.ts_code
+        FROM ods_daily o
+        LEFT JOIN (
+            SELECT ts_code, MAX(trade_date) AS dwd_max
+            FROM dwd_daily_quote
+            WHERE ts_code IN ({placeholders})
+            GROUP BY ts_code
+        ) d ON o.ts_code = d.ts_code
+        WHERE o.trade_date = ?
+          AND o.ts_code IN ({placeholders})
+          AND (d.dwd_max IS NULL OR d.dwd_max < ?)
+    """, list(ts_codes) + [analysis_date] + list(ts_codes) + [analysis_date]).fetchall()
+    return [r[0] for r in rows]
+
+
+def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str) -> int:
+    """Fetch missing tail ODS for stale stocks; rebuild their DWD."""
+    from backend.fetch.ods_daily import fetch_stocks_incremental
+
+    if not stale_codes:
+        return 0
+
+    placeholders = ",".join(["?" for _ in stale_codes])
+    max_rows = con.execute(f"""
+        SELECT ts_code, MAX(trade_date) FROM ods_daily
+        WHERE ts_code IN ({placeholders})
+        GROUP BY ts_code
+    """, stale_codes).fetchall()
+    ods_max = {r[0]: r[1] for r in max_rows}
+
+    gap_starts = []
+    for ts_code in stale_codes:
+        max_ods = ods_max.get(ts_code)
+        if not max_ods:
+            row = con.execute(
+                "SELECT list_date FROM dim_stock WHERE ts_code = ?", (ts_code,)
+            ).fetchone()
+            gap_starts.append(row[0] if row and row[0] else analysis_date)
+            continue
+        next_day = con.execute("""
+            SELECT MIN(trade_date) FROM dim_date
+            WHERE is_trade_day = 1 AND trade_date > ? AND trade_date <= ?
+        """, (max_ods, analysis_date)).fetchone()[0]
+        gap_starts.append(next_day or analysis_date)
+
+    seg_start = min(gap_starts)
+    tdays = _count_trading_days(con, seg_start, analysis_date)
+    client = TushareClient()
+
+    if _choose_fetch_strategy(len(stale_codes), tdays):
+        logger.info(
+            "Stale auto-fetch [%s~%s]: %d stocks, %d tdays → date-batched",
+            seg_start, analysis_date, len(stale_codes), tdays,
+        )
+        n_fetched = fetch_by_date_range_parallel(
+            seg_start, analysis_date, workers=3,
+            ts_codes=stale_codes, con=con,
+        )
+    else:
+        logger.info(
+            "Stale auto-fetch [%s~%s]: %d stocks, %d tdays → stock-batched",
+            seg_start, analysis_date, len(stale_codes), tdays,
+        )
+        n_fetched = fetch_stocks_incremental(
+            client, con, stale_codes, start=seg_start, end=analysis_date)
+
+    logger.info("Rebuilding DWD for %d stale stocks", len(stale_codes))
+    rebuild_all_dwd(con, stale_codes)
+    return n_fetched
 
 
 def _compute_fetch_range(con, ts_code: str, calc_date: str,
@@ -274,22 +457,17 @@ def _compute_fetch_range(con, ts_code: str, calc_date: str,
     if delist_date and delist_date < calc_date:
         end_date = delist_date
 
-    # 3. needed start: end_date往前推lookback_tdays个交易日
-    needed = con.execute("""
-        SELECT trade_date FROM (
-            SELECT trade_date, ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
-            FROM dim_date WHERE is_trade_day = 1 AND trade_date <= ?
-        ) WHERE rn = ?
-    """, (end_date, lookback_tdays)).fetchone()
-    needed_start = needed[0] if needed else None
+    # 3. needed start: daily + weekly warmup (weekly only when using default lookback)
+    include_weekly = (lookback_tdays == WARMUP_TDAYS)
+    needed_start = _needed_history_start(
+        con, end_date, list_date,
+        daily_lookback=lookback_tdays,
+        include_weekly=include_weekly,
+    )
     if not needed_start:
         return (None, None)
 
-    # 4. clamp to list_date
-    if list_date and list_date > needed_start:
-        needed_start = list_date
-
-    # 5. check if already covered by existing ODS data
+    # 4. check if already covered by existing ODS data
     actual = con.execute("""
         SELECT COUNT(DISTINCT trade_date) FROM ods_daily
         WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ?
@@ -443,14 +621,16 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str) -> int:
 
 
 def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
-             batch_size: int = 100):
+             batch_size: int = 100, calc_date: str = None,
+             skip_stale_fetch: bool = False):
     """执行 DWS 计算流程。
 
     1. 如果未指定 ts_codes，获取全市场活跃股票
     2. 退市股过滤
-    3. 数据完整度检查
-    4. 缺数据 → auto_fetch 补拉（warmup=27 tdays，熔断器：连续5次失败中止）
-    5. 逐 Calculator 计算 DWS
+    3. 数据完整度检查（warmup >= WARMUP_TDAYS）
+    4. 缺 warmup → auto_fetch 补拉（熔断器：连续5次失败中止）
+    5. stale ODS（max < calc_date）→ date/stock-batched 补 latest day（可 skip）
+    6. 逐 Calculator 计算 DWS
     """
     import time
     from datetime import datetime
@@ -466,8 +646,8 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         logger.warning("No stocks to calculate")
         return
 
-    # 0. 退市股过滤
-    calc_date = datetime.now().strftime("%Y%m%d")
+    if calc_date is None:
+        calc_date = datetime.now().strftime("%Y%m%d")
     ts_codes, delisted = _filter_delisted(con, ts_codes, calc_date)
     if delisted:
         classified = {SkipReason.DELISTED: [(c, d) for c, d in delisted.items()]}
@@ -483,8 +663,17 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     if completeness["missing"]:
         missing_codes = list(completeness["missing"].keys())
         missing_pct = len(missing_codes) * 100.0 / len(ts_codes)
-        logger.info("DWD completeness: %d/%d stocks (%.1f%%) lack sufficient data (< %d rows)",
-                    len(missing_codes), len(ts_codes), missing_pct, WARMUP_TDAYS)
+        logger.info(
+            "DWD completeness: %d/%d stocks (%.1f%%) lack sufficient data "
+            "(daily>=%d rows, weekly>=%d week-ends)",
+            len(missing_codes), len(ts_codes), missing_pct,
+            WARMUP_TDAYS, WEEKLY_WARMUP_WEEKS,
+        )
+        reason_counts = {}
+        for c in missing_codes:
+            r = completeness["missing"][c].get("reason", "unknown")
+            reason_counts[r] = reason_counts.get(r, 0) + 1
+        logger.info("Missing breakdown by reason: %s", reason_counts)
 
         if auto_fetch:
             # Compute per-stock fetch ranges based on warmup
@@ -574,6 +763,25 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 completeness = check_data_completeness(con, ts_codes)
         else:
             logger.info("Auto-fetch disabled. Skipping %d stocks.", len(missing_codes))
+
+    # 1b. Stale ODS tail — stocks with warmup OK but missing latest trade_date
+    if auto_fetch and not skip_stale_fetch:
+        stale_ods = find_stale_ods_codes(con, ts_codes, calc_date)
+        if stale_ods:
+            logger.info(
+                "Stale ODS: %d/%d stocks missing data through %s",
+                len(stale_ods), len(ts_codes), calc_date,
+            )
+            n_stale = _auto_fetch_stale_ods(con, stale_ods, calc_date)
+            logger.info("Stale auto-fetch complete: %d ODS rows", n_stale)
+        else:
+            stale_dwd = find_stale_dwd_codes(con, ts_codes, calc_date)
+            if stale_dwd:
+                logger.info(
+                    "Stale DWD: %d stocks have ODS on %s but DWD behind — rebuilding",
+                    len(stale_dwd), calc_date,
+                )
+                rebuild_all_dwd(con, stale_dwd)
 
     # 2. 分类仍缺失的股票 + 写 skip_log
     if completeness["missing"]:
