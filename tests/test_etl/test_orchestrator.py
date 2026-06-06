@@ -1,7 +1,23 @@
 """Tests for backend/etl/orchestrator.py — auto-fetch strategy selection."""
 
 import duckdb
+from datetime import date, timedelta
+
 from backend.etl.orchestrator import _count_trading_days, _choose_fetch_strategy
+
+
+def _seq_trade_dates(n, start=(2026, 1, 1)):
+    """Return n consecutive valid YYYYMMDD strings from start."""
+    y, m, d = start
+    base = date(y, m, d)
+    return [(base + timedelta(days=i)).strftime("%Y%m%d") for i in range(n)]
+
+
+def _seq_week_end_dates(n, start=(2024, 1, 5)):
+    """Return n week-end YYYYMMDD strings spaced 7 calendar days apart."""
+    y, m, d = start
+    base = date(y, m, d)
+    return [(base + timedelta(days=7 * i)).strftime("%Y%m%d") for i in range(n)]
 
 
 def test_count_trading_days_basic():
@@ -245,16 +261,14 @@ def test_check_data_completeness_batch_results():
     # A.SZ: 260 rows (>= 250, OK) + 125 week-end bars (>= 120, OK)
     # B.SZ: 100 rows (< 250, missing)
     # C.SZ: 0 rows (not in DWD at all)
-    week_dates = [f"2024{i:04d}" for i in range(1000, 1125)]
+    week_dates = _seq_week_end_dates(125)
     for d in week_dates:
         con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [d])
         con.execute("INSERT INTO dwd_weekly_quote VALUES ('A.SZ', ?)", [d])
-    for i in range(260):
-        con.execute("INSERT INTO dwd_daily_quote VALUES ('A.SZ', ?)",
-                    (f"2026{i//12:02d}{i%12+1:02d}",))
-    for i in range(100):
-        con.execute("INSERT INTO dwd_daily_quote VALUES ('B.SZ', ?)",
-                    (f"2026{i//12:02d}{i%12+1:02d}",))
+    for td in _seq_trade_dates(260):
+        con.execute("INSERT INTO dwd_daily_quote VALUES ('A.SZ', ?)", (td,))
+    for td in _seq_trade_dates(100):
+        con.execute("INSERT INTO dwd_daily_quote VALUES ('B.SZ', ?)", (td,))
 
     result = check_data_completeness(
         con, ["A.SZ", "B.SZ", "C.SZ"], min_daily_rows=250)
@@ -286,11 +300,9 @@ def test_check_data_completeness_requires_week_end_bars():
     """)
     con.execute("INSERT INTO dim_stock VALUES ('W.SZ', '20200101', NULL)")
 
-    for i in range(260):
-        td = f"2026{i//12:02d}{i%12+1:02d}"
+    for td in _seq_trade_dates(260):
         con.execute("INSERT INTO dwd_daily_quote VALUES ('W.SZ', ?)", [td])
-    for i in range(50):
-        td = f"2025{i+1:02d}05"
+    for td in _seq_week_end_dates(50, start=(2025, 1, 3)):
         con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
         con.execute("INSERT INTO dwd_weekly_quote VALUES ('W.SZ', ?)", [td])
 
