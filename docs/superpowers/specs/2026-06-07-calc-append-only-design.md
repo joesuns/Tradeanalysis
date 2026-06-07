@@ -53,17 +53,20 @@
 CREATE TABLE dws_calc_state (
     ts_code          VARCHAR NOT NULL,
     freq             VARCHAR NOT NULL,       -- 'daily' | 'weekly'
+    indicator        VARCHAR NOT NULL,       -- 'macd' | 'ma' | 'kpattern' | 'dde' | 'volume' | 'price_position'
     last_trade_date  VARCHAR NOT NULL,       -- 该股已写入 DWS 的最新 bar
     history_fp       VARCHAR NOT NULL,       -- [load_start, last_trade_date] 强签名
     quote_latest_adj DOUBLE,                 -- 上次计算的 latest_adj（除权快速预筛，可选优化）
     spec_version     VARCHAR DEFAULT 'v1',
     updated_calc_date VARCHAR NOT NULL,
-    PRIMARY KEY (ts_code, freq)
+    PRIMARY KEY (ts_code, freq, indicator)
 );
 ```
 
-- 一行 per `(ts_code, freq)`。日线/周线各一份。
+- 一行 per `(ts_code, freq, indicator)`。每指标独立判定，用各自 `SIGNATURE_COLS`，避免跨指标误 FULL。
+  - 例：KPattern 签名含 `vol`，MA 签名仅含 `close_qfq`。复权日 KPattern 触发 FULL，MA 可能仍 APPEND，两者互不干扰。
 - 缺失（首次部署 / 新股）→ 视为「无基线」→ 走 FULL 建立状态，之后转 APPEND。
+- 各计算器通过类属性 `SIGNATURE_COLS` 声明签名列，`append_calculate` 与路由器共用同一份定义。
 
 ### 4.1 强签名 `history_fp`
 
