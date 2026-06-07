@@ -5,7 +5,8 @@ import pandas as pd
 from backend.etl.base import (
     sma, to_float_safe, linear_regression_slope, weighted_window_slopes,
     insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
-    load_latest_fingerprints, load_quote_groups, SkipReason, CalcResult,
+    load_latest_fingerprints, load_quote_groups, compute_history_signature,
+    SkipReason, CalcResult,
 )
 from backend.etl.recalc_spec import RecalcSpec
 
@@ -220,6 +221,27 @@ class MACalculator:
                         else:
                             result[i] = "near_dead"
 
+        return result
+
+    def _compute_indicators_append(self, df: pd.DataFrame, new_bars: list) -> pd.DataFrame:
+        """Compute MA indicators over the full tail-window df; caller writes only new_bars.
+
+        MA5/MA10 and all derived indicators (bias, slope, alignment, turning point)
+        are causal rolling: a bar's value depends only on its preceding N bars.
+        With a tail window >= 10 bars of warmup, append values equal FULL by
+        construction.
+        """
+        return self._compute_indicators(df)
+
+    def append_calculate(self, ts_code: str, df: pd.DataFrame, new_bars: list,
+                         calc_date: str, state: dict) -> "CalcResult":
+        """APPEND mode: compute over full tail window, write only new_bars."""
+        result = CalcResult()
+        df = self._compute_indicators_append(df, new_bars)
+        fp = compute_history_signature(df, ["close_qfq"])
+        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                     write_start=new_bars[0], write_end=new_bars[-1])
+        result.calculated += 1
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
