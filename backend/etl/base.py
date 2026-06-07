@@ -335,6 +335,32 @@ def compute_fingerprint(df: "pd.DataFrame", float_cols: list[str] = None) -> str
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def compute_history_signature(df: "pd.DataFrame", cols: list,
+                              precision: int = 6) -> str:
+    """Strong content signature over actual value sequences (not summary stats).
+
+    Hashes the row-ordered, rounded values of ``cols`` (+ trade_date) so any
+    real value change flips the signature, while sub-precision float noise does
+    not. Replaces the lossy min/max/mean/count fingerprint for state gating.
+    """
+    if df is None or df.empty:
+        return hashlib.sha256(b"empty").hexdigest()[:16]
+    parts = []
+    td = df["trade_date"].astype(str).tolist()
+    parts.append("td:" + ",".join(td))
+    for col in sorted(cols):
+        if col not in df.columns:
+            parts.append(f"{col}:absent")
+            continue
+        vals = df[col].to_numpy(dtype=float)
+        rounded = np.where(np.isnan(vals), np.nan, np.round(vals, precision))
+        parts.append(f"{col}:" + ",".join(
+            "nan" if np.isnan(v) else format(v, f".{precision}f") for v in rounded
+        ))
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 def compute_input_fingerprint(df: "pd.DataFrame",
                               recalc_start: "Optional[str]" = None) -> str:
     """Strategy-A domain fingerprint: last_trade_date + window subset hash.

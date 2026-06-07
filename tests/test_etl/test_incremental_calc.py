@@ -722,3 +722,38 @@ def test_load_latest_fingerprints_picks_latest_trade_date_on_tie():
     fps = load_latest_fingerprints(con, "dws_x", ["A.SZ"])
     assert fps["A.SZ"] == "NEW"
     con.close()
+
+
+def test_history_signature_detects_value_change_summary_stats_stable():
+    import pandas as pd
+    from backend.etl.base import compute_history_signature
+    df1 = pd.DataFrame({
+        "trade_date": ["20260101", "20260102", "20260103"],
+        "close_qfq": [10.0, 20.0, 30.0],
+        "vol": [100.0, 200.0, 300.0],
+    })
+    df2 = pd.DataFrame({
+        "trade_date": ["20260101", "20260102", "20260103"],
+        "close_qfq": [20.0, 10.0, 30.0],
+        "vol": [100.0, 200.0, 300.0],
+    })
+    cols = ["close_qfq", "vol"]
+    assert compute_history_signature(df1, cols) != compute_history_signature(df2, cols)
+
+
+def test_history_signature_stable_under_float_noise_below_precision():
+    import pandas as pd
+    from backend.etl.base import compute_history_signature
+    df1 = pd.DataFrame({"trade_date": ["20260101"], "close_qfq": [10.0000001], "vol": [100.0]})
+    df2 = pd.DataFrame({"trade_date": ["20260101"], "close_qfq": [10.0000002], "vol": [100.0]})
+    cols = ["close_qfq", "vol"]
+    assert compute_history_signature(df1, cols) == compute_history_signature(df2, cols)
+
+
+def test_history_signature_changes_on_real_change():
+    import pandas as pd
+    from backend.etl.base import compute_history_signature
+    df1 = pd.DataFrame({"trade_date": ["20260101"], "close_qfq": [10.0], "vol": [100.0]})
+    df2 = pd.DataFrame({"trade_date": ["20260101"], "close_qfq": [10.5], "vol": [100.0]})
+    assert compute_history_signature(df1, ["close_qfq", "vol"]) != \
+           compute_history_signature(df2, ["close_qfq", "vol"])
