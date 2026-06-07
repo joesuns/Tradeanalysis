@@ -956,6 +956,18 @@ def _create_dws(con: duckdb.DuckDBPyConnection):
         for name, ddl in _DWS_DDL.items():
             table = f"dws_{name}_{freq}"
             con.execute(ddl.format(table=table))
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS dws_calc_state (
+            ts_code           VARCHAR NOT NULL,
+            freq              VARCHAR NOT NULL,
+            last_trade_date   VARCHAR NOT NULL,
+            history_fp        VARCHAR NOT NULL,
+            quote_latest_adj  DOUBLE,
+            spec_version      VARCHAR DEFAULT 'v1',
+            updated_calc_date VARCHAR NOT NULL,
+            PRIMARY KEY (ts_code, freq)
+        )
+    """)
 
 
 def drop_all_tables(con: duckdb.DuckDBPyConnection):
@@ -979,6 +991,7 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
         [f"dws_{ind}_{freq}"
          for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
          for freq in ["daily", "weekly"]]
+        + ["dws_calc_state"]
         # DWD (3)
         + ["dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
         # DIM (4) — FK tables first
