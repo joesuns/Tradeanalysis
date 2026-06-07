@@ -10,6 +10,7 @@ Usage:
 import logging
 import multiprocessing
 import os
+import threading
 import time
 from typing import Optional
 from datetime import datetime
@@ -676,15 +677,65 @@ def _write_skip_log_batch(con, calc_date: str, indicator: str, freq: str,
         )
 
 
+def _route_calc(con, calc, name: str, freq: str, ts_code: str, df,
+                calc_date: str, recalc_start: Optional[str],
+                quote_groups, append_on: bool) -> CalcResult:
+    """Route one (calculator, freq) to SKIP / APPEND / FULL and refresh state.
+
+    APPEND computes only new bars (vectorized, seeded); FULL is the existing
+    narrow-window recompute (and the equivalence oracle); SKIP is taken when no
+    new bar appeared and the fixed-window history signature is unchanged.
+    State (dws_calc_state) is refreshed only when a write actually happened.
+    """
+    from backend.etl.calc_state import load_calc_state, upsert_calc_state
+    from backend.etl.calc_router import classify_calc_mode, state_signature
+
+    def _full() -> CalcResult:
+        if name == "dde":
+            return calc.calculate([ts_code], calc_date, recalc_start=recalc_start)
+        return calc.calculate([ts_code], calc_date, recalc_start=recalc_start,
+                              quote_groups=quote_groups)
+
+    if not append_on or df is None or len(df) == 0:
+        return _full()
+
+    state = load_calc_state(con, freq, name, [ts_code]).get(ts_code)
+    mode, new_bars = classify_calc_mode(df, state, calc.SIGNATURE_COLS)
+
+    if mode == "SKIP":
+        r = CalcResult()
+        r.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
+                   "append: no new bars, signature match")
+        return r
+
+    if mode == "APPEND":
+        result = calc.append_calculate(ts_code, df, new_bars, calc_date, state)
+    else:  # FULL
+        result = _full()
+
+    # Only establish/refresh state when a write actually happened. A FULL that
+    # the calculator skipped (e.g. insufficient rows) leaves no baseline, so
+    # next run re-routes to FULL rather than appending onto nothing.
+    if mode == "APPEND" or result.calculated > 0:
+        max_td = str(df["trade_date"].max())
+        fp = state_signature(df, max_td, calc.SIGNATURE_COLS)
+        upsert_calc_state(con, ts_code, freq, name, last_trade_date=max_td,
+                          history_fp=fp, calc_date=calc_date)
+    return result
+
+
 def calc_stock_pipeline(con, ts_code: str, calc_date: str,
                         daily_recalc: Optional[str] = None,
                         weekly_recalc: Optional[str] = None) -> list:
     """Run all 12 indicator×freq calcs for one stock with shared quote loads.
 
-    Returns list of (indicator_name, freq, CalcResult) tuples.
+    Each (indicator, freq) is routed SKIP / APPEND / FULL by _route_calc when
+    CALC_APPEND is on and an incremental window is active. Returns a list of
+    (indicator_name, freq, CalcResult) tuples.
     """
     from backend.etl.base import load_quote_groups
     from backend.etl.recalc_spec import resolve_load_start
+    from backend.config import CALC_APPEND
 
     outputs = []
     for freq, recalc_start in (("daily", daily_recalc), ("weekly", weekly_recalc)):
@@ -695,21 +746,67 @@ def calc_stock_pipeline(con, ts_code: str, calc_date: str,
         quote_groups = load_quote_groups(
             con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=load_start,
         )
+        append_on = CALC_APPEND and recalc_start is not None
+        qdf = quote_groups.get(ts_code)
 
         for CalcCls in QUOTE_CALCULATORS:
             calc = CalcCls(con, freq)
             name = CalcCls.__name__.replace("Calculator", "").lower()
-            result = calc.calculate(
-                [ts_code], calc_date, recalc_start=recalc_start,
-                quote_groups=quote_groups,
-            )
+            result = _route_calc(con, calc, name, freq, ts_code, qdf, calc_date,
+                                 recalc_start, quote_groups, append_on)
             outputs.append((name, freq, result))
 
         dde = DDECalculator(con, freq)
-        result = dde.calculate([ts_code], calc_date, recalc_start=recalc_start)
+        if freq == "daily":
+            dde_groups = dde._load_daily_batch([ts_code], start_date=load_start)
+        else:
+            dde_groups = dde._load_weekly_batch([ts_code], start_date=load_start)
+        ddf = dde_groups.get(ts_code)
+        result = _route_calc(con, dde, "dde", freq, ts_code, ddf, calc_date,
+                             recalc_start, None, append_on)
         outputs.append(("dde", freq, result))
 
     return outputs
+
+
+_calc_progress_lock = threading.Lock()
+_calc_progress = {"done": 0, "total": 0, "t0": 0.0, "step": 1}
+
+
+def _init_calc_progress(total: int) -> None:
+    """Reset the shared calc progress counter before a multi-threaded run.
+
+    Count-throttled at ~5% (step = total // 20) so the per-stock heartbeat
+    emits ~20 progress lines instead of going silent for the whole calc phase.
+    """
+    with _calc_progress_lock:
+        _calc_progress["done"] = 0
+        _calc_progress["total"] = total
+        _calc_progress["t0"] = time.monotonic()
+        _calc_progress["step"] = max(1, total // 20)
+
+
+def _report_calc_progress() -> None:
+    """Thread-safe per-stock tick. Logs every ~5% of stocks with rate + ETA.
+
+    Called once per stock by every worker thread; threads share one counter so
+    the reported progress is the true global total, not per-chunk.
+    """
+    with _calc_progress_lock:
+        _calc_progress["done"] += 1
+        done = _calc_progress["done"]
+        total = _calc_progress["total"]
+        step = _calc_progress["step"]
+        if total <= 0 or (done % step != 0 and done != total):
+            return
+        elapsed = time.monotonic() - _calc_progress["t0"]
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (total - done) / rate if rate > 0 else 0.0
+        pct = done * 100 // total
+    logger.info(
+        "calc progress: %d/%d (%d%%) | %.0fs | %.1f stk/s | ETA ~%.0fs",
+        done, total, pct, elapsed, rate, eta,
+    )
 
 
 def _count_calc_rows(con, table: str, calc_date: str, ts_codes: list) -> int:
@@ -754,6 +851,7 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                 for reason, items in result.skipped.items():
                     for code, detail in items:
                         agg.add_skip(reason, code, detail)
+            _report_calc_progress()
 
         chunk_total = 0
         for CalcCls in CALCULATORS:
@@ -976,6 +1074,7 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     logger.info("calc %d stocks with %d threads (%d stocks/chunk)",
                 len(codes_to_calc), workers, chunk_size)
 
+    _init_calc_progress(len(codes_to_calc))
     lid, t0 = log_etl_start(con, "calc_dws")
     calc_start = time.monotonic()
 
