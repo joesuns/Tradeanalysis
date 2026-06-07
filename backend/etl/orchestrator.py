@@ -901,6 +901,12 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     from backend.fetch.ods_daily import fetch_stocks_incremental
     from backend.etl.error_handler import log_etl_start, log_etl_end
     from backend.db.connection import run_checkpoint
+    from backend.db.schema import ensure_calc_state_table
+
+    # Append-only routing reads/writes dws_calc_state from per-stock worker
+    # connections that don't run schema init. Ensure it exists on the main
+    # connection first so DBs created before this table get it (idempotent).
+    ensure_calc_state_table(con)
 
     if ts_codes is None:
         ts_codes = get_all_active_codes(con)

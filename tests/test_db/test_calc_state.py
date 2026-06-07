@@ -1,5 +1,21 @@
 import duckdb
-from backend.db.schema import create_all_tables
+from backend.db.schema import create_all_tables, ensure_calc_state_table
+
+
+def test_ensure_calc_state_table_creates_on_bare_db_and_is_idempotent():
+    """Mirrors a production DB created before dws_calc_state existed: the guard
+    must create it, and calling twice must not error (CREATE IF NOT EXISTS)."""
+    con = duckdb.connect(":memory:")
+    exists = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'dws_calc_state'"
+    ).fetchone()[0]
+    assert exists == 0
+    ensure_calc_state_table(con)
+    ensure_calc_state_table(con)  # idempotent
+    cols = {r[1] for r in con.execute("PRAGMA table_info('dws_calc_state')").fetchall()}
+    assert {"ts_code", "freq", "indicator", "history_fp"} <= cols
+    con.close()
 
 
 def test_dws_calc_state_table_exists_with_pk():

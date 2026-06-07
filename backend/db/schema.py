@@ -950,25 +950,37 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     con.execute(_V_DATA_FRESHNESS_DDL)
 
 
+_DWS_CALC_STATE_DDL = """
+    CREATE TABLE IF NOT EXISTS dws_calc_state (
+        ts_code           VARCHAR NOT NULL,
+        freq              VARCHAR NOT NULL,
+        indicator         VARCHAR NOT NULL,
+        last_trade_date   VARCHAR NOT NULL,
+        history_fp        VARCHAR NOT NULL,
+        quote_latest_adj  DOUBLE,
+        spec_version      VARCHAR DEFAULT 'v1',
+        updated_calc_date VARCHAR NOT NULL,
+        PRIMARY KEY (ts_code, freq, indicator)
+    )
+"""
+
+
+def ensure_calc_state_table(con: duckdb.DuckDBPyConnection):
+    """Idempotently create dws_calc_state (append-only calc routing state).
+
+    Called at calc startup so an existing DB created before this table was
+    added gets it without a manual schema re-init. CREATE TABLE IF NOT EXISTS.
+    """
+    con.execute(_DWS_CALC_STATE_DDL)
+
+
 def _create_dws(con: duckdb.DuckDBPyConnection):
-    """Create all 10 DWS tables from templates."""
+    """Create all 12 DWS tables from templates + the calc-state table."""
     for freq in ("daily", "weekly"):
         for name, ddl in _DWS_DDL.items():
             table = f"dws_{name}_{freq}"
             con.execute(ddl.format(table=table))
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS dws_calc_state (
-            ts_code           VARCHAR NOT NULL,
-            freq              VARCHAR NOT NULL,
-            indicator         VARCHAR NOT NULL,
-            last_trade_date   VARCHAR NOT NULL,
-            history_fp        VARCHAR NOT NULL,
-            quote_latest_adj  DOUBLE,
-            spec_version      VARCHAR DEFAULT 'v1',
-            updated_calc_date VARCHAR NOT NULL,
-            PRIMARY KEY (ts_code, freq, indicator)
-        )
-    """)
+    ensure_calc_state_table(con)
 
 
 def drop_all_tables(con: duckdb.DuckDBPyConnection):
