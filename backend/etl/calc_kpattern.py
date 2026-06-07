@@ -3,9 +3,11 @@ import logging
 import numpy as np
 import pandas as pd
 from backend.etl.base import (
-    sma, to_float_safe, insert_dws_batch, compute_fingerprint, check_dwd_unchanged,
+    sma, to_float_safe, insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
+    load_latest_fingerprints, load_quote_groups, compute_history_signature,
     SkipReason, CalcResult,
 )
+from backend.etl.recalc_spec import RecalcSpec
 from backend.kpattern_params import KPATTERN_PARAMS
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,9 @@ class KPatternCalculator:
     Works for both daily and weekly frequencies.
     """
 
+    RECALC_SPEC_DAILY = RecalcSpec(lookback=60, seed=10, event_tail=5, min_rows=30)
+    RECALC_SPEC_WEEKLY = RecalcSpec(lookback=60, seed=10, event_tail=5, min_rows=30)
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
@@ -25,18 +30,28 @@ class KPatternCalculator:
         self.src_table = src
         self.dws_table = f"dws_kpattern_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+    def calculate(self, ts_codes: list[str], calc_date: str,
+                  recalc_start: str = None,
+                  quote_groups: dict = None) -> CalcResult:
         result = CalcResult()
         min_rows = KPATTERN_PARAMS["common"]["min_data_rows"]
+        latest_fps = load_latest_fingerprints(self.con, self.dws_table, ts_codes)
+        if quote_groups is None:
+            load_start = None
+            if recalc_start:
+                from backend.etl.recalc_spec import resolve_load_start
+                load_start = resolve_load_start(self.con, recalc_start, self.freq)
+            groups = load_quote_groups(
+                self.con, self.src_table, self.freq,
+                ["trade_date", "open_qfq", "high_qfq", "low_qfq",
+                 "close_qfq", "vol", "pct_chg"], ts_codes,
+                start_date=load_start)
+        else:
+            groups = quote_groups
         for ts_code in ts_codes:
-            df = self.con.execute(f"""
-                SELECT trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, pct_chg
-                FROM {self.src_table} WHERE ts_code = ?
-                {'' if self.freq == 'weekly' else 'AND is_suspended = 0'}
-                ORDER BY trade_date
-            """, (ts_code,)).df()
+            df = groups.get(ts_code)
 
-            if df.empty:
+            if df is None or df.empty:
                 logger.debug("KPattern %s skip %s: no DWD data", self.freq, ts_code)
                 result.add_skip(SkipReason.NO_DWD_DATA, ts_code, "DWD returned 0 rows")
                 continue
@@ -47,15 +62,18 @@ class KPatternCalculator:
                                 f"DWD rows={len(df)}, min={min_rows}")
                 continue
 
-            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df):
+            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df,
+                                   latest_fps=latest_fps, recalc_start=recalc_start):
                 result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
                                 "DWD fingerprint match")
                 continue
 
-            fp = compute_fingerprint(df)
+            fp = compute_input_fingerprint(df, recalc_start=recalc_start)
             is_st = self._is_st_stock(ts_code)
             df = self._compute_patterns(df, is_st)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp)
+            self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                         write_start=recalc_start,
+                         write_end=calc_date if recalc_start else None)
             result.calculated += 1
         return result
 
@@ -354,8 +372,35 @@ class KPatternCalculator:
 
         return result
 
+    def _compute_patterns_append(self, df: pd.DataFrame, new_bars: list,
+                                  is_st: bool) -> pd.DataFrame:
+        """Compute patterns over the full tail-window df; caller writes only new_bars.
+
+        All 7 K-line patterns use at most a 60-bar lookback (uptrend_60d_high at
+        i>=59).  With a tail df covering >=60 bars before the new bar, the result
+        at each new bar is identical to FULL by construction.
+        """
+        return self._compute_patterns(df, is_st)
+
+    def append_calculate(self, ts_code: str, df: pd.DataFrame, new_bars: list,
+                         calc_date: str, state: dict) -> "CalcResult":
+        """APPEND mode: compute over full tail window, write only new_bars."""
+        result = CalcResult()
+        is_st = False
+        if self.con is not None:
+            is_st = self._is_st_stock(ts_code)
+        df = self._compute_patterns_append(df, new_bars, is_st)
+        fp = compute_history_signature(
+            df, ["open_qfq", "high_qfq", "low_qfq", "close_qfq"]
+        )
+        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                     write_start=new_bars[0], write_end=new_bars[-1])
+        result.calculated += 1
+        return result
+
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
-                input_fingerprint: str = None):
+                input_fingerprint: str = None,
+                write_start: str = None, write_end: str = None):
         dws_cols = ["ts_code", "trade_date", "yang_bao_yin", "yang_ke_yin",
                     "mu_bei_xian", "bi_lei_zhen", "gao_kai_chang_yin",
                     "yin_bao_yang", "yin_ke_yang", "strength", "calc_date",
@@ -363,4 +408,5 @@ class KPatternCalculator:
         float_cols = ["strength"]
         insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
                          dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint)
+                         input_fingerprint=input_fingerprint,
+                         write_start=write_start, write_end=write_end)
