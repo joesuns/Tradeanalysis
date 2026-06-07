@@ -14,6 +14,10 @@ LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
 ETL_WORKERS = int(os.getenv("ETL_WORKERS", "1"))
 CALC_INCREMENTAL = os.getenv("CALC_INCREMENTAL", "1").strip() != "0"
+# CALC_APPEND: when on (default), new-trading-day calc routes most stocks to the
+# vectorized APPEND fast path (compute only new bars). =0 falls back to the
+# CALC_INCREMENTAL narrow-window recompute; CALC_INCREMENTAL=0 falls back to full.
+CALC_APPEND = os.getenv("CALC_APPEND", "1").strip() != "0"
 # CALC_WORKERS: optional override for calc thread-pool size (default min(cpu-1, 8)).
 # DuckDB single-file lock forbids multi-process writes, so calc parallelism is
 # thread-based (shared in-process instance), not multiprocessing.
