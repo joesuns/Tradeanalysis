@@ -1750,6 +1750,15 @@ CREATE INDEX idx_ods_moneyflow_date ON ods_moneyflow(trade_date);
 | `load_start` | `recalc_start` 再向前 `max(lookback)-1` bar（EMA/PP 种子正确性） |
 | `CALC_INCREMENTAL=0` | 回退全量读/写（指纹 skip 仍可用） |
 | `CALC_WORKERS` | 计算**线程**并行度，默认 `min(cpu-1, 8)`（DuckDB 单文件禁跨进程写，故用线程池） |
+| `CALC_APPEND=1`（默认） | 新交易日双路径追算：每股每 freq 每指标按 `dws_calc_state` 路由 SKIP/APPEND/FULL；`=0` 回退 12.7 窄窗 |
+
+**新日追算（append-only，CALC_APPEND）：** 见独立设计 `docs/superpowers/specs/2026-06-07-calc-append-only-design.md`。要点：
+
+- **状态表 `dws_calc_state`** — PK `(ts_code, freq, indicator)`，列 `last_trade_date / history_fp / quote_latest_adj / spec_version / updated_calc_date`，每指标一行。缺失（新股/首部署）→ FULL 建基线。
+- **路由 `classify_calc_mode()`** — 无 state→FULL；强签名变（除权/填充/修正）→FULL；无新 bar 同签名→SKIP；有新 bar 同签名→APPEND。
+- **强签名 `state_signature()`** — 对 `last_td` 前**固定 245 根尾窗**的输入值序列（按各计算器 `SIGNATURE_COLS`）做 SHA256，替代弱的 min/max/mean 指纹；固定宽度保证跨运行稳定。误判方向只会多一次安全 FULL，绝不误 APPEND（新 bar 始终全窗重算）。
+- **APPEND `append_calculate()`** — 仅算/写新 bar；EMA/ddx2 `resolve_ema_seeds` 种子递推、Volume 迟滞 zone 种子、滚动类复用全尾窗算法。INSERT-only 不改写历史。与 FULL 逐值 `atol=1e-9` 等价（`tests/test_etl/test_append_calc.py`）。
+- **范围外后续项：** 端到端「秒级日更」仍受 ~320s 全市场 freshness-fetch 拖累，需单独立项。
 
 **P3 热路径优化（与全量 golden-master 等价）：**
 

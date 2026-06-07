@@ -148,6 +148,13 @@ calc（计算层）
 │   ├── P1 单股单管线：`calc_stock_pipeline()` 每股一次窄读，5 个 quote 计算器共享 `quote_groups`
 │   ├── P2 多线程：`ThreadPoolExecutor` + `resolve_calc_workers()`（默认 `min(cpu-1, 8)`，`CALC_WORKERS` 可覆盖）。DuckDB 单文件禁跨进程写，故线程池共享同一实例
 │   └── P3 热路径：PP `rolling_window_minmax_deque`；MACD/DDE `resolve_ema_seeds` 递推；背离 `compute_price_signal_divergence` 向量化
+├── **新日追算（`CALC_APPEND=1` 默认，`=0` 回退 `CALC_INCREMENTAL` 窄窗）：** 每股每 freq 每指标走双路径
+│   ├── 路由 `classify_calc_mode()`（`calc_router.py`）按 `dws_calc_state` + 各计算器 `SIGNATURE_COLS`：
+│   │   无 state→**FULL**（建基线）；强签名变（除权/填充/修正）→**FULL**；无新 bar 同签名→**SKIP**；有新 bar 同签名→**APPEND**
+│   ├── APPEND `append_calculate()`：仅算/写新 bar（EMA/ddx2 用 `resolve_ema_seeds` 种子递推、Volume 迟滞用 zone 种子、滚动类复用全尾窗算法），INSERT-only 不改写历史
+│   ├── 强签名 `state_signature()`：对 last_td 前 **固定 245 根尾窗**关键输入列做值序列 SHA256（替弱指纹），跨运行稳定；误判只多一次安全 FULL，绝不误 APPEND（新 bar 始终全窗重算）
+│   ├── 状态 `dws_calc_state` PK `(ts_code, freq, indicator)`，写入仅在实际写了行时；`_route_calc()` 在 `calc_stock_pipeline` 内统一路由（DDE 自载 moneyflow 尾窗）
+│   └── 等价性硬约束：各指标 APPEND 与 FULL 逐值 `atol=1e-9`（`tests/test_etl/test_append_calc.py` 锁定）
 └── export 行数 << 预期（<80% 活跃股）→ WARNING
 
 export（导出层）
@@ -249,8 +256,21 @@ export（导出层）
   相同 → 跳过计算；不同 → 窄域重算。重复跑同一天从 ~107min 降到秒级。
   `input_fingerprint` 由 `insert_dws_batch()` 写入每行。
 - **指纹检测批量化（A4）:** `load_latest_fingerprints(con, table, ts_codes)` 用
-  `ROW_NUMBER()` 一次取回整组 `{ts_code: 最新指纹}`，6 个计算器在循环前预取并传入
+  `ROW_NUMBER()`（`ORDER BY calc_date DESC, trade_date DESC` 确定性平局）一次取回整组
+  `{ts_code: 最新指纹}`，6 个计算器在循环前预取并传入
   `check_dwd_unchanged(..., latest_fps=...)`，把 ~6.6 万次单股 SELECT 降到每组一次。
+- **新日追算（CALC_APPEND，append-only calc）:** 新交易日 calc 不再对每股窄写 255 窗，
+  而由 `classify_calc_mode()` 按 `dws_calc_state`（PK `(ts_code, freq, indicator)`）+ 各计算器
+  `SIGNATURE_COLS` 路由 SKIP/APPEND/FULL。**APPEND** 仅算/写新 bar（`append_calculate()`，
+  EMA/ddx2 用 `resolve_ema_seeds` 种子、Volume 迟滞用 zone 种子、滚动类复用全尾窗算法），
+  INSERT-only 不改写历史；**FULL**（无 state / 强签名变 / 写后兜底）走原窄窗重算并作 APPEND 的
+  等价 oracle。强签名 `state_signature()` 对 last_td 前**固定 245 根尾窗**输入值序列做 SHA256
+  （`compute_history_signature`），替代弱的 min/max/mean 指纹，**跨运行稳定**（误判只多一次安全
+  FULL，绝不误 APPEND——新 bar 永远全窗重算）。设计/实施见
+  `docs/superpowers/specs/2026-06-07-calc-append-only-design.md` 与
+  `docs/superpowers/plans/2026-06-07-calc-append-only-impl.md`。等价性 `atol=1e-9` 由
+  `tests/test_etl/test_append_calc.py` 锁定。⚠️ **范围外后续项：** 端到端「秒级日更」仍受
+  ~320s 全市场 freshness-fetch 拖累，需单独立项提速。
 - **计算器批量取数（B1）:** `load_quote_groups(con, src, freq, columns, ts_codes)` 用
   `WHERE ts_code IN (...)` + 内存 `groupby` 一次取回整组分股帧（daily 过滤 `is_suspended=0`，
   weekly `JOIN dim_date is_week_end=1`），替代每股一次 SELECT；MACD/MA/Volume/PricePosition/
@@ -275,8 +295,13 @@ export（导出层）
 - **多线程 calc（P2）:** `run_calc` 用 `ThreadPoolExecutor` 按股分片并行（默认 `min(cpu-1, 8)` 线程，
   `CALC_WORKERS=N` 覆盖），每线程独立 DuckDB 连接、共享同一进程实例（MVCC 多写）。
   **DuckDB 单文件仅允许一个 read-write 进程**，故禁用 `multiprocessing.Pool`（会触发
-  `IOException: Could not set lock`）。与 `ods_daily` fetch 的多线程写模式一致。
-  墙钟记 `ods_etl_log`（观测项，非硬 KPI）。
+ `IOException: Could not set lock`）。与 `ods_daily` fetch 的多线程写模式一致。
+ 墙钟记 `ods_etl_log`（观测项，非硬 KPI）。
+- **calc 进度心跳（防"假卡死"）:** 多线程 calc 的 per-stock 计算阶段原本静默——`_calc_stock_chunk`
+ 只在整个 chunk（数百只）跑完后才打 `calc XXX DONE`，中间几十分钟无输出，易被误判成卡死。
+ 现 worker 每算完 1 只调用 `_report_calc_progress()`（`orchestrator.py`），跨线程共享计数器（`threading.Lock`），
+ **按数量节流**（step=`total//20`，约每 5%）输出 `calc progress: N/total (X%) | 耗时 | stk/s | ETA`，
+ 全程约 20 行真实全局进度。`run_calc` 在启动线程池前调 `_init_calc_progress(total)` 复位。
 - **周线计算器一律只采样真周末 bar:** `dwd_weekly_quote` 为滚动周线（每交易日一行），
   全部 6 个周线计算器（含已修复的 kpattern）weekly 路径 `JOIN dim_date ... WHERE is_week_end=1`，
   禁止直接查滚动 bar。**注意：** kpattern 周线历史曾遗漏此过滤产出 intra-week 幽灵行，
