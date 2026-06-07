@@ -5,7 +5,7 @@ import pandas as pd
 from backend.etl.base import (
     to_float_safe, insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
     load_latest_fingerprints, load_quote_groups, rolling_window_minmax_deque,
-    SkipReason, CalcResult,
+    compute_history_signature, SkipReason, CalcResult,
 )
 from backend.etl.recalc_spec import RecalcSpec
 
@@ -94,6 +94,26 @@ class PricePositionCalculator:
                 )
 
         return df
+
+    def _compute_positions_append(self, df: pd.DataFrame, new_bars: list) -> pd.DataFrame:
+        """Compute positions over the full tail-window df; caller writes only new_bars.
+
+        PP at any bar depends only on its trailing N-bar window (causal rolling
+        min/max).  Given a df whose tail covers the full 250-bar lookback, the
+        value at each new bar is identical to FULL by construction.
+        """
+        return self._compute_positions(df)
+
+    def append_calculate(self, ts_code: str, df: pd.DataFrame, new_bars: list,
+                         calc_date: str, state: dict) -> "CalcResult":
+        """APPEND mode: compute over full tail window, write only new_bars."""
+        result = CalcResult()
+        df = self._compute_positions_append(df, new_bars)
+        fp = compute_history_signature(df, ["close_qfq"])
+        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                     write_start=new_bars[0], write_end=new_bars[-1])
+        result.calculated += 1
+        return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
                 input_fingerprint: str = None,
