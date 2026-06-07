@@ -18,6 +18,7 @@ from backend.etl.calc_ma import MACalculator
 from backend.etl.calc_kpattern import KPatternCalculator
 from backend.etl.calc_macd import MACDCalculator
 from backend.etl.calc_dde import DDECalculator
+from backend.etl.calc_volume import VolumeCalculator
 
 
 # ---------------------------------------------------------------------------
@@ -276,4 +277,106 @@ def test_dde_append_matches_full():
     b_div = full_df.iloc[-1]["divergence"]
     assert a_div == b_div, (
         f"DDE divergence: append={a_div!r} != full={b_div!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 11 — VolumeCalculator
+# ---------------------------------------------------------------------------
+
+def _make_vol_df(n: int = 300) -> pd.DataFrame:
+    """Volume df: trade_date + vol + close_qfq."""
+    rng = np.random.default_rng(42)
+    vol = rng.uniform(100, 1000, n)
+    close = 10.0 + np.cumsum(rng.normal(0, 0.2, n))
+    return pd.DataFrame({
+        "trade_date": [f"26{i:06d}" for i in range(n)],
+        "vol": vol,
+        "close_qfq": close,
+    })
+
+
+def test_volume_append_matches_full_on_new_bar():
+    """_compute_indicators_append with zone_seed from FULL: last bar matches FULL.
+
+    Tail window (140 bars) covers the 120-bar pct_vol_rank lookback plus a
+    safety margin (20 bars).  Zone seed is taken from FULL's zone at the
+    last bar immediately before the tail, correctly initialising hysteresis
+    state.  All rolling indicators are causal, so last-bar values match
+    FULL to atol=1e-9.
+    """
+    df = _make_vol_df(300)
+    calc = VolumeCalculator(None, "daily")
+
+    # FULL on all 300 bars
+    full_df = calc._compute_indicators(df.copy())
+    last_date = df.iloc[-1]["trade_date"]
+
+    # Tail: last 140 bars; zone seed = FULL's zone at the bar before tail[0]
+    tail = df.iloc[-140:].reset_index(drop=True)
+    zone_seed = full_df.iloc[-141]["zone"]   # global index 159, before tail start
+    append_df = calc._compute_indicators_append(tail.copy(), zone_seed=zone_seed)
+
+    app_row = append_df[append_df["trade_date"] == last_date].iloc[0]
+    full_row = full_df[full_df["trade_date"] == last_date].iloc[0]
+
+    float_cols = ["ma_vol_5", "pct_vol_rank", "volume_ratio", "trend_strength"]
+    for col in float_cols:
+        a, b = app_row[col], full_row[col]
+        if pd.isna(b):
+            assert pd.isna(a), f"{col}: expected NaN, got {a}"
+        else:
+            assert abs(a - b) < 1e-9, f"{col}: |{a} - {b}| >= 1e-9"
+
+    for col in ("zone", "trend", "divergence"):
+        assert app_row[col] == full_row[col], (
+            f"{col}: append={app_row[col]!r} full={full_row[col]!r}"
+        )
+
+
+def test_volume_append_zone_hysteresis_at_new_bar():
+    """Zone seed correctly re-establishes hysteresis; naive recompute would err.
+
+    Scenario:
+    - Full 130-bar df: bars 0-1 have pct_vol_rank=91 → enter 'explosive';
+      bars 2-129 have rank=80 → stay explosive (>75) but can't re-enter (<90).
+    - Tail = last 120 bars (bars 10-129): all rank=80, never ≥90 for 2
+      consecutive → naive (no-seed) recompute never enters → zone='normal' (wrong).
+    - With zone_seed='explosive', prior state continues → zone='explosive' (correct).
+
+    This test drives the zone_seed implementation in _compute_zone.
+    """
+    calc = VolumeCalculator(None, "daily")
+    n_full = 130
+
+    # pct_vol_rank array: spike at bars 0-1 → enter explosive; rest = 80
+    rank_arr = np.full(n_full, 80.0)
+    rank_arr[0] = 91.0
+    rank_arr[1] = 91.0
+
+    df_full = pd.DataFrame({
+        "trade_date": [f"26{i:06d}" for i in range(n_full)],
+        "pct_vol_rank": rank_arr,
+        "vol": np.ones(n_full) * 500.0,
+    })
+
+    # FULL: bars 1+ are explosive (entry at bar 1; rank=80>75 → never exits)
+    zone_full = calc._compute_zone(df_full)
+    assert zone_full[-1] == "explosive", (
+        f"FULL: expected last bar 'explosive', got {zone_full[-1]!r}"
+    )
+
+    # Tail: last 120 bars (bars 10-129), all rank=80 — never re-enters explosive
+    df_tail = df_full.iloc[-120:].reset_index(drop=True)
+
+    # Naive recompute (no seed): in_explosive starts False → never enters → 'normal'
+    zone_naive = calc._compute_zone(df_tail)
+    assert zone_naive[-1] == "normal", (
+        f"Naive (no seed): expected 'normal', got {zone_naive[-1]!r}"
+    )
+
+    # Seeded recompute: zone_seed='explosive' → carries prior state → stays explosive
+    zone_seeded = calc._compute_zone(df_tail, zone_seed="explosive")
+    assert zone_seeded[-1] == "explosive", (
+        f"Seeded: expected 'explosive', got {zone_seeded[-1]!r}"
     )

@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -74,7 +75,8 @@ class VolumeCalculator:
             result.calculated += 1
         return result
 
-    def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_indicators(self, df: pd.DataFrame,
+                             zone_seed: Optional[str] = None) -> pd.DataFrame:
         v = df["vol"].values.astype(float)
 
         # MA5 volume
@@ -86,8 +88,8 @@ class VolumeCalculator:
         # Percentile rank of MA5_vol within last 120 days
         df["pct_vol_rank"] = self._compute_pct_rank(df["ma_vol_5"].values, 120)
 
-        # Zone: explosive / low_volume / normal
-        df["zone"] = self._compute_zone(df)
+        # Zone: explosive / low_volume / normal (hysteresis; pass seed for append mode)
+        df["zone"] = self._compute_zone(df, zone_seed=zone_seed)
 
         # Trend: linear regression slope on ln(raw_vol) over 10 days
         df["trend"] = self._compute_trend(df["vol"].values, 10)
@@ -100,6 +102,70 @@ class VolumeCalculator:
         df["divergence"] = self._compute_divergence(df)
 
         return df
+
+    def _compute_indicators_append(self, df: pd.DataFrame,
+                                    zone_seed: Optional[str] = None) -> pd.DataFrame:
+        """Compute volume indicators for append / tail-window mode.
+
+        Delegates to _compute_indicators with the zone_seed initialising the
+        hysteresis state.  All rolling functions (MA5, pct_vol_rank, trend,
+        divergence) are causal: the last bar's value depends only on its
+        trailing window, which the caller-supplied tail df fully contains.
+        The zone state at the first bar of df is seeded from zone_seed
+        (the stored DWS zone of the bar immediately before df starts).
+
+        Callers must supply df with >= 120 bars for pct_vol_rank accuracy.
+        """
+        return self._compute_indicators(df, zone_seed=zone_seed)
+
+    def _fetch_zone_seed(self, ts_code: str, before_date: str) -> Optional[str]:
+        """Return the stored zone of the last DWS bar strictly before before_date.
+
+        Queries the latest calc_date snapshot to correctly initialise zone
+        hysteresis for tail-window APPEND recompute.  Returns None when no
+        prior bar exists (new stock, first calc, or no DWS connection).
+        """
+        if self.con is None:
+            return None
+        try:
+            row = self.con.execute(f"""
+                SELECT zone FROM (
+                    SELECT zone,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ts_code
+                               ORDER BY trade_date DESC, calc_date DESC
+                           ) AS rn
+                    FROM {self.dws_table}
+                    WHERE ts_code = ? AND trade_date < ?
+                      AND zone IS NOT NULL
+                ) WHERE rn = 1
+            """, [ts_code, before_date]).fetchone()
+        except Exception:
+            return None
+        return row[0] if row else None
+
+    def append_calculate(self, ts_code: str, df: pd.DataFrame, new_bars: list,
+                         calc_date: str, state: dict) -> "CalcResult":
+        """APPEND mode: compute over tail-window df, write only new_bars.
+
+        Zone hysteresis is correctly seeded by fetching the stored DWS zone
+        of the bar immediately before df starts (_fetch_zone_seed).  All
+        other indicators (MA5, pct_vol_rank, trend, divergence) are causal
+        rolling functions that match FULL given a tail window >= 120 bars.
+
+        Signature columns: ["close_qfq", "vol"].
+        Only rows in new_bars are written to DWS (write_start/write_end).
+        """
+        from backend.etl.base import compute_history_signature
+        result = CalcResult()
+        first_date = str(df["trade_date"].min())
+        zone_seed = self._fetch_zone_seed(ts_code, before_date=first_date)
+        df = self._compute_indicators_append(df, zone_seed=zone_seed)
+        fp = compute_history_signature(df, ["close_qfq", "vol"])
+        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                     write_start=new_bars[0], write_end=new_bars[-1])
+        result.calculated += 1
+        return result
 
     def _compute_pct_rank(self, ma_vol_5: np.ndarray, window: int) -> np.ndarray:
         """Percentile rank of current MA5_vol within the last `window` valid values."""
@@ -121,7 +187,8 @@ class VolumeCalculator:
 
         return result
 
-    def _compute_zone(self, df: pd.DataFrame) -> list:
+    def _compute_zone(self, df: pd.DataFrame,
+                      zone_seed: Optional[str] = None) -> list:
         """Classify volume zone based on percentile rank persistence.
 
         - explosive: P90 threshold (pct_vol_rank > 90 for 2 consecutive days)
@@ -129,13 +196,19 @@ class VolumeCalculator:
         - low_volume: P10 threshold (pct_vol_rank < 10 for 5 consecutive days)
           Exit: pct_vol_rank > 25 for 2 consecutive days
         - normal: everything else
+
+        zone_seed: zone of the bar immediately *before* df starts, used to
+            initialise hysteresis state for append / tail-window recompute.
+            - "explosive"  → start with in_explosive=True
+            - "low_volume" → start with in_low_volume=True
+            - None / "normal" → start with both False (default / full recompute)
         """
         n = len(df)
         rank = df["pct_vol_rank"].values
         result = [None] * n
 
-        in_explosive = False
-        in_low_volume = False
+        in_explosive = (zone_seed == "explosive")
+        in_low_volume = (zone_seed == "low_volume")
 
         for i in range(n):
             if pd.isna(rank[i]):
