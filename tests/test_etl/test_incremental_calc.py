@@ -706,3 +706,19 @@ def test_count_calc_rows_scoped_by_ts_code():
     assert _count_calc_rows(con, "dws_x", "20260605", ["C.SZ"]) == 0
     assert _count_calc_rows(con, "dws_x", "20260605", []) == 0
     con.close()
+
+
+def test_load_latest_fingerprints_picks_latest_trade_date_on_tie():
+    """同一 calc_date 下混有两代指纹时，取最新 trade_date 的那条。"""
+    from backend.etl.base import load_latest_fingerprints
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dws_x (
+            ts_code TEXT, trade_date TEXT, calc_date TEXT, input_fingerprint TEXT
+        )
+    """)
+    con.execute("INSERT INTO dws_x VALUES ('A.SZ','20260101','20260605','OLD')")
+    con.execute("INSERT INTO dws_x VALUES ('A.SZ','20260605','20260605','NEW')")
+    fps = load_latest_fingerprints(con, "dws_x", ["A.SZ"])
+    assert fps["A.SZ"] == "NEW"
+    con.close()

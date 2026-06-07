@@ -475,7 +475,7 @@ def load_latest_fingerprints(con, dws_table: str,
             SELECT ts_code, input_fingerprint FROM (
                 SELECT ts_code, input_fingerprint,
                        ROW_NUMBER() OVER (PARTITION BY ts_code
-                                          ORDER BY calc_date DESC) AS rn
+                                          ORDER BY calc_date DESC, trade_date DESC) AS rn
                 FROM {dws_table}
                 WHERE ts_code IN ({placeholders}) AND input_fingerprint IS NOT NULL
             ) WHERE rn = 1
