@@ -391,7 +391,7 @@ class KPatternCalculator:
             is_st = self._is_st_stock(ts_code)
         df = self._compute_patterns_append(df, new_bars, is_st)
         fp = compute_history_signature(
-            df, ["open_qfq", "high_qfq", "low_qfq", "close_qfq"]
+            df, ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol"]
         )
         self._insert(ts_code, df, calc_date, input_fingerprint=fp,
                      write_start=new_bars[0], write_end=new_bars[-1])

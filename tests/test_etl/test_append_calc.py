@@ -145,6 +145,19 @@ def test_kpattern_append_matches_full_on_new_bar():
         )
 
 
+def test_kpattern_signature_changes_when_vol_changes():
+    """KPattern uses vol (volume thresholds + strength), so the history signature
+    MUST flip when only vol changes (OHLC unchanged) — else a vol correction
+    would be silently misrouted to APPEND with stale pattern logic."""
+    from backend.etl.base import compute_history_signature
+    df = _make_ohlcv_df(120)
+    sig_cols = ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol"]
+    df2 = df.copy()
+    df2.loc[10, "vol"] = df2.loc[10, "vol"] * 2.0  # vol-only change
+    assert compute_history_signature(df, sig_cols) != \
+        compute_history_signature(df2, sig_cols)
+
+
 # ---------------------------------------------------------------------------
 # Shared helper for DDE tests
 # ---------------------------------------------------------------------------
@@ -237,6 +250,19 @@ def test_macd_append_divergence_matches_full():
     assert a_div == b_div, (
         f"MACD divergence: append={a_div!r} != full={b_div!r}"
     )
+
+    # All EMA-derived output columns must also match on the new bar.
+    for col in ["macd_bar", "dif", "dea", "trend_strength"]:
+        a = app_df.iloc[-1][col]
+        b = full_df.iloc[-1][col]
+        if pd.isna(b):
+            assert pd.isna(a), f"MACD {col}: expected NaN, got {a}"
+        else:
+            assert abs(a - b) < 1e-9, f"MACD {col}: |{a} - {b}| >= 1e-9"
+    for col in ["zone", "trend", "turning_point", "alert"]:
+        assert app_df.iloc[-1][col] == full_df.iloc[-1][col], (
+            f"MACD {col}: append={app_df.iloc[-1][col]!r} != full={full_df.iloc[-1][col]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
