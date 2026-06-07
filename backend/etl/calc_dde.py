@@ -4,9 +4,12 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 from backend.etl.base import (
-    ema, to_float_safe, insert_dws_batch, compute_fingerprint, check_dwd_unchanged,
-    SkipReason, CalcResult,
+    ema, to_float_safe, weighted_window_slopes, sliding_window_mean_abs,
+    compute_price_signal_divergence,
+    insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
+    load_latest_fingerprints, resolve_ema_seeds, SkipReason, CalcResult,
 )
+from backend.etl.recalc_spec import RecalcSpec
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,9 @@ class DDECalculator:
     Works for both daily and weekly frequencies.
     """
 
+    RECALC_SPEC_DAILY = RecalcSpec(lookback=60, seed=5, event_tail=5, min_rows=10)
+    RECALC_SPEC_WEEKLY = RecalcSpec(lookback=60, seed=5, event_tail=5, min_rows=10)
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
@@ -30,13 +36,21 @@ class DDECalculator:
             self.quote_table = "dwd_weekly_quote"
         self.dws_table = f"dws_dde_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+    def calculate(self, ts_codes: list[str], calc_date: str,
+                  recalc_start: str = None) -> CalcResult:
         result = CalcResult()
+        latest_fps = load_latest_fingerprints(self.con, self.dws_table, ts_codes)
+        load_start = None
+        if recalc_start:
+            from backend.etl.recalc_spec import resolve_load_start
+            load_start = resolve_load_start(self.con, recalc_start, self.freq)
+        if self.freq == "daily":
+            groups = self._load_daily_batch(ts_codes, start_date=load_start)
+        else:
+            groups = self._load_weekly_batch(ts_codes, start_date=load_start)
+        empty = pd.DataFrame()
         for ts_code in ts_codes:
-            if self.freq == "daily":
-                df = self._load_daily(ts_code)
-            else:
-                df = self._load_weekly(ts_code)
+            df = groups.get(ts_code, empty)
 
             if df.empty:
                 if ts_code.endswith(".BJ"):
@@ -57,14 +71,21 @@ class DDECalculator:
                                 f"DWD rows={len(df)}, min=10")
                 continue
 
-            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df):
+            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df,
+                                   latest_fps=latest_fps, recalc_start=recalc_start):
                 result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
                                 "DWD fingerprint match")
                 continue
 
-            fp = compute_fingerprint(df)
-            df = self._compute_indicators(df)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp)
+            fp = compute_input_fingerprint(df, recalc_start=recalc_start)
+            ema_seeds = resolve_ema_seeds(
+                self.con, self.dws_table, ts_code, df, self.freq,
+                ("ddx2",), recalc_start,
+            )
+            df = self._compute_indicators(df, ema_seeds=ema_seeds)
+            self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                         write_start=recalc_start,
+                         write_end=calc_date if recalc_start else None)
             result.calculated += 1
         return result
 
@@ -79,6 +100,36 @@ class DDECalculator:
             WHERE m.ts_code = ? {'' if self.freq == 'weekly' else 'AND q.is_suspended = 0'}
             ORDER BY m.trade_date
         """, (ts_code,)).df()
+
+    def _load_daily_batch(self, ts_codes: list[str], chunk_size: int = 400,
+                          start_date: str = None) -> dict:
+        """Batch version of _load_daily: one query per chunk → {ts_code: df}.
+
+        Each frame is identical to _load_daily(ts_code) (same columns/order/filter).
+        """
+        susp = '' if self.freq == 'weekly' else 'AND q.is_suspended = 0'
+        groups = {}
+        for i in range(0, len(ts_codes), chunk_size):
+            chunk = ts_codes[i:i + chunk_size]
+            ph = ",".join(["?"] * len(chunk))
+            date_filter = " AND m.trade_date >= ?" if start_date else ""
+            params = list(chunk)
+            if start_date:
+                params.append(start_date)
+            big = self.con.execute(f"""
+                SELECT m.ts_code, m.trade_date, m.buy_lg_vol, m.sell_lg_vol,
+                       m.buy_elg_vol, m.sell_elg_vol, m.total_vol,
+                       m.net_mf_amount, q.close_qfq
+                FROM {self.src_table} m
+                JOIN {self.quote_table} q ON m.ts_code = q.ts_code AND m.trade_date = q.trade_date
+                WHERE m.ts_code IN ({ph}) {susp}{date_filter}
+                ORDER BY m.ts_code, m.trade_date
+            """, params).df()
+            if big.empty:
+                continue
+            for ts_code, g in big.groupby("ts_code", sort=False):
+                groups[ts_code] = g.drop(columns=["ts_code"]).reset_index(drop=True)
+        return groups
 
     def _load_weekly(self, ts_code: str) -> pd.DataFrame:
         """Aggregate daily moneyflow to weekly granularity — single-query.
@@ -158,7 +209,98 @@ class DDECalculator:
             ORDER BY wa.week_end
         """, (ts_code, ts_code)).df()
 
-    def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _load_weekly_batch(self, ts_codes: list[str], chunk_size: int = 400,
+                           start_date: str = None) -> dict:
+        """Batch version of _load_weekly: one query per chunk → {ts_code: df}.
+
+        Carries ts_code through every CTE (PARTITION/GROUP BY already keyed by
+        ts_code) so each per-stock frame is identical to _load_weekly(ts_code).
+        """
+        groups = {}
+        for i in range(0, len(ts_codes), chunk_size):
+            chunk = ts_codes[i:i + chunk_size]
+            ph = ",".join(["?"] * len(chunk))
+            big = self.con.execute(f"""
+                WITH week_ranges AS (
+                    SELECT
+                        wq.ts_code,
+                        wq.trade_date AS week_end,
+                        COALESCE(
+                            LAG(wq.trade_date) OVER (
+                                PARTITION BY wq.ts_code ORDER BY wq.trade_date
+                            ),
+                            strftime(
+                                CAST(
+                                    SUBSTR(wq.trade_date, 1, 4) || '-' ||
+                                    SUBSTR(wq.trade_date, 5, 2) || '-' ||
+                                    SUBSTR(wq.trade_date, 7, 2)
+                                    AS DATE
+                                ) - INTERVAL 7 DAY,
+                                '%Y%m%d'
+                            )
+                        ) AS week_start
+                    FROM dwd_weekly_quote wq
+                    JOIN dim_date dd ON wq.trade_date = dd.trade_date
+                    WHERE wq.ts_code IN ({ph}) AND dd.is_week_end = 1
+                ),
+                weekly_agg AS (
+                    SELECT
+                        wr.ts_code,
+                        wr.week_end,
+                        COALESCE(SUM(mf.buy_lg_vol),   0) AS buy_lg_vol,
+                        COALESCE(SUM(mf.sell_lg_vol),  0) AS sell_lg_vol,
+                        COALESCE(SUM(mf.buy_elg_vol),  0) AS buy_elg_vol,
+                        COALESCE(SUM(mf.sell_elg_vol), 0) AS sell_elg_vol,
+                        COALESCE(SUM(mf.total_vol),    0) AS total_vol,
+                        COALESCE(SUM(mf.net_mf_amount),0) AS net_mf_amount,
+                        COUNT(DISTINCT mf.trade_date) AS active_days,
+                        COUNT(DISTINCT dd_t.trade_date) AS expected_days
+                    FROM week_ranges wr
+                    JOIN {self.src_table} mf
+                        ON wr.ts_code = mf.ts_code
+                        AND mf.trade_date > wr.week_start
+                        AND mf.trade_date <= wr.week_end
+                    JOIN dwd_daily_quote q
+                        ON mf.ts_code = q.ts_code
+                        AND mf.trade_date = q.trade_date
+                        AND q.is_suspended = 0
+                    JOIN dim_date dd_t
+                        ON dd_t.trade_date > wr.week_start
+                        AND dd_t.trade_date <= wr.week_end
+                        AND dd_t.is_trade_day = 1
+                    GROUP BY wr.ts_code, wr.week_end
+                )
+                SELECT
+                    wa.ts_code,
+                    wa.week_end   AS trade_date,
+                    wa.buy_lg_vol,
+                    wa.sell_lg_vol,
+                    wa.buy_elg_vol,
+                    wa.sell_elg_vol,
+                    wa.total_vol,
+                    wa.net_mf_amount,
+                    wa.active_days,
+                    wa.expected_days,
+                    wq.close_qfq,
+                    CASE
+                        WHEN wa.active_days < wa.expected_days * 0.6
+                        THEN 1 ELSE 0
+                    END AS _skip_dde
+                FROM weekly_agg wa
+                JOIN dwd_weekly_quote wq
+                    ON wq.ts_code = wa.ts_code AND wq.trade_date = wa.week_end
+                WHERE wa.expected_days > 0
+                {(" AND wa.week_end >= ?" if start_date else "")}
+                ORDER BY wa.ts_code, wa.week_end
+            """, (chunk + [start_date]) if start_date else chunk).df()
+            if big.empty:
+                continue
+            for ts_code, g in big.groupby("ts_code", sort=False):
+                groups[ts_code] = g.drop(columns=["ts_code"]).reset_index(drop=True)
+        return groups
+
+    def _compute_indicators(self, df: pd.DataFrame,
+                            ema_seeds: dict = None) -> pd.DataFrame:
         """Compute DDX, DDX2, divergence, trend, alerts, and turning points."""
         buy_lg = df["buy_lg_vol"].values.astype(float)
         sell_lg = df["sell_lg_vol"].values.astype(float)
@@ -178,7 +320,8 @@ class DDECalculator:
         df["ddx"] = ddx
 
         # DDX2 = EMA(DDX, 5)
-        df["ddx2"] = ema(ddx, 5)
+        sddx2 = ema_seeds.get("ddx2") if ema_seeds else None
+        df["ddx2"] = ema(ddx, 5, seed=sddx2)
 
         # net_mf_amount: direct copy
         df["net_mf_amount"] = df["net_mf_amount"].values.astype(float)
@@ -204,26 +347,15 @@ class DDECalculator:
         - down: weighted_slope < -0.0001
         - flat: otherwise
         """
+        # Vectorized fixed-window weighted regression (decay=0.20), equivalent
+        # to the legacy per-bar np.polyfit loop. See base.weighted_window_slopes.
+        slopes = weighted_window_slopes(ddx2, window, 0.20)
         result = [None] * len(ddx2)
-        for i in range(len(ddx2)):
-            if i < window - 1:
-                continue
-            segment = ddx2[i - window + 1:i + 1]
-            valid = segment[~np.isnan(segment)]
-            if len(valid) < window:
-                continue
-            n = len(valid)
-            x = np.arange(n, dtype=float)
-            weights = np.exp(x * 0.20)
-            try:
-                slope = float(np.polyfit(x, valid, 1, w=weights)[0])
-            except (np.linalg.LinAlgError, ValueError, TypeError):
-                continue
-            if not np.isfinite(slope):
-                continue
-            if slope > 0.0001:
+        for i in np.nonzero(np.isfinite(slopes))[0]:
+            s = slopes[i]
+            if s > 0.0001:
                 result[i] = "up"
-            elif slope < -0.0001:
+            elif s < -0.0001:
                 result[i] = "down"
             else:
                 result[i] = "flat"
@@ -239,92 +371,21 @@ class DDECalculator:
 
         Returns NaN where window < window or all DDX2 in segment are zero.
         """
+        # Vectorized: weighted slope / mean(|DDX2|) over each full window.
+        # mean_abs == 0 → skip (NaN), matching legacy (no 0.0 fallback here).
+        slopes = weighted_window_slopes(ddx2, window, 0.20)
+        scale = sliding_window_mean_abs(ddx2, window)
         result = np.full(len(ddx2), np.nan)
-        for i in range(window - 1, len(ddx2)):
-            segment = ddx2[i - window + 1:i + 1]
-            valid = segment[~np.isnan(segment)]
-            if len(valid) < window:
-                continue
-            mean_abs = np.mean(np.abs(valid))
-            if mean_abs == 0:
-                continue
-            n = len(valid)
-            x = np.arange(n, dtype=float)
-            weights = np.exp(x * 0.20)
-            try:
-                slope = float(np.polyfit(x, valid, 1, w=weights)[0])
-            except (np.linalg.LinAlgError, ValueError, TypeError):
-                continue
-            if not np.isfinite(slope):
-                continue
-            result[i] = slope / mean_abs
+        mask = (~np.isnan(scale)) & (scale != 0) & np.isfinite(slopes)
+        result[mask] = slopes[mask] / scale[mask]
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
-        """Top/bottom divergence using DDX (raw) vs close over 60-day window.
-
-        Confirmation day: DDX has clearly rolled from its 60d peak/valley,
-        but price still near extreme. Dedup: no repeat within 5 bars.
-        Single-bar DDX spikes are filtered by requiring at least 2 bars
-        within ±2 days of the peak to reach >= 80% of the peak value.
-        """
-        result = [None] * len(df)
-        w = 59  # 60-bar window: iloc[i-59 : i+1] = 60 elements
-        for i in range(w, len(df)):
-            window_close = df["close_qfq"].iloc[i - w : i + 1]
-            window_ddx = df["ddx"].iloc[i - w : i + 1]
-
-            if window_ddx.isna().any():
-                continue
-
-            c_hi = window_close.max()
-            c_lo = window_close.min()
-            d_hi = window_ddx.max()
-            d_lo = window_ddx.min()
-            cur_c = df["close_qfq"].iloc[i]
-            cur_d = df["ddx"].iloc[i]
-
-            if pd.isna(cur_c) or pd.isna(cur_d):
-                continue
-
-            # Top divergence: DDX peaked in past, has fallen from peak,
-            #                price still near 60d high (within 2%).
-            ddx_peak_iloc = np.argmax(window_ddx.values)
-            ddx_peak_val = window_ddx.max()
-            ddx_fallen = d_hi != 0 and cur_d < d_hi
-            price_near_peak = cur_c >= c_hi * 0.98
-
-            # 邻域确认：峰值不是孤立的单日尖刺
-            neighbors = window_ddx.values[
-                max(0, ddx_peak_iloc - 2):min(len(window_ddx), ddx_peak_iloc + 3)
-            ]
-            is_spike = (neighbors >= ddx_peak_val * 0.8).sum() < 2
-
-            if ddx_peak_iloc < w and ddx_fallen and not is_spike and price_near_peak:
-                recent = any(result[j] == "top_divergence" for j in range(max(0, i - 5), i))
-                if not recent:
-                    result[i] = "top_divergence"
-
-            # Bottom divergence: DDX valley in past, recovered >10%,
-            #                   price stopped falling (low >= 3 bars ago).
-            ddx_valley_iloc = np.argmin(window_ddx.values)
-            ddx_valley_val = window_ddx.min()
-            ddx_recovered = d_lo != 0 and cur_d > d_lo
-            # 回升确认：DDX 回升幅度 > 谷值绝对值的 10%
-            ddx_recovery_pct = (cur_d - d_lo) / abs(d_lo) if d_lo != 0 else 0
-            ddx_confirmed = ddx_recovery_pct > 0.1
-            # 价格止跌确认：60日低点距今 >= 3 根 bar
-            c_lo_iloc = np.argmin(window_close.values)
-            price_stopped = (w - c_lo_iloc) >= 3
-            price_near_bottom = cur_c <= c_lo * 1.02
-
-            if (ddx_valley_iloc < w and ddx_recovered and ddx_confirmed
-                    and price_stopped and price_near_bottom):
-                recent = any(result[j] == "bottom_divergence" for j in range(max(0, i - 5), i))
-                if not recent:
-                    result[i] = "bottom_divergence"
-
-        return result
+        """Top/bottom divergence using DDX vs close (vectorized + spike filter)."""
+        return compute_price_signal_divergence(
+            df["close_qfq"].values, df["ddx"].values, window=60, dedup=5,
+            require_finite_signal_window=True, spike_filter_top=True,
+        )
 
     def _compute_alerts(self, df: pd.DataFrame) -> list:
         """Upturn/downturn reverse + flat alerts using DDX2.
@@ -357,11 +418,13 @@ class DDECalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
-                input_fingerprint: str = None):
+                input_fingerprint: str = None,
+                write_start: str = None, write_end: str = None):
         dws_cols = ["ts_code", "trade_date", "net_mf_amount", "ddx", "ddx2",
                     "trend", "trend_strength", "alert", "divergence",
                     "calc_date", "input_fingerprint", "spec_version"]
         float_cols = ["net_mf_amount", "ddx", "ddx2", "trend_strength"]
         insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
                          dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint)
+                         input_fingerprint=input_fingerprint,
+                         write_start=write_start, write_end=write_end)

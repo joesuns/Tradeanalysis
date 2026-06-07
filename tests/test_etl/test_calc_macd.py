@@ -3,6 +3,81 @@ import numpy as np
 from backend.etl.calc_macd import MACDCalculator
 
 
+# ── B2 golden-master: frozen pre-vectorization oracles ──
+
+def _oracle_macd_trend(bar, window=5):
+    result = [None] * len(bar)
+    for i in range(len(bar)):
+        if i < window - 1:
+            continue
+        segment = bar[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        if len(valid) < window:
+            continue
+        x = np.arange(window, dtype=float)
+        weights = np.exp(x * 0.15)
+        try:
+            slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+        except (np.linalg.LinAlgError, ValueError, TypeError):
+            continue
+        if not np.isfinite(slope):
+            continue
+        if slope > 0.001:
+            result[i] = "up"
+        elif slope < -0.001:
+            result[i] = "down"
+        else:
+            result[i] = "flat"
+    return result
+
+
+def _oracle_macd_trend_strength(bar, window=5):
+    result = np.full(len(bar), np.nan)
+    for i in range(window - 1, len(bar)):
+        segment = bar[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        if len(valid) < window:
+            continue
+        x = np.arange(window, dtype=float)
+        weights = np.exp(x * 0.15)
+        try:
+            slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+        except (np.linalg.LinAlgError, ValueError, TypeError):
+            continue
+        scale = np.mean(np.abs(valid))
+        if scale < 1e-6:
+            result[i] = 0.0
+        elif np.isfinite(slope):
+            result[i] = float(slope) / scale
+    return result
+
+
+def test_macd_trend_matches_oracle_random():
+    calc = MACDCalculator.__new__(MACDCalculator)
+    rng = np.random.default_rng(11)
+    for _ in range(40):
+        bar = rng.normal(0, 0.05, size=rng.integers(5, 90))
+        if rng.random() < 0.5:
+            idx = rng.integers(0, len(bar), size=max(1, len(bar) // 6))
+            bar[idx] = np.nan
+        assert calc._compute_trend(bar) == _oracle_macd_trend(bar)
+
+
+def test_macd_trend_strength_matches_oracle_random():
+    calc = MACDCalculator.__new__(MACDCalculator)
+    rng = np.random.default_rng(13)
+    for _ in range(40):
+        bar = rng.normal(0, 0.05, size=rng.integers(5, 90))
+        if rng.random() < 0.5:
+            idx = rng.integers(0, len(bar), size=max(1, len(bar) // 6))
+            bar[idx] = np.nan
+        got = calc._compute_trend_strength(bar)
+        exp = _oracle_macd_trend_strength(bar)
+        np.testing.assert_array_equal(np.isnan(got), np.isnan(exp))
+        m = ~np.isnan(exp)
+        np.testing.assert_allclose(got[m], exp[m], rtol=0, atol=1e-9)
+
+
 def test_macd_ema_seed():
     """Verify EMA12 seed = SMA of first 12 close values."""
     calc = MACDCalculator.__new__(MACDCalculator)

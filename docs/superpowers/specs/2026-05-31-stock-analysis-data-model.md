@@ -1733,12 +1733,29 @@ CREATE INDEX idx_ods_moneyflow_date ON ods_moneyflow(trade_date);
 每日跑批流程（INSERT-only 快照模式）：
   0. ETL 启动自检：DuckDB 数据库文件可读写
   1. ODS 增量拉取最新 N 日数据，INSERT INTO ODS 表
-  2. DuckDB 窗口函数计算 DWS（直接读 DWD 表）
-  3. INSERT INTO DWS 表（新 calc_date 行），每批 100 只股票一个事务
-  4. 最近 60 个交易日产生新的 calc_date 快照（同一 trade_date 可有多个 calc_date）
-  5. 60 日之前的 DWS 行冻结不变（不再产生新 calc_date）
-  6. calc_date = 当前跑批日期
+  2. DuckDB 计算 DWS（直接读 DWD 表；CALC_INCREMENTAL=1 时窄读窄写）
+  3. INSERT INTO DWS 表（新 calc_date 行），每股窄写 [recalc_start, calc_date]
+  4. 快照保留由 prune_dws_snapshots(keep_runs=N) 运维清理（默认 5 次 calc_date）
+  5. calc_date = 当前跑批日期
+  6. 墙钟耗时记入 ods_etl_log（观测项，非硬 KPI）
 ```
+
+**重算窗口（RecalcSpec 注册表，禁止 magic number）：**
+
+| 概念 | 含义 |
+|------|------|
+| `RecalcSpec` | 各 Calculator 声明 `lookback + seed + event_tail + min_rows` |
+| `resolve_recalc_bars()` | `max(total) + safety(5)`；当前 daily 聚合值 **255** |
+| `recalc_start` | `calc_date` 向前回溯 255 交易日（指纹域 + DWS 窄写起点） |
+| `load_start` | `recalc_start` 再向前 `max(lookback)-1` bar（EMA/PP 种子正确性） |
+| `CALC_INCREMENTAL=0` | 回退全量读/写（指纹 skip 仍可用） |
+| `CALC_WORKERS` | 计算**线程**并行度，默认 `min(cpu-1, 8)`（DuckDB 单文件禁跨进程写，故用线程池） |
+
+**P3 热路径优化（与全量 golden-master 等价）：**
+
+- PricePosition：`rolling_window_minmax_deque` O(n) 滚动极值
+- MACD/DDE：`load_ema_seed` 从上一 calc_date DWS 读 EMA 状态再递推
+- 背离：`compute_price_signal_divergence` 向量化 60 日窗口 + 5 日 dedup
 
 ### 12.7b ETL 故障恢复与数据回补
 

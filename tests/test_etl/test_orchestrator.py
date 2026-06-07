@@ -424,6 +424,48 @@ def test_check_data_completeness_mature_low_week_ends_goes_to_weekly_fetch():
     con.close()
 
 
+def test_week_end_bars_windowed_not_full_history():
+    """全历史 week-end 够但 warmup 窗口内不足 → 仍应 weekly_fetch。"""
+    import duckdb
+    from backend.etl.orchestrator import check_data_completeness, WEEKLY_WARMUP_WEEKS
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_trade_day INTEGER, is_week_end INTEGER)
+    """)
+    con.execute("""
+        CREATE TABLE dim_stock (
+            ts_code TEXT PRIMARY KEY, list_date TEXT, delist_date TEXT)
+    """)
+    con.execute("INSERT INTO dim_stock VALUES ('STALE.SZ', '20200101', NULL)")
+
+    calc_weeks = _seq_week_end_dates(130, start=(2023, 1, 6))
+    calc_date = calc_weeks[-1]
+    stale_weeks = _seq_week_end_dates(150, start=(2015, 1, 9))
+    for td in calc_weeks:
+        con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
+    for td in stale_weeks:
+        if td < calc_weeks[0]:
+            con.execute("INSERT OR IGNORE INTO dim_date VALUES (?, 1, 1)", [td])
+            con.execute("INSERT INTO dwd_weekly_quote VALUES ('STALE.SZ', ?)", [td])
+    for td in _seq_trade_dates(260, start=(2025, 1, 1)):
+        con.execute("INSERT INTO dwd_daily_quote VALUES ('STALE.SZ', ?)", [td])
+
+    result = check_data_completeness(
+        con, ["STALE.SZ"], calc_date=calc_date, min_daily_rows=250)
+    assert "STALE.SZ" in result["ok"]
+    assert "STALE.SZ" in result["weekly_fetch"]
+    wf = result["weekly_fetch"]["STALE.SZ"]
+    assert wf["week_end_bars"] < WEEKLY_WARMUP_WEEKS
+    assert wf["week_end_bars"] == 0
+    assert wf["available_week_ends"] >= WEEKLY_WARMUP_WEEKS
+
+    con.close()
+
+
 def test_classify_still_missing_includes_week_end_bars_in_detail():
     from backend.etl.orchestrator import _classify_still_missing
     from backend.etl.base import SkipReason
@@ -538,4 +580,68 @@ def test_find_stale_dwd_codes_detects_ods_without_dwd():
     stale = find_stale_dwd_codes(con, ["A.SZ"], "20260605")
     assert stale == ["A.SZ"]
 
+    con.close()
+
+
+# ── P2: multiprocessing worker resolution ──
+
+
+def test_resolve_calc_workers_env_override(monkeypatch):
+    monkeypatch.setenv("CALC_WORKERS", "4")
+    from backend.etl.orchestrator import resolve_calc_workers
+    assert resolve_calc_workers() == 4
+
+
+def test_resolve_calc_workers_env_minimum_one(monkeypatch):
+    monkeypatch.setenv("CALC_WORKERS", "0")
+    from backend.etl.orchestrator import resolve_calc_workers
+    assert resolve_calc_workers() == 1
+
+
+def test_resolve_calc_workers_default_capped(monkeypatch):
+    import multiprocessing
+    monkeypatch.delenv("CALC_WORKERS", raising=False)
+    from backend.etl.orchestrator import resolve_calc_workers
+    expected = max(1, min(multiprocessing.cpu_count() - 1, 8))
+    assert resolve_calc_workers() == expected
+
+
+def test_resolve_calc_workers_invalid_falls_back(monkeypatch):
+    """非法 CALC_WORKERS（非数字）→ 回退默认值，不崩溃。"""
+    import multiprocessing
+    monkeypatch.setenv("CALC_WORKERS", "abc")
+    from backend.etl.orchestrator import resolve_calc_workers
+    expected = max(1, min(multiprocessing.cpu_count() - 1, 8))
+    assert resolve_calc_workers() == expected
+
+
+def test_run_calc_uses_thread_pool(monkeypatch):
+    """run_calc should dispatch chunks via ThreadPoolExecutor (not multiprocessing)."""
+    import duckdb
+    from backend.etl.orchestrator import run_calc
+
+    con = duckdb.connect(":memory:")
+    calls = []
+
+    def fake_chunk(chunk, calc_date, incremental):
+        calls.append((tuple(chunk), calc_date, incremental))
+        return 0
+
+    monkeypatch.setattr("backend.etl.orchestrator._calc_stock_chunk", fake_chunk)
+    monkeypatch.setattr("backend.etl.orchestrator.resolve_calc_workers", lambda: 2)
+    monkeypatch.setattr(
+        "backend.etl.orchestrator.check_data_completeness",
+        lambda *a, **k: {"ok": ["A.SZ", "B.SZ"], "missing": {}, "weekly_fetch": {}},
+    )
+    monkeypatch.setattr("backend.etl.orchestrator._filter_delisted", lambda *a, **k: (a[1], {}))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start", lambda *a: (1, 0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.orchestrator.run_checkpoint", lambda *a: None)
+
+    run_calc(con, ts_codes=["A.SZ", "B.SZ"], calc_date="20260605", auto_fetch=False)
+
+    # 2 workers, 2 stocks → chunk_size=1 → 2 个单股 chunk
+    assert len(calls) == 2
+    assert {c[0] for c in calls} == {("A.SZ",), ("B.SZ",)}
+    assert all(c[1] == "20260605" for c in calls)
     con.close()

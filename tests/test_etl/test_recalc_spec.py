@@ -1,0 +1,35 @@
+"""Tests for RecalcSpec registry and resolve_recalc_bars aggregation."""
+from backend.etl.recalc_spec import RecalcSpec, collect_specs, resolve_recalc_bars
+
+
+def test_recalc_spec_total():
+    spec = RecalcSpec(lookback=60, seed=26, event_tail=5)
+    assert spec.total == 91
+
+
+def test_resolve_recalc_bars_daily_current_registry():
+    specs = collect_specs("daily")
+    assert resolve_recalc_bars(specs, safety=5) == 255
+
+
+def test_resolve_recalc_bars_weekly_current_registry():
+    specs = collect_specs("weekly")
+    assert resolve_recalc_bars(specs, safety=5) == 255
+
+
+def test_resolve_recalc_bars_empty():
+    assert resolve_recalc_bars([], safety=5) == 5
+
+
+def test_collect_specs_includes_all_calculators():
+    daily = collect_specs("daily")
+    weekly = collect_specs("weekly")
+    assert len(daily) == 6
+    assert len(weekly) == 6
+
+
+def test_warmup_from_registry():
+    """warmup = max(min_rows, lookback) across daily specs → >= 250."""
+    specs = collect_specs("daily")
+    warmup = max(max(s.min_rows, s.lookback) for s in specs)
+    assert warmup >= 250

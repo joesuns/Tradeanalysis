@@ -4,9 +4,12 @@ import numpy as np
 import pandas as pd
 from backend.etl.base import (
     sma, linear_regression_slope, to_float_safe,
-    insert_dws_batch, compute_fingerprint, check_dwd_unchanged,
-    SkipReason, CalcResult,
+    weighted_window_slopes, sliding_window_mean_abs,
+    compute_price_signal_divergence,
+    insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
+    load_latest_fingerprints, load_quote_groups, SkipReason, CalcResult,
 )
+from backend.etl.recalc_spec import RecalcSpec
 
 logger = logging.getLogger(__name__)
 
@@ -19,30 +22,34 @@ class VolumeCalculator:
     Works for both daily and weekly frequencies.
     """
 
+    RECALC_SPEC_DAILY = RecalcSpec(lookback=120, seed=5, event_tail=5, min_rows=5)
+    RECALC_SPEC_WEEKLY = RecalcSpec(lookback=120, seed=5, event_tail=5, min_rows=5)
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
         self.src_table = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
         self.dws_table = f"dws_volume_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+    def calculate(self, ts_codes: list[str], calc_date: str,
+                  recalc_start: str = None,
+                  quote_groups: dict = None) -> CalcResult:
         result = CalcResult()
+        latest_fps = load_latest_fingerprints(self.con, self.dws_table, ts_codes)
+        if quote_groups is None:
+            load_start = None
+            if recalc_start:
+                from backend.etl.recalc_spec import resolve_load_start
+                load_start = resolve_load_start(self.con, recalc_start, self.freq)
+            groups = load_quote_groups(self.con, self.src_table, self.freq,
+                                       ["trade_date", "vol", "close_qfq"], ts_codes,
+                                       start_date=load_start)
+        else:
+            groups = quote_groups
         for ts_code in ts_codes:
-            if self.freq == "weekly":
-                df = self.con.execute(f"""
-                    SELECT d.trade_date, d.vol, d.close_qfq FROM {self.src_table} d
-                    JOIN dim_date dd ON d.trade_date = dd.trade_date
-                    WHERE d.ts_code = ? AND dd.is_week_end = 1
-                    ORDER BY d.trade_date
-                """, (ts_code,)).df()
-            else:
-                df = self.con.execute(f"""
-                    SELECT trade_date, vol, close_qfq FROM {self.src_table}
-                    WHERE ts_code = ? AND is_suspended = 0
-                    ORDER BY trade_date
-                """, (ts_code,)).df()
+            df = groups.get(ts_code)
 
-            if df.empty:
+            if df is None or df.empty:
                 logger.debug("Volume %s skip %s: no DWD data", self.freq, ts_code)
                 result.add_skip(SkipReason.NO_DWD_DATA, ts_code, "DWD returned 0 rows")
                 continue
@@ -53,14 +60,17 @@ class VolumeCalculator:
                                 f"DWD rows={len(df)}, min=5")
                 continue
 
-            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df):
+            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df,
+                                   latest_fps=latest_fps, recalc_start=recalc_start):
                 result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
                                 "DWD fingerprint match")
                 continue
 
-            fp = compute_fingerprint(df)
+            fp = compute_input_fingerprint(df, recalc_start=recalc_start)
             df = self._compute_indicators(df)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp)
+            self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                         write_start=recalc_start,
+                         write_end=calc_date if recalc_start else None)
             result.calculated += 1
         return result
 
@@ -165,6 +175,64 @@ class VolumeCalculator:
 
         return result
 
+    def _log_slope_and_scale(self, vol_series: np.ndarray, window: int,
+                             min_pos: int = 5, decay: float = 0.20):
+        """Per-window weighted log-vol regression slope + |log| scale.
+
+        Exactly reproduces the legacy compacted-positive per-bar loop:
+        per window, keep non-NaN values > 0, log them, re-base x to 0..m-1,
+        weighted (decay) LS slope; scale = mean(|log values|).
+
+        Hybrid for speed: windows whose `window` values are ALL non-NaN and > 0
+        (the overwhelmingly common case) use the vectorized fixed-window closed
+        form on ln(vol); only windows containing NaN / non-positive values fall
+        back to the exact per-bar computation. Windows with < min_pos positive
+        values are marked invalid (→ NaN downstream).
+
+        Returns (slopes, scales, valid): float arrays + bool mask of length n.
+        """
+        vol = np.asarray(vol_series, dtype=float)
+        n = len(vol)
+        slopes = np.full(n, np.nan)
+        scales = np.full(n, np.nan)
+        valid = np.zeros(n, dtype=bool)
+        if n < window:
+            return slopes, scales, valid
+
+        pos = (~np.isnan(vol)) & (vol > 0)
+        pos_count = np.convolve(pos.astype(float), np.ones(window), mode="valid")
+        valid[window - 1:] = pos_count >= min_pos
+
+        # Fast path: log(vol) is NaN at non-positive/NaN positions, so
+        # weighted_window_slopes is finite ONLY for fully-positive windows.
+        logvol = np.log(np.where(pos, vol, np.nan))
+        fast_slope = weighted_window_slopes(logvol, window, decay)
+        fast_scale = sliding_window_mean_abs(logvol, window)
+        fast_mask = np.isfinite(fast_slope)
+        slopes[fast_mask] = fast_slope[fast_mask]
+        scales[fast_mask] = fast_scale[fast_mask]
+
+        # Slow path: valid but not full (has NaN / non-positive in window).
+        for i in np.nonzero(valid & ~fast_mask)[0]:
+            segment = vol[i - window + 1:i + 1]
+            vp = segment[~np.isnan(segment)]
+            vp = vp[vp > 0]
+            log_segment = np.log(vp)
+            m = len(log_segment)
+            x = np.arange(m, dtype=float)
+            weights = np.exp(x * decay)
+            try:
+                s = float(np.polyfit(x, log_segment, 1, w=weights)[0])
+            except (np.linalg.LinAlgError, ValueError, TypeError):
+                valid[i] = False
+                continue
+            if not np.isfinite(s):
+                valid[i] = False
+                continue
+            slopes[i] = s
+            scales[i] = float(np.mean(np.abs(log_segment)))
+        return slopes, scales, valid
+
     def _compute_trend(self, vol_series: np.ndarray, window: int) -> list:
         """Volume trend via exponentially weighted linear regression on ln(vol).
 
@@ -174,37 +242,16 @@ class VolumeCalculator:
         - shrinking: weighted_slope < -0.008
         - flat: otherwise
         """
-        n = len(vol_series)
-        result = [None] * n
-        decay = 0.20
-
-        for i in range(n):
-            if i < window - 1:
-                continue
-            segment = vol_series[i - window + 1:i + 1]
-            valid = segment[~np.isnan(segment)]
-            valid_pos = valid[valid > 0]
-            if len(valid_pos) < 5:
-                continue
-
-            log_segment = np.log(valid_pos)
-            m = len(log_segment)
-            x = np.arange(m, dtype=float)
-            weights = np.exp(x * decay)
-            try:
-                slope = float(np.polyfit(x, log_segment, 1, w=weights)[0])
-            except (np.linalg.LinAlgError, ValueError, TypeError):
-                continue
-            if not np.isfinite(slope):
-                continue
-
-            if slope > 0.008:
+        slopes, _, valid = self._log_slope_and_scale(vol_series, window)
+        result = [None] * len(vol_series)
+        for i in np.nonzero(valid)[0]:
+            s = slopes[i]
+            if s > 0.008:
                 result[i] = "expanding"
-            elif slope < -0.008:
+            elif s < -0.008:
                 result[i] = "shrinking"
             else:
                 result[i] = "flat"
-
         return result
 
     def _compute_volume_ratio(self, df: pd.DataFrame) -> np.ndarray:
@@ -223,93 +270,29 @@ class VolumeCalculator:
         Positive = volume expanding, negative = shrinking.
         Weighted regression (decay=0.20) gives recent bars ~3x more influence.
         """
-        n = len(vol_series)
-        result = np.full(n, np.nan)
-        for i in range(window - 1, n):
-            segment = vol_series[i - window + 1:i + 1]
-            valid = segment[~np.isnan(segment)]
-            valid_pos = valid[valid > 0]
-            if len(valid_pos) < 5:
-                continue
-            log_segment = np.log(valid_pos)
-            m = len(log_segment)
-            x = np.arange(m, dtype=float)
-            weights = np.exp(x * 0.20)
-            try:
-                slope = float(np.polyfit(x, log_segment, 1, w=weights)[0])
-            except (np.linalg.LinAlgError, ValueError, TypeError):
-                continue
-            if not np.isfinite(slope):
-                continue
-            scale = np.mean(np.abs(log_segment))
-            if scale < 1e-6:
-                result[i] = 0.0
-            else:
-                result[i] = slope / scale
+        slopes, scales, valid = self._log_slope_and_scale(vol_series, window)
+        result = np.full(len(vol_series), np.nan)
+        result[valid & (scales < 1e-6)] = 0.0
+        mask = valid & (scales >= 1e-6)
+        result[mask] = slopes[mask] / scales[mask]
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
-        """Top/bottom volume-price divergence using 60-day window.
-
-        Confirmation day + 5-day dedup, same pattern as MACD/DDE divergence.
-        - Top divergence: price near 60d high + vol has fallen from 60d peak
-        - Bottom divergence: price near 60d low + vol has recovered from 60d valley
-        """
-        result = [None] * len(df)
+        """Top/bottom volume-price divergence (vectorized rolling + dedup)."""
         if "close_qfq" not in df.columns:
-            return result
-        w = 59  # 60-bar window
-        for i in range(w, len(df)):
-            window_close = df["close_qfq"].iloc[i - w:i + 1]
-            window_vol = df["vol"].iloc[i - w:i + 1]
-
-            c_hi = window_close.max()
-            c_lo = window_close.min()
-            v_hi = window_vol.max()
-            v_lo = window_vol.min()
-            cur_c = df["close_qfq"].iloc[i]
-            cur_v = df["vol"].iloc[i]
-
-            if pd.isna(cur_c) or pd.isna(cur_v):
-                continue
-
-            # Top divergence: price at 60d high, vol has fallen from 60d peak
-            vol_peak_iloc = np.argmax(window_vol.values)
-            vol_fallen = v_hi != 0 and cur_v < window_vol.values[vol_peak_iloc]
-            price_near_peak = cur_c >= c_hi * 0.98
-
-            if vol_peak_iloc < w and vol_fallen and price_near_peak:
-                recent = any(
-                    result[j] == "top_divergence" for j in range(max(0, i - 5), i)
-                )
-                if not recent:
-                    result[i] = "top_divergence"
-
-            # Bottom divergence: price at 60d low, vol has recovered from 60d valley
-            vol_valley_iloc = np.argmin(window_vol.values)
-            vol_recovered = v_lo != 0 and cur_v > window_vol.values[vol_valley_iloc]
-            vol_recovery_pct = (cur_v - v_lo) / abs(v_lo) if v_lo != 0 else 0
-            vol_confirmed = vol_recovery_pct > 0.1
-            c_lo_iloc = np.argmin(window_close.values)
-            price_stopped = (w - c_lo_iloc) >= 3
-            price_near_bottom = cur_c <= c_lo * 1.02
-
-            if (vol_valley_iloc < w and vol_recovered and vol_confirmed
-                    and price_stopped and price_near_bottom):
-                recent = any(
-                    result[j] == "bottom_divergence" for j in range(max(0, i - 5), i)
-                )
-                if not recent:
-                    result[i] = "bottom_divergence"
-
-        return result
+            return [None] * len(df)
+        return compute_price_signal_divergence(
+            df["close_qfq"].values, df["vol"].values, window=60, dedup=5,
+        )
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
-                input_fingerprint: str = None):
+                input_fingerprint: str = None,
+                write_start: str = None, write_end: str = None):
         dws_cols = ["ts_code", "trade_date", "ma_vol_5", "pct_vol_rank",
                     "zone", "trend", "volume_ratio", "trend_strength",
                     "divergence", "calc_date", "input_fingerprint", "spec_version"]
         float_cols = ["ma_vol_5", "pct_vol_rank", "volume_ratio", "trend_strength"]
         insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
                          dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint)
+                         input_fingerprint=input_fingerprint,
+                         write_start=write_start, write_end=write_end)

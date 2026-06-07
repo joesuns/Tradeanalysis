@@ -65,6 +65,7 @@ uvicorn backend.api.app:app --reload
 # 环境检查
 python -m backend.cli check
 python -m backend.cli status
+python -m scripts.health_check   # 跑批后全链路质量体检（只读，Section I=成熟股最新 week-end 截面）
 ```
 
 ## 项目结构
@@ -135,11 +136,18 @@ fetch（数据拉取层）
 calc（计算层）
 ├── `--date` 指定 analysis_date（默认 today），与 export/run 对齐
 ├── 退市股过滤：delist_date < calc_date 且 DWS 已有 → 跳过
-├── G1 warmup：check_data_completeness() — DWD 行数 ≥250
+├── G1 warmup：`check_data_completeness()` — calc 准入 `dwd_rows≥250`；成熟股 `week_end_bars`（120 周窗口内）不足 → `weekly_fetch` 仅 fetch 不拦 calc
 ├── G2 fresh：find_stale_ods_codes() — ODS max < calc_date → date/stock-batched 补 tail（run 内 skip）
 ├── G3 sync：find_stale_dwd_codes() — ODS 有当日但 DWD 落后 → rebuild_all_dwd
 ├── 缺 warmup → auto-fetch（策略选择器 + 熔断器 5 次）
 ├── 补拉后 rebuild_all_dwd() → re-check → 分类原因 → 写 ods_calc_skip_log
+├── **增量优化（`CALC_INCREMENTAL=1` 默认，`=0` 回退全量读/写）：**
+│   ├── `RecalcSpec` 注册表（`recalc_spec.py`）— 各 Calculator 声明 `RECALC_SPEC_DAILY/WEEKLY`，`resolve_recalc_bars()` 聚合重算宽度（当前 daily **255** = max(lookback+seed+event_tail)+5）
+│   ├── 三层窗口：`load_start`（种子）→ `recalc_start`（指纹+窄写起点）→ `calc_date`（窄写终点）
+│   ├── P0.5 保守域指纹（策略 A）：`last_trade_date` 同 **且** `[recalc_start, last_td]` 子集 SHA256 同 → skip
+│   ├── P1 单股单管线：`calc_stock_pipeline()` 每股一次窄读，5 个 quote 计算器共享 `quote_groups`
+│   ├── P2 多线程：`ThreadPoolExecutor` + `resolve_calc_workers()`（默认 `min(cpu-1, 8)`，`CALC_WORKERS` 可覆盖）。DuckDB 单文件禁跨进程写，故线程池共享同一实例
+│   └── P3 热路径：PP `rolling_window_minmax_deque`；MACD/DDE `resolve_ema_seeds` 递推；背离 `compute_price_signal_divergence` 向量化
 └── export 行数 << 预期（<80% 活跃股）→ WARNING
 
 export（导出层）
@@ -230,15 +238,16 @@ export（导出层）
 - **Freshness 三门禁（calc）：** G1 calc 准入（DWD≥250 行）+ G2 stale ODS + G3 stale DWD。`run` 先 fetch 故 calc 设 `skip_stale_fetch=True`。
 - **双轨 warmup（拆分门禁）：**
   - **calc 准入：** `dwd_rows ≥ 250`（`check_data_completeness.ok`）
-  - **fetch 门禁：** 成熟股（available week-end ≥ 120）且 `week_end_bars < 120` → `weekly_fetch` 桶，触发 auto-fetch；**上市不足 120 周除外**（`weekly_required = min(120, available)`）
+  - **fetch 门禁：** 成熟股（available week-end ≥ 120）且 `week_end_bars < 120` → `weekly_fetch` 桶，触发 auto-fetch；**上市不足 120 周除外**（`weekly_required = min(120, available)`）。`week_end_bars` 仅在 `[resolve_weekly_warmup_start(calc_date), calc_date]` 窗口内计数（与 fetch 历史对齐），非全历史
   - fetch 起点：`min(250td_start, 120 week-end_start, list_date)`
 - **导出语义：** `-`=当日无事件信号；`N/A`=不可算或源端无数据（如亏损股 PE、历史不足量能分位）。
 - **Fetch 覆盖率:** `_compute_fetch_range` 要求 100% ODS 覆盖才跳过（对齐 123 项目严格检查模式）。
 - **数据质量门禁:** `_validate_ods_batch` 已接入全部 3 条 `daily` 写库路径（`fetch_by_date_range` / `_fetch_chunk` 并行 / `fetch_stocks_incremental`）。在 ODS INSERT 前校验 OHLC 逻辑（high >= low）和必需字段（open/high/low/close/vol/amount）非空，**返回过滤后的有效记录列表**，无效行丢弃并按批次打 WARNING。仅作用于 daily（OHLCV），daily_basic/moneyflow 不校验。
 - **adj_factor 护栏:** `build_dwd_daily_quote` 排除 `adj_factor IS NULL` 或 `latest_adj IS NULL/0` 的行，避免静默产出 NULL `close_qfq` / 除零；插入前诊断 COUNT 被排除行数并打 WARNING（某股 qfq 不可用时可见）。
-- **DWS 指纹跳过:** `check_dwd_unchanged()` 在 calc 前比对 DWD 输入数据 SHA256 指纹。
-  相同 → 跳过计算；不同 → 重算。重复跑同一天从 ~107min 降到秒级。
-  `input_fingerprint` 存储于每张 DWS 表的每行中，由 `insert_dws_batch()` 写入。
+- **DWS 指纹跳过（P0.5 策略 A）:** `compute_input_fingerprint(df, recalc_start)` 对
+  `[recalc_start, last_trade_date]` 域做 SHA256；`check_dwd_unchanged()` 比对最新指纹。
+  相同 → 跳过计算；不同 → 窄域重算。重复跑同一天从 ~107min 降到秒级。
+  `input_fingerprint` 由 `insert_dws_batch()` 写入每行。
 - **指纹检测批量化（A4）:** `load_latest_fingerprints(con, table, ts_codes)` 用
   `ROW_NUMBER()` 一次取回整组 `{ts_code: 最新指纹}`，6 个计算器在循环前预取并传入
   `check_dwd_unchanged(..., latest_fps=...)`，把 ~6.6 万次单股 SELECT 降到每组一次。
@@ -263,8 +272,11 @@ export（导出层）
 - **DDE 周线批量聚合:** `_load_weekly` 使用 LAG 窗口函数一次性完成周间 SUM 聚合，
   替代原来的 per-week N+1 查询。SQL 调用 ~150x 减少，DDE 周线 ~50min → ~25s。
 - **批量完整度检查:** `check_data_completeness` 使用 GROUP BY 替代逐股票循环，5524 SQL → 1 SQL。
-- **多线程 calc:** `run_calc` 将股票分 3 片并行计算，WAL 并发写入。每线程独立 DuckDB 连接。
-  总 calc 从 ~58min → ~20min（3 线程）。
+- **多线程 calc（P2）:** `run_calc` 用 `ThreadPoolExecutor` 按股分片并行（默认 `min(cpu-1, 8)` 线程，
+  `CALC_WORKERS=N` 覆盖），每线程独立 DuckDB 连接、共享同一进程实例（MVCC 多写）。
+  **DuckDB 单文件仅允许一个 read-write 进程**，故禁用 `multiprocessing.Pool`（会触发
+  `IOException: Could not set lock`）。与 `ods_daily` fetch 的多线程写模式一致。
+  墙钟记 `ods_etl_log`（观测项，非硬 KPI）。
 - **周线计算器一律只采样真周末 bar:** `dwd_weekly_quote` 为滚动周线（每交易日一行），
   全部 6 个周线计算器（含已修复的 kpattern）weekly 路径 `JOIN dim_date ... WHERE is_week_end=1`，
   禁止直接查滚动 bar。**注意：** kpattern 周线历史曾遗漏此过滤产出 intra-week 幽灵行，

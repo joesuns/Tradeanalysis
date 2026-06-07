@@ -3,6 +3,82 @@ import numpy as np
 from backend.etl.calc_dde import DDECalculator
 
 
+# ── B2 golden-master: frozen pre-vectorization oracles (decay=0.20, window=8) ──
+
+def _oracle_dde_trend(ddx2, window=8):
+    result = [None] * len(ddx2)
+    for i in range(len(ddx2)):
+        if i < window - 1:
+            continue
+        segment = ddx2[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        if len(valid) < window:
+            continue
+        x = np.arange(window, dtype=float)
+        weights = np.exp(x * 0.20)
+        try:
+            slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+        except (np.linalg.LinAlgError, ValueError, TypeError):
+            continue
+        if not np.isfinite(slope):
+            continue
+        if slope > 0.0001:
+            result[i] = "up"
+        elif slope < -0.0001:
+            result[i] = "down"
+        else:
+            result[i] = "flat"
+    return result
+
+
+def _oracle_dde_trend_strength(ddx2, window=8):
+    result = np.full(len(ddx2), np.nan)
+    for i in range(window - 1, len(ddx2)):
+        segment = ddx2[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        if len(valid) < window:
+            continue
+        mean_abs = np.mean(np.abs(valid))
+        if mean_abs == 0:
+            continue
+        x = np.arange(window, dtype=float)
+        weights = np.exp(x * 0.20)
+        try:
+            slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+        except (np.linalg.LinAlgError, ValueError, TypeError):
+            continue
+        if not np.isfinite(slope):
+            continue
+        result[i] = slope / mean_abs
+    return result
+
+
+def test_dde_trend_matches_oracle_random():
+    calc = DDECalculator.__new__(DDECalculator)
+    rng = np.random.default_rng(21)
+    for _ in range(40):
+        ddx2 = rng.normal(0, 0.03, size=rng.integers(8, 90))
+        if rng.random() < 0.5:
+            idx = rng.integers(0, len(ddx2), size=max(1, len(ddx2) // 6))
+            ddx2[idx] = np.nan
+        assert calc._compute_trend(ddx2) == _oracle_dde_trend(ddx2)
+
+
+def test_dde_trend_strength_matches_oracle_random():
+    calc = DDECalculator.__new__(DDECalculator)
+    rng = np.random.default_rng(23)
+    for _ in range(40):
+        ddx2 = rng.normal(0, 0.03, size=rng.integers(8, 90))
+        if rng.random() < 0.5:
+            idx = rng.integers(0, len(ddx2), size=max(1, len(ddx2) // 6))
+            ddx2[idx] = np.nan
+        got = calc._compute_trend_strength(ddx2)
+        exp = _oracle_dde_trend_strength(ddx2)
+        np.testing.assert_array_equal(np.isnan(got), np.isnan(exp))
+        m = ~np.isnan(exp)
+        np.testing.assert_allclose(got[m], exp[m], rtol=0, atol=1e-9)
+
+
 def test_ddx_formula():
     """Verify DDX = (buy_lg + buy_elg - sell_lg - sell_elg) / total_vol."""
     calc = DDECalculator.__new__(DDECalculator)
@@ -435,6 +511,81 @@ def test_dde_trend_strength_zero_mean():
     assert np.isnan(result[9]), (
         f"全零 DDX2 应返回 NaN，实际 {result[9]}"
     )
+
+
+# ── B1 batch-load equivalence ──
+
+
+def _dde_schema(con):
+    for ddl in [
+        """CREATE TABLE dwd_daily_moneyflow (
+            ts_code TEXT, trade_date TEXT, buy_lg_vol REAL, sell_lg_vol REAL,
+            buy_elg_vol REAL, sell_elg_vol REAL, total_vol REAL,
+            net_mf_amount REAL, PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dwd_daily_quote (
+            ts_code TEXT, trade_date TEXT, close_qfq REAL, is_suspended INTEGER,
+            PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dwd_weekly_quote (
+            ts_code TEXT, trade_date TEXT, close_qfq REAL,
+            PRIMARY KEY (ts_code, trade_date))""",
+        """CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_week_end INTEGER,
+            is_trade_day INTEGER)""",
+    ]:
+        con.execute(ddl)
+
+
+def _seed_dde_two_stocks(con):
+    import random
+    random.seed(7)
+    for code in ["A.SZ", "B.SZ"]:
+        for w in range(1, 4):
+            for d in range(1, 6):
+                day = f"202601{w*7+d:02d}"
+                con.execute("INSERT OR REPLACE INTO dwd_daily_moneyflow VALUES "
+                            "(?,?,?,?,?,?,?,?)",
+                            (code, day, 100+random.random(), 50, 80, 30, 300,
+                             500+random.random()))
+                con.execute("INSERT OR REPLACE INTO dwd_daily_quote VALUES (?,?,?,0)",
+                            (code, day, 10.0 + random.random()))
+                is_we = 1 if d == 5 else 0
+                con.execute("INSERT OR REPLACE INTO dim_date VALUES (?, ?, 1)",
+                            (day, is_we))
+                if is_we:
+                    con.execute("INSERT OR REPLACE INTO dwd_weekly_quote "
+                                "VALUES (?, ?, 10.0)", (code, day))
+
+
+def test_dde_load_daily_batch_matches_per_stock():
+    import duckdb
+    import pandas as pd
+    from backend.etl.calc_dde import DDECalculator
+
+    con = duckdb.connect(":memory:")
+    _dde_schema(con)
+    _seed_dde_two_stocks(con)
+
+    calc = DDECalculator(con, "daily")
+    groups = calc._load_daily_batch(["A.SZ", "B.SZ"])
+    for code in ["A.SZ", "B.SZ"]:
+        pd.testing.assert_frame_equal(groups[code], calc._load_daily(code))
+    con.close()
+
+
+def test_dde_load_weekly_batch_matches_per_stock():
+    import duckdb
+    import pandas as pd
+    from backend.etl.calc_dde import DDECalculator
+
+    con = duckdb.connect(":memory:")
+    _dde_schema(con)
+    _seed_dde_two_stocks(con)
+
+    calc = DDECalculator(con, "weekly")
+    groups = calc._load_weekly_batch(["A.SZ", "B.SZ"])
+    for code in ["A.SZ", "B.SZ"]:
+        pd.testing.assert_frame_equal(groups[code], calc._load_weekly(code))
+    con.close()
 
 
 # ── _load_weekly contract ──

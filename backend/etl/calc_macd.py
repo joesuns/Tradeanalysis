@@ -4,14 +4,20 @@ import numpy as np
 import pandas as pd
 from backend.etl.base import (
     ema, to_float_safe, linear_regression_slope,
-    insert_dws_batch, compute_fingerprint, check_dwd_unchanged,
+    weighted_window_slopes, sliding_window_mean_abs,
+    compute_price_signal_divergence,
+    insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
+    load_latest_fingerprints, load_quote_groups, resolve_ema_seeds,
     SkipReason, CalcResult,
 )
+from backend.etl.recalc_spec import RecalcSpec
 
 logger = logging.getLogger(__name__)
 
 
 class MACDCalculator:
+    RECALC_SPEC_DAILY = RecalcSpec(lookback=60, seed=26, event_tail=5, min_rows=27)
+    RECALC_SPEC_WEEKLY = RecalcSpec(lookback=60, seed=26, event_tail=5, min_rows=27)
     """MACD indicator calculator. Works for both daily and weekly frequencies."""
 
     def __init__(self, con, freq: str = "daily"):
@@ -20,25 +26,26 @@ class MACDCalculator:
         self.src_table = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
         self.dws_table = f"dws_macd_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+    def calculate(self, ts_codes: list[str], calc_date: str,
+                  recalc_start: str = None,
+                  quote_groups: dict = None) -> CalcResult:
         """Calculate MACD for a batch of stocks. Returns CalcResult with stats."""
         result = CalcResult()
+        latest_fps = load_latest_fingerprints(self.con, self.dws_table, ts_codes)
+        if quote_groups is None:
+            load_start = None
+            if recalc_start:
+                from backend.etl.recalc_spec import resolve_load_start
+                load_start = resolve_load_start(self.con, recalc_start, self.freq)
+            groups = load_quote_groups(self.con, self.src_table, self.freq,
+                                       ["trade_date", "close_qfq"], ts_codes,
+                                       start_date=load_start)
+        else:
+            groups = quote_groups
         for ts_code in ts_codes:
-            if self.freq == "weekly":
-                df = self.con.execute(f"""
-                    SELECT d.trade_date, d.close_qfq FROM {self.src_table} d
-                    JOIN dim_date dd ON d.trade_date = dd.trade_date
-                    WHERE d.ts_code = ? AND dd.is_week_end = 1
-                    ORDER BY d.trade_date
-                """, (ts_code,)).df()
-            else:
-                df = self.con.execute(f"""
-                    SELECT trade_date, close_qfq FROM {self.src_table}
-                    WHERE ts_code = ? AND is_suspended = 0
-                    ORDER BY trade_date
-                """, (ts_code,)).df()
+            df = groups.get(ts_code)
 
-            if df.empty:
+            if df is None or df.empty:
                 logger.debug("MACD %s skip %s: no DWD data", self.freq, ts_code)
                 result.add_skip(SkipReason.NO_DWD_DATA, ts_code, "DWD returned 0 rows")
                 continue
@@ -49,23 +56,34 @@ class MACDCalculator:
                                 f"DWD rows={len(df)}, min=27")
                 continue
 
-            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df):
+            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df,
+                                   latest_fps=latest_fps, recalc_start=recalc_start):
                 result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
                                 "DWD fingerprint match")
                 continue
 
-            fp = compute_fingerprint(df)
-            df = self._compute_indicators(df)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp)
+            fp = compute_input_fingerprint(df, recalc_start=recalc_start)
+            ema_seeds = resolve_ema_seeds(
+                self.con, self.dws_table, ts_code, df, self.freq,
+                ("ema_12", "ema_26", "dea"), recalc_start,
+            )
+            df = self._compute_indicators(df, ema_seeds=ema_seeds)
+            self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                         write_start=recalc_start,
+                         write_end=calc_date if recalc_start else None)
             result.calculated += 1
         return result
 
-    def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_indicators(self, df: pd.DataFrame,
+                            ema_seeds: dict = None) -> pd.DataFrame:
         c = df["close_qfq"].values.astype(float)
-        df["ema_12"] = ema(c, 12)
-        df["ema_26"] = ema(c, 26)
+        s12 = ema_seeds.get("ema_12") if ema_seeds else None
+        s26 = ema_seeds.get("ema_26") if ema_seeds else None
+        df["ema_12"] = ema(c, 12, seed=s12)
+        df["ema_26"] = ema(c, 26, seed=s26)
         df["dif"] = df["ema_12"] - df["ema_26"]
-        df["dea"] = ema(df["dif"].values.astype(float), 9)
+        sdea = ema_seeds.get("dea") if ema_seeds else None
+        df["dea"] = ema(df["dif"].values.astype(float), 9, seed=sdea)
         df["macd_bar"] = 2.0 * (df["dif"] - df["dea"])
         df["zone"] = df["macd_bar"].apply(
             lambda x: "bull" if x > 0 else ("bear" if x < 0 else None)
@@ -87,27 +105,15 @@ class MACDCalculator:
         - down: weighted_slope < -0.001
         - flat: otherwise
         """
+        # Vectorized fixed-window weighted regression (decay=0.15), equivalent
+        # to the legacy per-bar np.polyfit loop. See base.weighted_window_slopes.
+        slopes = weighted_window_slopes(bar, window, 0.15)
         result = [None] * len(bar)
-        for i in range(len(bar)):
-            if i < window - 1:
-                continue
-            segment = bar[i - window + 1:i + 1]
-            valid = segment[~np.isnan(segment)]
-            if len(valid) < window:
-                continue
-            # Exponentially weighted regression (same as 123)
-            n = len(valid)
-            x = np.arange(n, dtype=float)
-            weights = np.exp(x * 0.15)
-            try:
-                slope = float(np.polyfit(x, valid, 1, w=weights)[0])
-            except (np.linalg.LinAlgError, ValueError, TypeError):
-                continue
-            if not np.isfinite(slope):
-                continue
-            if slope > 0.001:
+        for i in np.nonzero(np.isfinite(slopes))[0]:
+            s = slopes[i]
+            if s > 0.001:
                 result[i] = "up"
-            elif slope < -0.001:
+            elif s < -0.001:
                 result[i] = "down"
             else:
                 result[i] = "flat"
@@ -120,82 +126,21 @@ class MACDCalculator:
         Positive = bullish strength, negative = bearish strength.
         Weighted regression (decay=0.15) makes recent bars ~3x more influential.
         """
+        # Vectorized: weighted slope / mean(|bar|) over each full window.
+        slopes = weighted_window_slopes(bar, window, 0.15)
+        scale = sliding_window_mean_abs(bar, window)
         result = np.full(len(bar), np.nan)
-        for i in range(window - 1, len(bar)):
-            segment = bar[i - window + 1:i + 1]
-            valid = segment[~np.isnan(segment)]
-            if len(valid) < window:
-                continue
-            # Weighted slope: recent bars carry more weight
-            n = len(valid)
-            x = np.arange(n, dtype=float)
-            weights = np.exp(x * 0.15)
-            try:
-                slope = float(np.polyfit(x, valid, 1, w=weights)[0])
-            except (np.linalg.LinAlgError, ValueError, TypeError):
-                continue
-            # Normalize by mean absolute value
-            scale = np.mean(np.abs(valid))
-            if scale < 1e-6:
-                result[i] = 0.0
-            elif np.isfinite(slope):
-                result[i] = float(slope) / scale
+        full = ~np.isnan(scale)  # full non-NaN window
+        result[full & (scale < 1e-6)] = 0.0
+        mask = full & (scale >= 1e-6) & np.isfinite(slopes)
+        result[mask] = slopes[mask] / scale[mask]
         return result
 
     def _compute_divergence(self, df: pd.DataFrame) -> list:
-        """Top/bottom divergence using 60-day window. Marked on confirmation day.
-
-        Confirmation day = DIF has clearly rolled over from its 60d peak
-        but price is still near its 60d high (within 2%).
-        Deduplication: same type of divergence does not repeat within 5 bars.
-        """
-        result = [None] * len(df)
-        w = 59  # 60-bar window: iloc[i-59 : i+1] = 60 elements
-        for i in range(w, len(df)):
-            window_close = df["close_qfq"].iloc[i - w : i + 1]
-            window_dif = df["dif"].iloc[i - w : i + 1]
-            c_hi = window_close.max()
-            c_lo = window_close.min()
-            d_hi = window_dif.max()
-            d_lo = window_dif.min()
-            cur_c = df["close_qfq"].iloc[i]
-            cur_d = df["dif"].iloc[i]
-
-            if pd.isna(cur_c) or pd.isna(cur_d):
-                continue
-
-            # Top divergence: DIF peaked in past, DIF has fallen from peak,
-            #                price still near 60d high (within 2%).
-            dif_peak_iloc = np.argmax(window_dif.values)
-            dif_has_fallen = d_hi != 0 and cur_d < d_hi
-            price_near_peak = cur_c >= c_hi * 0.98
-
-            if dif_peak_iloc < w and dif_has_fallen and price_near_peak:
-                # Dedup: no top_divergence within previous 5 bars
-                recent = any(result[j] == "top_divergence" for j in range(max(0, i - 5), i))
-                if not recent:
-                    result[i] = "top_divergence"
-
-            # Bottom divergence: DIF valley in past, DIF recovered >10%,
-            #                   price stopped falling (low >= 3 bars ago).
-            dif_valley_iloc = np.argmin(window_dif.values)
-            dif_valley_val = window_dif.min()
-            dif_has_recovered = d_lo != 0 and cur_d > d_lo
-            # 回升确认：DIF 回升幅度 > 谷值绝对值的 10%
-            dif_recovery_pct = (cur_d - d_lo) / abs(d_lo) if d_lo != 0 else 0
-            dif_confirmed = dif_recovery_pct > 0.1
-            # 价格止跌确认：60日低点距今 >= 3 根 bar
-            c_lo_iloc = np.argmin(window_close.values)
-            price_stopped = (w - c_lo_iloc) >= 3
-            price_near_bottom = cur_c <= c_lo * 1.02
-
-            if (dif_valley_iloc < w and dif_has_recovered and dif_confirmed
-                    and price_stopped and price_near_bottom):
-                recent = any(result[j] == "bottom_divergence" for j in range(max(0, i - 5), i))
-                if not recent:
-                    result[i] = "bottom_divergence"
-
-        return result
+        """Top/bottom divergence using 60-day window (vectorized rolling + dedup)."""
+        return compute_price_signal_divergence(
+            df["close_qfq"].values, df["dif"].values, window=60, dedup=5,
+        )
 
     def _compute_turning_points(self, df: pd.DataFrame) -> list:
         """Golden cross / Dead cross / Near golden / Near dead.
@@ -296,7 +241,8 @@ class MACDCalculator:
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
-                input_fingerprint: str = None):
+                input_fingerprint: str = None,
+                write_start: str = None, write_end: str = None):
         dws_cols = ["ts_code", "trade_date", "ema_12", "ema_26", "dif", "dea",
                     "macd_bar", "divergence", "zone", "turning_point", "alert",
                     "trend", "trend_strength", "calc_date",
@@ -304,4 +250,5 @@ class MACDCalculator:
         float_cols = ["ema_12", "ema_26", "dif", "dea", "macd_bar", "trend_strength"]
         insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
                          dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint)
+                         input_fingerprint=input_fingerprint,
+                         write_start=write_start, write_end=write_end)

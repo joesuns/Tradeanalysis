@@ -1,6 +1,41 @@
 import pandas as pd
 import numpy as np
-from backend.etl.calc_ma import MACalculator
+from backend.etl.calc_ma import MACalculator, _compute_slope_pct
+from backend.etl.base import linear_regression_slope
+
+
+# ── B2 golden-master: frozen pre-vectorization oracle (unweighted OLS slope) ──
+
+def _oracle_slope_pct(series, window=5):
+    result = np.full(len(series), np.nan)
+    for i in range(window - 1, len(series)):
+        segment = series[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        if len(valid) < window or series[i] == 0:
+            continue
+        raw_slope = linear_regression_slope(valid, use_log=False)
+        result[i] = raw_slope / series[i] * 100.0
+    return result
+
+
+def test_ma_slope_pct_matches_oracle_random():
+    rng = np.random.default_rng(31)
+    for _ in range(40):
+        series = rng.normal(10, 2.0, size=rng.integers(5, 90))
+        if rng.random() < 0.5:
+            idx = rng.integers(0, len(series), size=max(1, len(series) // 6))
+            series[idx] = np.nan
+        got = _compute_slope_pct(series)
+        exp = _oracle_slope_pct(series)
+        np.testing.assert_array_equal(np.isnan(got), np.isnan(exp))
+        m = ~np.isnan(exp)
+        np.testing.assert_allclose(got[m], exp[m], rtol=0, atol=1e-9)
+
+
+def test_ma_slope_pct_zero_current_value_skipped():
+    series = np.array([1.0, 2.0, 3.0, 4.0, 0.0, 6.0, 7.0, 8.0, 9.0])
+    got = _compute_slope_pct(series)
+    assert np.isnan(got[4]), "series[i]==0 must be skipped (NaN)"
 
 
 def test_ma5_ma10_formula():

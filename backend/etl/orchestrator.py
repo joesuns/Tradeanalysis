@@ -8,6 +8,8 @@ Usage:
 """
 
 import logging
+import multiprocessing
+import os
 import time
 from typing import Optional
 from datetime import datetime
@@ -32,6 +34,33 @@ from backend.etl.calc_price_position import PricePositionCalculator
 
 CALCULATORS = [MACDCalculator, MACalculator, KPatternCalculator,
                DDECalculator, VolumeCalculator, PricePositionCalculator]
+
+QUOTE_COLUMNS = [
+    "trade_date", "open_qfq", "high_qfq", "low_qfq",
+    "close_qfq", "vol", "pct_chg",
+]
+QUOTE_CALCULATORS = [
+    MACDCalculator, MACalculator, KPatternCalculator,
+    VolumeCalculator, PricePositionCalculator,
+]
+
+
+def resolve_calc_workers() -> int:
+    """Resolve calc parallelism: CALC_WORKERS env or min(cpu-1, 8).
+
+    CALC_WORKERS controls the number of calc *threads* (not processes).
+    DuckDB's single-file lock forbids concurrent read-write processes, so calc
+    parallelism is thread-based, sharing one in-process DuckDB instance.
+    Invalid (non-integer) values fall back to the default with a warning.
+    """
+    env = os.getenv("CALC_WORKERS", "").strip()
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            logger.warning("Invalid CALC_WORKERS=%r, falling back to default", env)
+    return max(1, min(multiprocessing.cpu_count() - 1, 8))
+
 
 
 def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
@@ -199,8 +228,38 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
         con.close()
 
 
-WARMUP_TDAYS = 250  # max across all indicators: PP250d window (pp120=120, divergence=60, MACD=27)
-WEEKLY_WARMUP_WEEKS = 120  # volume weekly pct_rank/zone window (120 week-end bars)
+def _derive_warmup_constants():
+    from backend.etl.recalc_spec import resolve_warmup_tdays, resolve_weekly_warmup_weeks
+    return resolve_warmup_tdays(), resolve_weekly_warmup_weeks()
+
+
+WARMUP_TDAYS, WEEKLY_WARMUP_WEEKS = _derive_warmup_constants()
+
+
+def resolve_recalc_start(con, calc_date: str, freq: str) -> Optional[str]:
+    """Backtrack resolve_recalc_bars trade/week-end days from calc_date via dim_date."""
+    from backend.etl.recalc_spec import collect_specs, resolve_recalc_bars
+
+    n_bars = resolve_recalc_bars(collect_specs(freq))
+    if freq == "weekly":
+        row = con.execute("""
+            SELECT trade_date FROM (
+                SELECT trade_date,
+                       ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
+                FROM dim_date
+                WHERE is_trade_day = 1 AND is_week_end = 1 AND trade_date <= ?
+            ) WHERE rn = ?
+        """, [calc_date, n_bars]).fetchone()
+    else:
+        row = con.execute("""
+            SELECT trade_date FROM (
+                SELECT trade_date,
+                       ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
+                FROM dim_date
+                WHERE is_trade_day = 1 AND trade_date <= ?
+            ) WHERE rn = ?
+        """, [calc_date, n_bars]).fetchone()
+    return row[0] if row else None
 
 
 def resolve_weekly_warmup_start(con, end_date: str,
@@ -263,19 +322,34 @@ def _available_week_ends_batch(con, ts_codes: list[str], end_date: str) -> dict:
     return {r[0]: r[1] for r in rows}
 
 
-def _count_week_end_bars_batch(con, ts_codes: list[str]) -> dict:
+def _count_week_end_bars_batch(con, ts_codes: list[str],
+                               calc_date: str) -> dict:
+    """Count week-end bars in dwd_weekly within [weekly_warmup_start, calc_date].
+
+    Aligns with resolve_weekly_warmup_start / fetch history window; per-stock
+    floor is max(weekly_start, list_date).
+    """
     if not ts_codes:
         return {}
+    weekly_start = resolve_weekly_warmup_start(con, calc_date)
+    if not weekly_start:
+        return {code: 0 for code in ts_codes}
     try:
         placeholders = ",".join(["?" for _ in ts_codes])
         rows = con.execute(f"""
             SELECT w.ts_code, COUNT(*)
             FROM dwd_weekly_quote w
             JOIN dim_date d ON w.trade_date = d.trade_date AND d.is_week_end = 1
+            LEFT JOIN dim_stock s ON w.ts_code = s.ts_code
             WHERE w.ts_code IN ({placeholders})
+              AND w.trade_date <= ?
+              AND w.trade_date >= GREATEST(?, COALESCE(s.list_date, ?))
             GROUP BY w.ts_code
-        """, ts_codes).fetchall()
-        return {r[0]: r[1] for r in rows}
+        """, ts_codes + [calc_date, weekly_start, weekly_start]).fetchall()
+        result = {r[0]: r[1] for r in rows}
+        for code in ts_codes:
+            result.setdefault(code, 0)
+        return result
     except Exception:
         return {}
 
@@ -316,7 +390,7 @@ def check_data_completeness(con, ts_codes: list[str],
     dwd_data = {r[0]: {"dwd_rows": r[1], "min_date": r[2], "max_date": r[3]}
                 for r in rows}
 
-    week_end_counts = _count_week_end_bars_batch(con, ts_codes)
+    week_end_counts = _count_week_end_bars_batch(con, ts_codes, calc_date)
     available_counts = _available_week_ends_batch(con, ts_codes, calc_date)
 
     for ts_code in ts_codes:
@@ -602,35 +676,96 @@ def _write_skip_log_batch(con, calc_date: str, indicator: str, freq: str,
         )
 
 
-def _calc_stock_chunk(chunk: list[str], calc_date: str) -> int:
+def calc_stock_pipeline(con, ts_code: str, calc_date: str,
+                        daily_recalc: Optional[str] = None,
+                        weekly_recalc: Optional[str] = None) -> list:
+    """Run all 12 indicator×freq calcs for one stock with shared quote loads.
+
+    Returns list of (indicator_name, freq, CalcResult) tuples.
+    """
+    from backend.etl.base import load_quote_groups
+    from backend.etl.recalc_spec import resolve_load_start
+
+    outputs = []
+    for freq, recalc_start in (("daily", daily_recalc), ("weekly", weekly_recalc)):
+        load_start = None
+        if recalc_start:
+            load_start = resolve_load_start(con, recalc_start, freq)
+        src = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
+        quote_groups = load_quote_groups(
+            con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=load_start,
+        )
+
+        for CalcCls in QUOTE_CALCULATORS:
+            calc = CalcCls(con, freq)
+            name = CalcCls.__name__.replace("Calculator", "").lower()
+            result = calc.calculate(
+                [ts_code], calc_date, recalc_start=recalc_start,
+                quote_groups=quote_groups,
+            )
+            outputs.append((name, freq, result))
+
+        dde = DDECalculator(con, freq)
+        result = dde.calculate([ts_code], calc_date, recalc_start=recalc_start)
+        outputs.append(("dde", freq, result))
+
+    return outputs
+
+
+def _count_calc_rows(con, table: str, calc_date: str, ts_codes: list) -> int:
+    """Count DWS rows written for a specific calc_date AND ts_code set.
+
+    Scoped by ts_code so per-chunk totals are disjoint — summing chunk results
+    yields the true grand total (the old whole-table COUNT double-counted across
+    threads/chunks).
+    """
+    if not ts_codes:
+        return 0
+    ph = ",".join(["?"] * len(ts_codes))
+    return con.execute(
+        f"SELECT COUNT(*) FROM {table} "
+        f"WHERE calc_date = ? AND ts_code IN ({ph})",
+        [calc_date] + list(ts_codes),
+    ).fetchone()[0]
+
+
+def _calc_stock_chunk(chunk: list[str], calc_date: str,
+                      incremental: bool = True) -> int:
     """Worker: run all calculators for one stock chunk in a dedicated connection."""
     import duckdb
     from backend.config import DUCKDB_PATH
 
     con = duckdb.connect(DUCKDB_PATH)
     try:
+        if incremental:
+            daily_recalc = resolve_recalc_start(con, calc_date, "daily")
+            weekly_recalc = resolve_recalc_start(con, calc_date, "weekly")
+        else:
+            daily_recalc = weekly_recalc = None
+        from collections import defaultdict
+
+        agg_by_key = defaultdict(CalcResult)
+        for ts_code in chunk:
+            for indicator_name, freq, result in calc_stock_pipeline(
+                    con, ts_code, calc_date, daily_recalc, weekly_recalc):
+                key = (indicator_name, freq)
+                agg = agg_by_key[key]
+                agg.calculated += result.calculated
+                for reason, items in result.skipped.items():
+                    for code, detail in items:
+                        agg.add_skip(reason, code, detail)
+
         chunk_total = 0
         for CalcCls in CALCULATORS:
             indicator_name = CalcCls.__name__.replace("Calculator", "").lower()
             for freq in ("daily", "weekly"):
                 calc = CalcCls(con, freq)
-                agg_result = CalcResult()
-
-                for i in range(0, len(chunk), 100):
-                    batch = chunk[i:i + 100]
-                    batch_result = calc.calculate(batch, calc_date)
-                    agg_result.calculated += batch_result.calculated
-                    for reason, items in batch_result.skipped.items():
-                        for ts_code, detail in items:
-                            agg_result.add_skip(reason, ts_code, detail)
+                agg_result = agg_by_key.get((indicator_name, freq), CalcResult())
 
                 _write_skip_log_batch(con, calc_date, indicator_name, freq,
                                       agg_result.skipped)
 
-                n = con.execute(
-                    f"SELECT COUNT(*) FROM {calc.dws_table} "
-                    f"WHERE calc_date = ?", (calc_date,),
-                ).fetchone()[0]
+                n = _count_calc_rows(con, calc.dws_table, calc_date, chunk)
                 chunk_total += n
 
                 skip_parts = []
@@ -829,25 +964,38 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         logger.warning("No stocks with sufficient data to calculate")
         return
 
-    # 4. 计算 DWS — multi-threaded by stock chunk
-    import concurrent.futures
-    WORKERS = 3
-    chunk_size = max(1, (len(codes_to_calc) + WORKERS - 1) // WORKERS)
+    # 4. 计算 DWS — ThreadPoolExecutor by stock chunk.
+    #    DuckDB 单文件仅允许一个 read-write 进程；multiprocessing 会争文件锁
+    #    （IOException: Could not set lock）。线程共享同一进程 DuckDB 实例，
+    #    支持多写线程（MVCC），与 ods_daily fetch 的 3 线程模式一致。
+    workers = resolve_calc_workers()
+    chunk_size = max(1, (len(codes_to_calc) + workers - 1) // workers)
     chunks = [codes_to_calc[i:i + chunk_size]
               for i in range(0, len(codes_to_calc), chunk_size)]
 
-    logger.info("calc %d stocks with %d threads (%d stocks/thread)",
-                len(codes_to_calc), WORKERS, chunk_size)
+    logger.info("calc %d stocks with %d threads (%d stocks/chunk)",
+                len(codes_to_calc), workers, chunk_size)
 
     lid, t0 = log_etl_start(con, "calc_dws")
-    grand_total = 0
     calc_start = time.monotonic()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = [pool.submit(_calc_stock_chunk, chunk, calc_date)
-                   for chunk in chunks]
-        for f in concurrent.futures.as_completed(futures):
-            grand_total += f.result()
+    from backend.config import CALC_INCREMENTAL
+    from backend.log_config import _run_id, set_run_id
+    from concurrent.futures import ThreadPoolExecutor
+
+    rid = _run_id.get()
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        initializer=set_run_id,
+        initargs=(rid,),
+    ) as executor:
+        results = list(executor.map(
+            _calc_stock_chunk,
+            chunks,
+            [calc_date] * len(chunks),
+            [CALC_INCREMENTAL] * len(chunks),
+        ))
+    grand_total = sum(results)
 
     total_elapsed = time.monotonic() - calc_start
     logger.info("calc ALL DONE — %d total DWS rows across %d indicator×freq pairs, %.0fs",
