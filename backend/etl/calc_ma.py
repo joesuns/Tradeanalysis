@@ -38,6 +38,8 @@ class MACalculator:
     RECALC_SPEC_DAILY = RecalcSpec(lookback=10, seed=10, event_tail=5, min_rows=11)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=10, seed=10, event_tail=5, min_rows=11)
 
+    SIGNATURE_COLS = ["close_qfq"]
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
@@ -238,7 +240,7 @@ class MACalculator:
         """APPEND mode: compute over full tail window, write only new_bars."""
         result = CalcResult()
         df = self._compute_indicators_append(df, new_bars)
-        fp = compute_history_signature(df, ["close_qfq"])
+        fp = compute_history_signature(df, self.SIGNATURE_COLS)
         self._insert(ts_code, df, calc_date, input_fingerprint=fp,
                      write_start=new_bars[0], write_end=new_bars[-1])
         result.calculated += 1

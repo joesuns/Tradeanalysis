@@ -23,6 +23,8 @@ class KPatternCalculator:
     RECALC_SPEC_DAILY = RecalcSpec(lookback=60, seed=10, event_tail=5, min_rows=30)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=60, seed=10, event_tail=5, min_rows=30)
 
+    SIGNATURE_COLS = ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol"]
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
@@ -390,9 +392,7 @@ class KPatternCalculator:
         if self.con is not None:
             is_st = self._is_st_stock(ts_code)
         df = self._compute_patterns_append(df, new_bars, is_st)
-        fp = compute_history_signature(
-            df, ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol"]
-        )
+        fp = compute_history_signature(df, self.SIGNATURE_COLS)
         self._insert(ts_code, df, calc_date, input_fingerprint=fp,
                      write_start=new_bars[0], write_end=new_bars[-1])
         result.calculated += 1

@@ -27,6 +27,11 @@ class DDECalculator:
     RECALC_SPEC_DAILY = RecalcSpec(lookback=60, seed=5, event_tail=5, min_rows=10)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=60, seed=5, event_tail=5, min_rows=10)
 
+    SIGNATURE_COLS = [
+        "buy_lg_vol", "sell_lg_vol", "buy_elg_vol", "sell_elg_vol",
+        "total_vol", "net_mf_amount", "close_qfq",
+    ]
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
@@ -433,11 +438,7 @@ class DDECalculator:
             ("ddx2",), recalc_start=new_bars[0],
         )
         df = self._compute_indicators(df, ema_seeds=seeds)
-        fp = compute_history_signature(
-            df,
-            ["buy_lg_vol", "sell_lg_vol", "buy_elg_vol", "sell_elg_vol",
-             "total_vol", "net_mf_amount", "close_qfq"],
-        )
+        fp = compute_history_signature(df, self.SIGNATURE_COLS)
         self._insert(ts_code, df, calc_date, input_fingerprint=fp,
                      write_start=new_bars[0], write_end=new_bars[-1])
         result.calculated += 1

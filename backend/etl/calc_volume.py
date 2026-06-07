@@ -26,6 +26,8 @@ class VolumeCalculator:
     RECALC_SPEC_DAILY = RecalcSpec(lookback=120, seed=5, event_tail=5, min_rows=5)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=120, seed=5, event_tail=5, min_rows=5)
 
+    SIGNATURE_COLS = ["close_qfq", "vol"]
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
@@ -161,7 +163,7 @@ class VolumeCalculator:
         first_date = str(df["trade_date"].min())
         zone_seed = self._fetch_zone_seed(ts_code, before_date=first_date)
         df = self._compute_indicators_append(df, zone_seed=zone_seed)
-        fp = compute_history_signature(df, ["close_qfq", "vol"])
+        fp = compute_history_signature(df, self.SIGNATURE_COLS)
         self._insert(ts_code, df, calc_date, input_fingerprint=fp,
                      write_start=new_bars[0], write_end=new_bars[-1])
         result.calculated += 1

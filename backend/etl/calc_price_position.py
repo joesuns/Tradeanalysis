@@ -27,6 +27,8 @@ class PricePositionCalculator:
     RECALC_SPEC_DAILY = RecalcSpec(lookback=250, seed=0, event_tail=0, min_rows=2)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=250, seed=0, event_tail=0, min_rows=2)
 
+    SIGNATURE_COLS = ["close_qfq"]
+
     WINDOWS = [60, 120, 250]
 
     def __init__(self, con, freq: str = "daily"):
@@ -109,7 +111,7 @@ class PricePositionCalculator:
         """APPEND mode: compute over full tail window, write only new_bars."""
         result = CalcResult()
         df = self._compute_positions_append(df, new_bars)
-        fp = compute_history_signature(df, ["close_qfq"])
+        fp = compute_history_signature(df, self.SIGNATURE_COLS)
         self._insert(ts_code, df, calc_date, input_fingerprint=fp,
                      write_start=new_bars[0], write_end=new_bars[-1])
         result.calculated += 1

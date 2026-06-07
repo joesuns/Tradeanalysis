@@ -21,6 +21,8 @@ class MACDCalculator:
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=60, seed=26, event_tail=5, min_rows=27)
     """MACD indicator calculator. Works for both daily and weekly frequencies."""
 
+    SIGNATURE_COLS = ["close_qfq"]
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
@@ -256,7 +258,7 @@ class MACDCalculator:
             ("ema_12", "ema_26", "dea"), recalc_start=new_bars[0],
         )
         df = self._compute_indicators(df, ema_seeds=seeds)
-        fp = compute_history_signature(df, ["close_qfq"])
+        fp = compute_history_signature(df, self.SIGNATURE_COLS)
         self._insert(ts_code, df, calc_date, input_fingerprint=fp,
                      write_start=new_bars[0], write_end=new_bars[-1])
         result.calculated += 1
