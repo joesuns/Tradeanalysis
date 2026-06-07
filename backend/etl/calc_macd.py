@@ -8,6 +8,7 @@ from backend.etl.base import (
     compute_price_signal_divergence,
     insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
     load_latest_fingerprints, load_quote_groups, resolve_ema_seeds,
+    compute_history_signature,
     SkipReason, CalcResult,
 )
 from backend.etl.recalc_spec import RecalcSpec
@@ -238,6 +239,27 @@ class MACDCalculator:
                 elif bar[i - 1] != 0 and abs(bar[i] - bar[i - 1]) / abs(bar[i - 1]) <= 0.02:
                     result[i] = "downturn_flat"
 
+        return result
+
+    def append_calculate(self, ts_code: str, df: pd.DataFrame, new_bars: list,
+                         calc_date: str, state: dict) -> CalcResult:
+        """APPEND mode: compute over full tail-window df, write only new_bars.
+
+        EMA (ema_12, ema_26, dea) seeds are loaded from DWS at the bar
+        immediately before df[0], ensuring the seeded recursion is equivalent
+        to full-history computation on the new bars (atol=1e-9).
+        Falls back to SMA warm-up when seeds are unavailable.
+        """
+        result = CalcResult()
+        seeds = resolve_ema_seeds(
+            self.con, self.dws_table, ts_code, df, self.freq,
+            ("ema_12", "ema_26", "dea"), recalc_start=new_bars[0],
+        )
+        df = self._compute_indicators(df, ema_seeds=seeds)
+        fp = compute_history_signature(df, ["close_qfq"])
+        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                     write_start=new_bars[0], write_end=new_bars[-1])
+        result.calculated += 1
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,

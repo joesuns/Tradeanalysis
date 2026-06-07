@@ -16,6 +16,8 @@ import pytest
 from backend.etl.calc_price_position import PricePositionCalculator
 from backend.etl.calc_ma import MACalculator
 from backend.etl.calc_kpattern import KPatternCalculator
+from backend.etl.calc_macd import MACDCalculator
+from backend.etl.calc_dde import DDECalculator
 
 
 # ---------------------------------------------------------------------------
@@ -140,3 +142,138 @@ def test_kpattern_append_matches_full_on_new_bar():
         assert abs(float(a_str) - float(b_str)) < 1e-9, (
             f"strength: |{a_str} - {b_str}| >= 1e-9"
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared helper for DDE tests
+# ---------------------------------------------------------------------------
+
+def _make_moneyflow_df(n: int = 200) -> pd.DataFrame:
+    """Moneyflow + close df with all required DDE input columns."""
+    rng = np.random.default_rng(55)
+    close = 10.0 + np.cumsum(rng.normal(0, 0.2, n))
+    total_vol = rng.uniform(10000, 50000, n)
+    frac = rng.uniform(0.3, 0.7, n)
+    buy_lg = total_vol * frac * rng.uniform(0.2, 0.4, n)
+    sell_lg = total_vol * (1 - frac) * rng.uniform(0.2, 0.4, n)
+    buy_elg = total_vol * frac * rng.uniform(0.05, 0.15, n)
+    sell_elg = total_vol * (1 - frac) * rng.uniform(0.05, 0.15, n)
+    net_mf = buy_lg + buy_elg - sell_lg - sell_elg
+    return pd.DataFrame({
+        "trade_date": [f"26{i:06d}" for i in range(n)],
+        "buy_lg_vol":  buy_lg,
+        "sell_lg_vol": sell_lg,
+        "buy_elg_vol": buy_elg,
+        "sell_elg_vol":sell_elg,
+        "total_vol":   total_vol,
+        "net_mf_amount": net_mf,
+        "close_qfq":   close,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Task 9 — MACDCalculator
+# ---------------------------------------------------------------------------
+
+def test_macd_append_ema_matches_full():
+    """Seeded EMA one-step recursion: last bar ema_12/ema_26/dif/dea/macd_bar == FULL.
+
+    Seeds taken from FULL's second-to-last bar (simulating prior DWS state).
+    The new bar is processed alone with those seeds; result must equal FULL
+    on the same bar to atol=1e-9 by the EMA recursion property.
+    """
+    df = _make_df(80)
+    calc = MACDCalculator(None, "daily")
+
+    # FULL: SMA warm-up, no external seeds
+    full_df = calc._compute_indicators(df.copy())
+
+    # Seeds from second-to-last bar (what would be stored in DWS)
+    s_row = full_df.iloc[-2]
+    seeds = {
+        "ema_12": float(s_row["ema_12"]),
+        "ema_26": float(s_row["ema_26"]),
+        "dea":    float(s_row["dea"]),
+    }
+
+    # APPEND: only the new bar, seeded from bar N-2
+    new_bar_df = df.iloc[-1:].reset_index(drop=True)
+    app_df = calc._compute_indicators(new_bar_df.copy(), ema_seeds=seeds)
+
+    for col in ["ema_12", "ema_26", "dif", "dea", "macd_bar"]:
+        a = app_df.iloc[-1][col]
+        b = full_df.iloc[-1][col]
+        if pd.isna(b):
+            assert pd.isna(a), f"MACD {col}: expected NaN, got {a}"
+        else:
+            assert abs(a - b) < 1e-9, f"MACD {col}: |{a} - {b}| >= 1e-9"
+
+
+def test_macd_append_divergence_matches_full():
+    """Tail-window (80 bars) with seeded EMA: last bar divergence == FULL(200 bars).
+
+    tail_window >= 60+5 guarantees dedup context is fully within the window,
+    making divergence at the last bar identical to the full-history computation.
+    """
+    df_full = _make_df(200)
+    calc = MACDCalculator(None, "daily")
+
+    # FULL on all 200 bars
+    full_df = calc._compute_indicators(df_full.copy())
+
+    # APPEND: last 80 bars as tail window, seeds from bar just before tail[0]
+    tail = df_full.iloc[-80:].reset_index(drop=True)
+    s_row = full_df.iloc[-81]   # index 119, immediately before tail[0]=index 120
+    seeds = {
+        "ema_12": float(s_row["ema_12"]),
+        "ema_26": float(s_row["ema_26"]),
+        "dea":    float(s_row["dea"]),
+    }
+    app_df = calc._compute_indicators(tail.copy(), ema_seeds=seeds)
+
+    a_div = app_df.iloc[-1]["divergence"]
+    b_div = full_df.iloc[-1]["divergence"]
+    assert a_div == b_div, (
+        f"MACD divergence: append={a_div!r} != full={b_div!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 10 — DDECalculator
+# ---------------------------------------------------------------------------
+
+def test_dde_append_matches_full():
+    """DDE tail-window + seeded DDX2 gives same ddx/ddx2/divergence as FULL.
+
+    ddx is causal (no EMA), so it matches by construction.
+    ddx2 = EMA(ddx, 5) with seed from bar before tail[0] gives exact match.
+    Divergence uses ddx (causal) in a 60-bar window; tail >= 65 bars ensures
+    dedup context is fully contained, so last bar divergence matches FULL.
+    """
+    df_full = _make_moneyflow_df(200)
+    calc = DDECalculator(None, "daily")
+
+    # FULL on all 200 bars
+    full_df = calc._compute_indicators(df_full.copy())
+
+    # APPEND: last 80 bars + seed for ddx2 from bar just before tail[0]
+    tail = df_full.iloc[-80:].reset_index(drop=True)
+    s_row = full_df.iloc[-81]   # index 119, immediately before tail[0]=index 120
+    seeds = {"ddx2": float(s_row["ddx2"])}
+    app_df = calc._compute_indicators(tail.copy(), ema_seeds=seeds)
+
+    # DDX (causal, no EMA) and DDX2 (EMA with seed) must match exactly
+    for col in ["ddx", "ddx2"]:
+        a = app_df.iloc[-1][col]
+        b = full_df.iloc[-1][col]
+        if pd.isna(b):
+            assert pd.isna(a), f"DDE {col}: expected NaN, got {a}"
+        else:
+            assert abs(a - b) < 1e-9, f"DDE {col}: |{a} - {b}| >= 1e-9"
+
+    # Divergence: ddx is causal and tail >= 65 bars → last bar must match FULL
+    a_div = app_df.iloc[-1]["divergence"]
+    b_div = full_df.iloc[-1]["divergence"]
+    assert a_div == b_div, (
+        f"DDE divergence: append={a_div!r} != full={b_div!r}"
+    )
