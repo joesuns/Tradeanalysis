@@ -960,12 +960,13 @@ def _create_dws(con: duckdb.DuckDBPyConnection):
         CREATE TABLE IF NOT EXISTS dws_calc_state (
             ts_code           VARCHAR NOT NULL,
             freq              VARCHAR NOT NULL,
+            indicator         VARCHAR NOT NULL,
             last_trade_date   VARCHAR NOT NULL,
             history_fp        VARCHAR NOT NULL,
             quote_latest_adj  DOUBLE,
             spec_version      VARCHAR DEFAULT 'v1',
             updated_calc_date VARCHAR NOT NULL,
-            PRIMARY KEY (ts_code, freq)
+            PRIMARY KEY (ts_code, freq, indicator)
         )
     """)
 
