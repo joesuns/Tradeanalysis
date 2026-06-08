@@ -217,7 +217,8 @@ class DDECalculator:
         """, (ts_code, ts_code)).df()
 
     def _load_weekly_batch(self, ts_codes: list[str], chunk_size: int = 400,
-                           start_date: str = None) -> dict:
+                           start_date: str = None,
+                           tail_window: int = None) -> dict:
         """Batch version of _load_weekly: one query per chunk → {ts_code: df}.
 
         Carries ts_code through every CTE (PARTITION/GROUP BY already keyed by
@@ -227,7 +228,7 @@ class DDECalculator:
         for i in range(0, len(ts_codes), chunk_size):
             chunk = ts_codes[i:i + chunk_size]
             ph = ",".join(["?"] * len(chunk))
-            big = self.con.execute(f"""
+            inner = f"""
                 WITH week_ranges AS (
                     SELECT
                         wq.ts_code,
@@ -298,8 +299,32 @@ class DDECalculator:
                     ON wq.ts_code = wa.ts_code AND wq.trade_date = wa.week_end
                 WHERE wa.expected_days > 0
                 {(" AND wa.week_end >= ?" if start_date else "")}
-                ORDER BY wa.ts_code, wa.week_end
-            """, (chunk + [start_date]) if start_date else chunk).df()
+            """
+            if tail_window is not None:
+                query = f"""
+                    WITH base AS (
+                        {inner}
+                        ORDER BY wa.ts_code, wa.week_end
+                    ),
+                    ranked AS (
+                        SELECT *,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY ts_code ORDER BY trade_date DESC
+                               ) AS rn
+                        FROM base
+                    )
+                    SELECT ts_code, trade_date, buy_lg_vol, sell_lg_vol,
+                           buy_elg_vol, sell_elg_vol, total_vol, net_mf_amount,
+                           active_days, expected_days, close_qfq, _skip_dde
+                    FROM ranked
+                    WHERE rn <= ?
+                    ORDER BY ts_code, trade_date
+                """
+                params = (chunk + [start_date, tail_window]) if start_date else (chunk + [tail_window])
+            else:
+                query = inner + "\n                ORDER BY wa.ts_code, wa.week_end"
+                params = (chunk + [start_date]) if start_date else chunk
+            big = self.con.execute(query, params).df()
             if big.empty:
                 continue
             for ts_code, g in big.groupby("ts_code", sort=False):

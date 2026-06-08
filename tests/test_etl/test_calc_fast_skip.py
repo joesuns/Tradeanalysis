@@ -11,8 +11,12 @@ from backend.etl.calc_fast_skip import (
     batch_load_quote_tails,
     batch_load_dde_tails,
     preflight_stock_modes,
+    preflight_stock_modes_v2,
+    partition_preflight_modes,
     stock_can_fast_skip,
 )
+from backend.etl.calc_router import state_signature
+from backend.etl.calc_state import upsert_calc_state
 from backend.etl.calc_indicators import CALC_ROUTE_SPECS, quote_sig_col_union, quote_tail_columns
 from backend.etl.calc_dde import DDECalculator
 from backend.etl.base import load_quote_groups
@@ -225,6 +229,73 @@ def test_fast_skip_equivalent_to_slow_path_skip():
             state = state_map.get((TS, freq, indicator_name))
             slow_mode, _ = classify_calc_mode(df, state, sig_cols_i)
             assert mode == slow_mode
+    con.close()
+
+
+def test_partition_preflight_modes_splits_skip_and_run():
+    modes = {
+        ("macd", "daily"): ("SKIP", []),
+        ("ma", "daily"): ("FULL", []),
+        ("dde", "weekly"): ("SKIP", []),
+    }
+    skip_keys, run_keys = partition_preflight_modes(modes)
+    assert skip_keys == {("macd", "daily"), ("dde", "weekly")}
+    assert run_keys == {("ma", "daily")}
+
+
+def test_preflight_bse_empty_dde_treated_as_skip_not_fallthrough():
+    """BSE empty moneyflow → per-indicator SKIP, not whole-stock None."""
+    con = duckdb.connect(":memory:")
+    _minimal_db(con)
+    bj = "899999.BJ"
+    dates = [r[0] for r in con.execute(
+        "SELECT trade_date FROM dim_date WHERE is_trade_day=1 ORDER BY trade_date LIMIT 30"
+    ).fetchall()]
+    rng = np.random.default_rng(7)
+    close = 10.0 + np.cumsum(rng.normal(0, 0.1, len(dates)))
+    _seed_daily(con, bj, dates, close)
+    week_dates = dates[::5][:6]
+    _seed_week_end(con, bj, week_dates, close[: len(week_dates)])
+
+    tail_cols = quote_tail_columns()
+    daily = batch_load_quote_tails(con, [bj], "daily", tail_cols)
+    weekly = batch_load_quote_tails(con, [bj], "weekly", tail_cols)
+    last_td = daily[bj]["trade_date"].max()
+    state_map = {}
+    for indicator_name, freq, _, sig_cols, source in CALC_ROUTE_SPECS:
+        if source != "quote":
+            continue
+        df = daily[bj] if freq == "daily" else weekly.get(bj)
+        if df is None or df.empty:
+            continue
+        fp = state_signature(df, last_td, sig_cols)
+        upsert_calc_state(con, bj, freq, indicator_name,
+                          last_trade_date=last_td, history_fp=fp, calc_date="20260602")
+        state_map[(bj, freq, indicator_name)] = {
+            "last_trade_date": last_td,
+            "history_fp": fp,
+            "quote_latest_adj": None,
+            "updated_calc_date": "20260602",
+        }
+
+    modes = preflight_stock_modes_v2(
+        bj, state_map, daily.get(bj), weekly.get(bj), None, None,
+    )
+    assert modes is not None, "BSE must not fallthrough on empty DDE"
+    assert modes[("dde", "daily")][0] == "SKIP"
+    assert modes[("dde", "weekly")][0] == "SKIP"
+    assert stock_can_fast_skip(modes)
+    con.close()
+
+
+def test_load_weekly_batch_tail_window_limits_rows():
+    con = duckdb.connect(":memory:")
+    _minimal_db(con)
+    calc = DDECalculator(con, "weekly")
+    full = calc._load_weekly_batch([TS], tail_window=None)[TS]
+    tailed = calc._load_weekly_batch([TS], tail_window=SIG_WINDOW)[TS]
+    assert len(tailed) <= SIG_WINDOW
+    pd.testing.assert_frame_equal(tailed, full.tail(SIG_WINDOW).reset_index(drop=True))
     con.close()
 
 

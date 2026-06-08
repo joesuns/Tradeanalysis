@@ -73,9 +73,36 @@ def batch_load_dde_tails(con, ts_codes: List[str], freq: str,
     calc = DDECalculator(con, freq)
     if freq == "daily":
         groups = calc._load_daily_batch(ts_codes)
-    else:
-        groups = calc._load_weekly_batch(ts_codes)
-    return {code: _tail_frame(df, window) for code, df in groups.items()}
+        return {code: _tail_frame(df, window) for code, df in groups.items()}
+    groups = calc._load_weekly_batch(ts_codes, tail_window=window)
+    return groups
+
+
+def _classify_indicator_preflight(
+    ts_code: str,
+    indicator_name: str,
+    freq: str,
+    sig_cols: list,
+    source: str,
+    state: Optional[dict],
+    daily_q: Optional[pd.DataFrame],
+    weekly_q: Optional[pd.DataFrame],
+    daily_dde: Optional[pd.DataFrame],
+    weekly_dde: Optional[pd.DataFrame],
+) -> Optional[Tuple[str, list]]:
+    """Return (mode, new_bars) or None when slow-path required."""
+    if source == "quote":
+        df = daily_q if freq == "daily" else weekly_q
+        if df is None or len(df) == 0:
+            return None
+        return classify_calc_mode(df, state, sig_cols)
+
+    df = daily_dde if freq == "daily" else weekly_dde
+    if df is None or len(df) == 0:
+        if ts_code.endswith(".BJ"):
+            return "SKIP", []
+        return None
+    return classify_calc_mode(df, state, sig_cols)
 
 
 def preflight_stock_modes(
@@ -100,6 +127,43 @@ def preflight_stock_modes(
         mode, new_bars = classify_calc_mode(df, state, sig_cols)
         modes[(indicator_name, freq)] = (mode, new_bars)
     return modes
+
+
+def preflight_stock_modes_v2(
+    ts_code: str,
+    state_map: Dict[Tuple[str, str, str], dict],
+    daily_q: Optional[pd.DataFrame],
+    weekly_q: Optional[pd.DataFrame],
+    daily_dde: Optional[pd.DataFrame],
+    weekly_dde: Optional[pd.DataFrame],
+    specs=CALC_ROUTE_SPECS,
+) -> Optional[Dict[Tuple[str, str], Tuple[str, list]]]:
+    """v2 preflight: BSE empty DDE → per-indicator SKIP instead of whole-stock None."""
+    modes = {}
+    for indicator_name, freq, _, sig_cols, source in specs:
+        state = state_map.get((ts_code, freq, indicator_name))
+        out = _classify_indicator_preflight(
+            ts_code, indicator_name, freq, sig_cols, source, state,
+            daily_q, weekly_q, daily_dde, weekly_dde,
+        )
+        if out is None:
+            return None
+        modes[(indicator_name, freq)] = out
+    return modes
+
+
+def partition_preflight_modes(
+    modes: Dict[Tuple[str, str], Tuple[str, list]],
+) -> Tuple[set, set]:
+    """Return (skip_keys, run_keys) where run_keys need APPEND/FULL."""
+    skip_keys = set()
+    run_keys = set()
+    for key, (mode, _) in modes.items():
+        if mode == "SKIP":
+            skip_keys.add(key)
+        else:
+            run_keys.add(key)
+    return skip_keys, run_keys
 
 
 def stock_can_fast_skip(modes: Dict[Tuple[str, str], Tuple[str, list]]) -> bool:

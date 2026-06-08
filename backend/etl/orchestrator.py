@@ -771,6 +771,69 @@ def calc_stock_pipeline(con, ts_code: str, calc_date: str,
     return outputs
 
 
+def calc_stock_pipeline_selective(
+    con, ts_code: str, calc_date: str,
+    daily_recalc: Optional[str] = None,
+    weekly_recalc: Optional[str] = None,
+    run_keys: Optional[set] = None,
+) -> list:
+    """Run only (indicator, freq) in run_keys; same loads/routing as full pipeline."""
+    from backend.etl.base import load_quote_groups
+    from backend.etl.recalc_spec import resolve_load_start
+    from backend.config import CALC_APPEND
+    from backend.etl.calc_indicators import CALC_ROUTE_SPECS
+
+    if not run_keys:
+        return []
+
+    outputs = []
+    specs_by_freq = {"daily": [], "weekly": []}
+    for indicator_name, freq, CalcCls, _, source in CALC_ROUTE_SPECS:
+        if (indicator_name, freq) in run_keys:
+            specs_by_freq[freq].append((indicator_name, CalcCls, source))
+
+    for freq, recalc_start in (("daily", daily_recalc), ("weekly", weekly_recalc)):
+        freq_specs = specs_by_freq[freq]
+        if not freq_specs:
+            continue
+        load_start = resolve_load_start(con, recalc_start, freq) if recalc_start else None
+        append_on = CALC_APPEND and recalc_start is not None
+
+        quote_groups = {}
+        qdf = None
+        if any(s[2] == "quote" for s in freq_specs):
+            src = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
+            quote_groups = load_quote_groups(
+                con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=load_start,
+            )
+            qdf = quote_groups.get(ts_code)
+
+        dde_groups = {}
+        ddf = None
+        if any(s[0] == "dde" for s in freq_specs):
+            dde = DDECalculator(con, freq)
+            if freq == "daily":
+                dde_groups = dde._load_daily_batch([ts_code], start_date=load_start)
+            else:
+                dde_groups = dde._load_weekly_batch([ts_code], start_date=load_start)
+            ddf = dde_groups.get(ts_code)
+
+        for indicator_name, CalcCls, source in freq_specs:
+            calc = CalcCls(con, freq)
+            if source == "quote":
+                result = _route_calc(
+                    con, calc, indicator_name, freq, ts_code, qdf, calc_date,
+                    recalc_start, quote_groups, append_on,
+                )
+            else:
+                result = _route_calc(
+                    con, calc, "dde", freq, ts_code, ddf, calc_date,
+                    recalc_start, None, append_on,
+                )
+            outputs.append((indicator_name, freq, result))
+    return outputs
+
+
 _calc_progress_lock = threading.Lock()
 _calc_progress = {"done": 0, "total": 0, "t0": 0.0, "step": 1}
 
@@ -849,13 +912,15 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
         from backend.etl.calc_fast_skip import (
             batch_load_quote_tails,
             batch_load_dde_tails,
-            preflight_stock_modes,
-            stock_can_fast_skip,
+            preflight_stock_modes_v2,
+            partition_preflight_modes,
         )
 
         agg_by_key = defaultdict(CalcResult)
         fast_on = CALC_FAST_SKIP and CALC_APPEND and incremental
-        fast_skip_count = 0
+        full_skip_count = 0
+        partial_run_count = 0
+        fallthrough_count = 0
         state_map = {}
         daily_tails = weekly_tails = dde_daily = dde_weekly = {}
         if fast_on:
@@ -869,21 +934,36 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
         for ts_code in chunk:
             modes = None
             if fast_on:
-                modes = preflight_stock_modes(
+                modes = preflight_stock_modes_v2(
                     ts_code, state_map,
                     daily_tails.get(ts_code), weekly_tails.get(ts_code),
                     dde_daily.get(ts_code), dde_weekly.get(ts_code),
                 )
-            if modes is not None and stock_can_fast_skip(modes):
-                for indicator_name, freq, _, _, _ in CALC_ROUTE_SPECS:
+            if modes is not None:
+                skip_keys, run_keys = partition_preflight_modes(modes)
+                for indicator_name, freq in skip_keys:
                     agg_by_key[(indicator_name, freq)].add_skip(
                         SkipReason.FINGERPRINT_MATCH, ts_code,
                         "fast_skip: preflight",
                     )
-                fast_skip_count += 1
+                if not run_keys:
+                    full_skip_count += 1
+                    _report_calc_progress()
+                    continue
+                for indicator_name, freq, result in calc_stock_pipeline_selective(
+                        con, ts_code, calc_date, daily_recalc, weekly_recalc,
+                        run_keys=run_keys):
+                    key = (indicator_name, freq)
+                    agg = agg_by_key[key]
+                    agg.calculated += result.calculated
+                    for reason, items in result.skipped.items():
+                        for code, detail in items:
+                            agg.add_skip(reason, code, detail)
+                partial_run_count += 1
                 _report_calc_progress()
                 continue
 
+            fallthrough_count += 1
             for indicator_name, freq, result in calc_stock_pipeline(
                     con, ts_code, calc_date, daily_recalc, weekly_recalc):
                 key = (indicator_name, freq)
@@ -895,8 +975,10 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
             _report_calc_progress()
 
         if fast_on:
-            logger.info("calc fast_skip: %d/%d stocks in chunk",
-                        fast_skip_count, len(chunk))
+            logger.info(
+                "calc partial_skip: full_skip=%d partial_run=%d fallthrough=%d / %d stocks",
+                full_skip_count, partial_run_count, fallthrough_count, len(chunk),
+            )
 
         chunk_total = 0
         for CalcCls in CALCULATORS:
