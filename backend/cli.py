@@ -112,6 +112,7 @@ def cmd_fetch(args):
     --ts-code: stock-batched mode, per-stock incremental detection.
     """
     from backend.db.connection import get_connection
+    from backend.etl.error_handler import log_etl_end, log_etl_start
     from backend.fetch.client import TushareClient
     from backend.fetch.ods_daily import (
         fetch_by_date_range_parallel,
@@ -121,6 +122,7 @@ def cmd_fetch(args):
 
     client = TushareClient()
     con = get_connection()
+    lid, t0 = log_etl_start(con, "cli_fetch")
     try:
         start = args.start or "20150101"
         end = args.end or "20991231"
@@ -129,13 +131,22 @@ def cmd_fetch(args):
             codes = args.ts_code if isinstance(args.ts_code, list) else [args.ts_code]
             logger.info("Stock-batched fetch: %d stocks, %s~%s", len(codes), start, end)
             n = fetch_stocks_incremental(client, con, codes, start=start, end=end)
+            mode = "stock"
         else:
             codes = get_all_active_codes(con)
             logger.info("Date-batched fetch: %d active stocks, %s~%s", len(codes), start, end)
             n = fetch_by_date_range_parallel(
                 start, end, workers=3, ts_codes=codes, con=con
             )
-        print(f"Fetched {n} rows")
+            mode = "date"
+        log_etl_end(
+            con, lid, "cli_fetch", t0, "success", row_count=n,
+            data_completeness={"mode": mode, "start": start, "end": end},
+        )
+        logger.info("Fetch complete: %d ODS rows", n)
+    except Exception:
+        log_etl_end(con, lid, "cli_fetch", t0, "failed")
+        raise
     finally:
         con.close()
 
@@ -201,6 +212,30 @@ def cmd_export(args):
 
 # ── run ──
 
+def _rebuild_dwd_for_run(con, codes: list[str], date: str, n_fetch: int) -> dict:
+    """Rebuild DWD after run fetch step.
+
+    n_fetch > 0: rebuild all codes (new ODS data).
+    n_fetch == 0: rebuild only find_stale_dwd_codes; skip if none stale.
+    Returns rebuild_all_dwd result dict, or {} if skipped.
+    """
+    from backend.etl.build_dwd import rebuild_all_dwd
+
+    if n_fetch > 0:
+        logger.info("Rebuilding DWD for %d stocks (fetch wrote %d ODS rows)", len(codes), n_fetch)
+        return rebuild_all_dwd(con, codes)
+
+    from backend.etl.orchestrator import find_stale_dwd_codes
+
+    stale = find_stale_dwd_codes(con, codes, date)
+    if not stale:
+        logger.info("DWD fresh for %s — skip rebuild (%d stocks checked)", date, len(codes))
+        return {}
+    logger.info("DWD stale for %d/%d stocks on %s — rebuilding subset",
+                len(stale), len(codes), date)
+    return rebuild_all_dwd(con, stale)
+
+
 def cmd_run(args):
     """One-command daily analysis: fetch → calc → export.
 
@@ -208,6 +243,7 @@ def cmd_run(args):
     runs all DWS calculators, and exports the Excel report.
     """
     from backend.db.connection import get_connection
+    from backend.etl.error_handler import log_etl_end, log_etl_start
     from backend.export_wide import default_export_path, export_wide_to_excel
     from backend.fetch.client import TushareClient
     from backend.fetch.ods_daily import (
@@ -215,8 +251,6 @@ def cmd_run(args):
         fetch_stocks_incremental,
         get_all_active_codes,
     )
-    from backend.etl.build_dwd import rebuild_all_dwd
-
     # Resolve date on a short-lived connection, then close before later steps.
     con = get_connection()
     try:
@@ -232,6 +266,7 @@ def cmd_run(args):
     con = get_connection()
     try:
         codes = ts_codes or get_all_active_codes(con)
+        lid, t0 = log_etl_start(con, "run_fetch")
         if ts_codes:
             client = TushareClient()
             n_fetch = fetch_stocks_incremental(
@@ -240,7 +275,22 @@ def cmd_run(args):
             n_fetch = fetch_by_date_range_parallel(
                 date, date, workers=3, ts_codes=codes, con=con)
         logger.info("Fetch complete: %d ODS rows for %s", n_fetch, date)
-        rebuild_all_dwd(con, codes)
+        log_etl_end(
+            con, lid, "run_fetch", t0, "success", row_count=n_fetch,
+            data_completeness={"analysis_date": date, "stocks": len(codes)},
+        )
+
+        lid, t0 = log_etl_start(con, "run_rebuild_dwd")
+        dwd_result = _rebuild_dwd_for_run(con, codes, date, n_fetch)
+        rebuild_rows = sum(dwd_result.values()) if dwd_result else 0
+        log_etl_end(
+            con, lid, "run_rebuild_dwd", t0, "success", row_count=rebuild_rows,
+            data_completeness={
+                "analysis_date": date,
+                "skipped": not dwd_result,
+                "n_fetch": n_fetch,
+            },
+        )
     finally:
         con.close()
 
@@ -248,21 +298,34 @@ def cmd_run(args):
     args.date = date
     cmd_calc(args, skip_stale_fetch=True)
 
-    logger.info("=== Step 3/3: Exporting analysis for %s ===", date)
-    args.output = default_export_path(date, args.output)
+    if not getattr(args, "skip_export", False):
+        logger.info("=== Step 3/3: Exporting analysis for %s ===", date)
+        args.output = default_export_path(date, args.output)
 
-    n = export_wide_to_excel(
-        db_path,
-        date,
-        args.output,
-        filter_st=not args.include_st,
-        include_index=not args.no_index,
-        ts_codes=ts_codes,
-    )
-    _warn_export_coverage(
-        db_path, date, n, filter_st=not args.include_st, ts_codes=ts_codes,
-    )
-    print(f"Exported {n} rows -> {args.output}")
+        con = get_connection()
+        try:
+            lid, t0 = log_etl_start(con, "run_export")
+            n = export_wide_to_excel(
+                db_path,
+                date,
+                args.output,
+                filter_st=not args.include_st,
+                include_index=not args.no_index,
+                ts_codes=ts_codes,
+            )
+            log_etl_end(
+                con, lid, "run_export", t0, "success", row_count=n,
+                data_completeness={"analysis_date": date},
+            )
+        finally:
+            con.close()
+
+        _warn_export_coverage(
+            db_path, date, n, filter_st=not args.include_st, ts_codes=ts_codes,
+        )
+        print(f"Exported {n} rows -> {args.output}")
+    else:
+        logger.info("Skipping export (--skip-export)")
     logger.info("Done.")
 
 
@@ -423,6 +486,8 @@ def main():
     rp.add_argument("--no-index", action="store_true")
     rp.add_argument("--force", action="store_true",
                     help="Force recalc even if calc_date already completed")
+    rp.add_argument("--skip-export", action="store_true",
+                    help="Skip Excel export (same-day rerun when report unchanged)")
 
     # prune
     pp = sp.add_parser("prune", help="Prune superseded DWS snapshots (keep last N runs)")

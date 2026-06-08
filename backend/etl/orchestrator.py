@@ -927,9 +927,9 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
         fallthrough_count = 0
         state_map = {}
         daily_tails = weekly_tails = dde_daily = dde_weekly = {}
-        if batch_ctx and batch_ctx.get("state_map") is not None:
+        if batch_ctx is not None:
             state_map = {
-                k: v for k, v in batch_ctx["state_map"].items()
+                k: v for k, v in batch_ctx.get("state_map", {}).items()
                 if k[0] in chunk
             }
             daily_tails = {c: batch_ctx["daily_tails"][c] for c in chunk
@@ -939,8 +939,8 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
             dde_daily = {c: batch_ctx["dde_daily"][c] for c in chunk
                          if c in batch_ctx.get("dde_daily", {})}
             dde_weekly = {c: batch_ctx["dde_weekly"][c] for c in chunk
-                            if c in batch_ctx.get("dde_weekly", {})}
-            fast_on = True
+                          if c in batch_ctx.get("dde_weekly", {})}
+            fast_on = CALC_FAST_SKIP and CALC_APPEND and incremental
         elif fast_on:
             state_map = load_calc_state_batch(con, chunk)
             tail_cols = quote_tail_columns()
@@ -949,8 +949,11 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
             dde_daily = batch_load_dde_tails(con, chunk, "daily")
             dde_weekly = batch_load_dde_tails(con, chunk, "weekly")
 
-        from backend.etl.calc_state import write_calc_state_from_df
+        from backend.config import CALC_SKIP_STATE_REFRESH
+        from backend.etl.calc_router import state_signature
+        from backend.etl.calc_state import should_refresh_calc_state, upsert_calc_state_batch
 
+        skip_state_records = []
         for ts_code in chunk:
             modes = None
             if fast_on:
@@ -978,10 +981,13 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                         tdf = daily_tails.get(ts_code) if freq == "daily" else weekly_tails.get(ts_code)
                     else:
                         tdf = dde_daily.get(ts_code) if freq == "daily" else dde_weekly.get(ts_code)
-                    write_calc_state_from_df(
-                        con, ts_code, freq, indicator_name, tdf, sig_cols, calc_date,
-                        last_trade_date=st["last_trade_date"],
-                    )
+                    if tdf is None or tdf.empty:
+                        continue
+                    fp = state_signature(tdf, st["last_trade_date"], sig_cols)
+                    if not CALC_SKIP_STATE_REFRESH or should_refresh_calc_state(st, calc_date, fp):
+                        skip_state_records.append((
+                            ts_code, freq, indicator_name, st["last_trade_date"], fp, calc_date, None,
+                        ))
                 if completed_keys:
                     run_keys = {
                         k for k in run_keys
@@ -1022,6 +1028,8 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                     for code, detail in items:
                         agg.add_skip(reason, code, detail)
             _report_calc_progress()
+
+        upsert_calc_state_batch(con, skip_state_records)
 
         if fast_on:
             logger.info(

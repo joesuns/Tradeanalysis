@@ -1,7 +1,12 @@
+import logging
+import time
+
 import duckdb
 import pandas as pd
 from datetime import datetime
 from openpyxl import Workbook
+
+logger = logging.getLogger(__name__)
 from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -131,6 +136,8 @@ def export_wide_to_excel(
     Row 1 merges group labels (日线指标/周线指标), Row 2 has individual column names.
     Returns total rows written.
     """
+    logger.info("progress export: started | date=%s", trade_date)
+    t0 = time.monotonic()
     con = duckdb.connect(db_path)
 
     # ---- Daily data ----
@@ -141,7 +148,13 @@ def export_wide_to_excel(
     ).df()
     if daily.empty:
         con.close()
+        logger.info("progress export: done | rows=0 | %.0fs", time.monotonic() - t0)
         return 0
+
+    logger.info(
+        "progress export: daily query done | rows=%d | %.0fs",
+        len(daily), time.monotonic() - t0,
+    )
 
     # ---- Optional ts_code filter ----
     if ts_codes:
@@ -197,6 +210,8 @@ def export_wide_to_excel(
         merged = daily.copy()
         weekly_cols = []
 
+    logger.info("progress export: weekly merge done | %.0fs", time.monotonic() - t0)
+
     # ---- Write to Excel ----
     wb = Workbook()
     wb.remove(wb.active)
@@ -234,7 +249,12 @@ def export_wide_to_excel(
     if parent:
         os.makedirs(parent, exist_ok=True)
 
+    logger.info("progress export: writing xlsx | path=%s", output_path)
     wb.save(output_path)
+    logger.info(
+        "progress export: done | rows=%d | %.0fs",
+        len(merged), time.monotonic() - t0,
+    )
     return len(merged)
 
 

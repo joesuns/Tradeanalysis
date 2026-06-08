@@ -799,6 +799,68 @@ def test_count_week_end_bars_ignores_dwd_without_dim_stock():
     con.close()
 
 
+def test_calc_stock_chunk_reuses_batch_ctx_without_reload(monkeypatch):
+    """When batch_ctx is provided, chunk must not call load_calc_state_batch / batch_load_*."""
+    import importlib
+
+    import pandas as pd
+
+    import backend.config as cfg
+    from backend.etl.calc_indicators import CALC_ROUTE_SPECS
+    from backend.etl.orchestrator import _calc_stock_chunk
+
+    calls = []
+
+    def spy_load_state(*args, **kwargs):
+        calls.append("state")
+        return {}
+
+    def spy_quote_tails(*args, **kwargs):
+        calls.append("quote")
+        return {}
+
+    def spy_dde_tails(*args, **kwargs):
+        calls.append("dde")
+        return {}
+
+    monkeypatch.setenv("CALC_FAST_SKIP", "1")
+    monkeypatch.setenv("CALC_APPEND", "1")
+    importlib.reload(cfg)
+
+    monkeypatch.setattr("backend.etl.calc_state.load_calc_state_batch", spy_load_state)
+    monkeypatch.setattr("backend.etl.calc_fast_skip.batch_load_quote_tails", spy_quote_tails)
+    monkeypatch.setattr("backend.etl.calc_fast_skip.batch_load_dde_tails", spy_dde_tails)
+    real_connect = duckdb.connect
+    monkeypatch.setattr("duckdb.connect", lambda path: real_connect(":memory:"))
+    monkeypatch.setattr("backend.etl.orchestrator.resolve_recalc_start", lambda *a, **k: None)
+
+    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde):
+        return {(s[0], s[1]): ("SKIP", []) for s in CALC_ROUTE_SPECS}
+
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.preflight_stock_modes_v2", fake_preflight,
+    )
+    monkeypatch.setattr("backend.etl.orchestrator._write_skip_log_batch", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.orchestrator._count_calc_rows", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.calc_state.upsert_calc_state_batch", lambda *a, **k: 0)
+
+    minimal_df = pd.DataFrame({"trade_date": ["20260608"], "close_qfq": [10.0]})
+    batch_ctx = {
+        "state_map": {},
+        "daily_tails": {"A.SZ": minimal_df},
+        "weekly_tails": {},
+        "dde_daily": {},
+        "dde_weekly": {},
+        "completed_keys": set(),
+    }
+
+    _calc_stock_chunk(["A.SZ"], "20260609", incremental=True, batch_ctx=batch_ctx)
+
+    assert "state" not in calls
+    assert "quote" not in calls
+    assert "dde" not in calls
+
+
 def test_count_week_end_bars_respects_list_date_floor():
     """week_end 计数窗口下限 = max(weekly_start, list_date)。"""
     from backend.etl.orchestrator import _count_week_end_bars_batch

@@ -8,10 +8,11 @@ TushareClient + DuckDB connection. WAL mode allows concurrent writers.
 """
 
 import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from backend.config import DUCKDB_PATH
 import duckdb
+
+from backend.etl.progress import day_progress, stock_progress
 
 logger = logging.getLogger(__name__)
 
@@ -30,20 +31,13 @@ def fetch_by_date_range(client, con, start: str, end: str,
     if not days:
         logger.info("All dates already in DB — nothing to fetch (%s~%s)", start, end)
         return 0
-    logger.info("Fetching data for %d trading days (%s~%s)", len(days), start, end)
+    prog = day_progress("fetch.ods", len(days))
+    prog.log_start(range=f"{start}~{end}")
 
     t0 = time.time()
     total = 0
     failed_dates = []
-    for i, trade_date in enumerate(days):
-        if i > 0 and i % 20 == 0:
-            elapsed = time.time() - t0
-            rate = i / elapsed * 60 if elapsed > 0 else 0
-            eta = (len(days) - i) / rate if rate > 0 else 0
-            logger.info("Progress: %d/%d days (%d%%) | %.0fs elapsed | "
-                        "%.1f days/min | eta %.0fs",
-                        i, len(days), i * 100 // len(days), elapsed, rate, eta)
-
+    for trade_date in days:
         try:
             import pandas as pd
             # 0. Fetch adj_factor FIRST — build lookup for daily INSERT
@@ -136,6 +130,7 @@ def fetch_by_date_range(client, con, start: str, end: str,
         except Exception:
             failed_dates.append(trade_date)
             logger.exception("Failed trade_date=%s", trade_date)
+        prog.tick()
 
     if failed_dates:
         display = ", ".join(failed_dates[:5])
@@ -143,6 +138,10 @@ def fetch_by_date_range(client, con, start: str, end: str,
             display += f" ... (+{len(failed_dates) - 5} more)"
         logger.warning("fetch_by_date_range: %d/%d dates failed: %s",
                        len(failed_dates), len(days) if days else 0, display)
+    elapsed = time.time() - t0
+    prog.log_done(rows=total, days=len(days))
+    logger.info("ODS fetch complete: %d rows in %.0fs (%.1f days/min)",
+                total, elapsed, len(days) / elapsed * 60 if elapsed > 0 else 0)
     return total
 
 
@@ -369,12 +368,13 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
     if not all_days:
         return 0
 
+    prog = stock_progress("fetch.stocks", len(ts_codes))
+    prog.log_start(range=f"{start}~{end}")
+
     total = 0
     t0 = time.time()
-    for i, ts_code in enumerate(ts_codes):
+    for ts_code in ts_codes:
         ranges = _get_missing_ranges_per_stock(con, ts_code, all_days)
-        if not ranges:
-            continue
 
         for seg_start, seg_end in ranges:
             try:
@@ -480,13 +480,10 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                 logger.warning("fetch_stocks_incremental %s [%s~%s] moneyflow skipped: %s",
                               ts_code, seg_start, seg_end, e)
 
-        if (i + 1) % 10 == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            logger.info("Stock fetch: %d/%d stocks | %.0fs | %.1f stk/s",
-                        i + 1, len(ts_codes), elapsed, rate)
+        prog.tick()
 
     elapsed = time.time() - t0
+    prog.log_done(rows=total, stocks=len(ts_codes))
     logger.info("Stock fetch complete: %d stocks, %d rows, %.0fs",
                 len(ts_codes), total, elapsed)
     return total
@@ -527,16 +524,13 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
         return 0
     code_set = set(ts_codes) if ts_codes else None
     filter_msg = f" ({len(ts_codes)} stocks)" if ts_codes else ""
-    logger.info("Fetching %d trading days with %d threads (%s~%s)%s",
-                len(days), workers, start, end, filter_msg)
     t0 = time.time()
+    prog = day_progress("fetch.ods", len(days))
+    prog.log_start(threads=workers, range=f"{start}~{end}", stocks=filter_msg.strip())
 
     # Split days into chunks
     chunk_size = max(1, len(days) // workers)
     chunks = [days[i:i + chunk_size] for i in range(0, len(days), chunk_size)]
-
-    progress_lock = threading.Lock()
-    progress_done = [0]  # mutable counter shared across threads
 
     def _fetch_chunk(trade_dates: list[str]) -> int:
         """Process one chunk of trading days in a thread.
@@ -656,21 +650,9 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
                     thread_con.unregister("_mf_batch")
                     total += len(mf_data)
 
-                # Thread-safe progress: log every 20 days
-                with progress_lock:
-                    progress_done[0] += 1
-                    done = progress_done[0]
-                if done % 20 == 0 or done == 1:
-                    elapsed = time.time() - t0
-                    rate = done / elapsed * 60 if elapsed > 0 else 0
-                    eta = (len(days) - done) / rate if rate > 0 else 0
-                    logger.info("ODS fetch: %d/%d days (%d%%) | %.0fs elapsed | "
-                                "%.1f days/min | eta %.0fs",
-                                done, len(days), done * 100 // len(days),
-                                elapsed, rate, eta)
-
             except Exception:
                 logger.exception("Thread failed trade_date=%s", trade_date)
+            prog.tick()
         thread_con.close()
         return total
 
@@ -679,6 +661,7 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
 
     total_rows = sum(results)
     elapsed = time.time() - t0
+    prog.log_done(rows=total_rows, days=len(days))
     logger.info("ODS fetch complete: %d rows in %.0fs (%.1f days/min)",
                 total_rows, elapsed, len(days) / elapsed * 60 if elapsed > 0 else 0)
     return total_rows

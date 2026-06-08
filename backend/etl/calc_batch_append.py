@@ -301,7 +301,7 @@ def run_batch_append_phase(con, codes: List[str], calc_date: str) -> Optional[di
     Returns context dict with chunk_codes, completed_keys, agg_by_key, and
     preloaded tail frames; None when batch path is inactive.
     """
-    from backend.config import CALC_APPEND, CALC_BATCH_APPEND
+    from backend.config import CALC_APPEND, CALC_BATCH_APPEND, CALC_SKIP_STATE_REFRESH
     from backend.etl.calc_indicators import CALC_ROUTE_SPECS, quote_tail_columns
     from backend.etl.calc_fast_skip import (
         batch_load_dde_tails,
@@ -309,7 +309,13 @@ def run_batch_append_phase(con, codes: List[str], calc_date: str) -> Optional[di
         partition_preflight_modes,
         preflight_stock_modes_v2,
     )
-    from backend.etl.calc_state import load_calc_state_batch, write_calc_state_from_df
+    from backend.etl.calc_router import state_signature
+    from backend.etl.calc_state import (
+        load_calc_state_batch,
+        should_refresh_calc_state,
+        upsert_calc_state_batch,
+        write_calc_state_from_df,
+    )
 
     if not (CALC_APPEND and CALC_BATCH_APPEND):
         return None
@@ -361,6 +367,7 @@ def run_batch_append_phase(con, codes: List[str], calc_date: str) -> Optional[di
         preflight.tick()
     preflight.log_done()
 
+    state_records = []
     for ts_code, modes in stock_modes.items():
         for (indicator_name, freq), (mode, _) in modes.items():
             if mode != "SKIP":
@@ -381,10 +388,14 @@ def run_batch_append_phase(con, codes: List[str], calc_date: str) -> Optional[di
                 tdf = daily_tails.get(ts_code) if freq == "daily" else weekly_tails.get(ts_code)
             else:
                 tdf = dde_daily.get(ts_code) if freq == "daily" else dde_weekly.get(ts_code)
-            write_calc_state_from_df(
-                con, ts_code, freq, indicator_name, tdf, sig_cols, calc_date,
-                last_trade_date=st["last_trade_date"],
-            )
+            if tdf is None or tdf.empty:
+                continue
+            fp = state_signature(tdf, st["last_trade_date"], sig_cols)
+            if not CALC_SKIP_STATE_REFRESH or should_refresh_calc_state(st, calc_date, fp):
+                state_records.append((
+                    ts_code, freq, indicator_name, st["last_trade_date"], fp, calc_date, None,
+                ))
+    upsert_calc_state_batch(con, state_records)
 
     for indicator_name, freq, CalcCls, sig_cols, source in CALC_ROUTE_SPECS:
         append_codes: List[str] = []
