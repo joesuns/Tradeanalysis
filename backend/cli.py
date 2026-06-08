@@ -17,6 +17,7 @@ import argparse
 import logging
 import sys
 import uuid
+from datetime import datetime
 
 from backend.log_config import setup_logging, set_run_id
 
@@ -163,6 +164,7 @@ def cmd_calc(args, skip_stale_fetch=False):
             auto_fetch=True,
             calc_date=calc_date,
             skip_stale_fetch=skip_stale_fetch,
+            force=getattr(args, "force", False),
         )
     finally:
         con.close()
@@ -313,6 +315,7 @@ def cmd_repair_weekly(args):
             print("EXECUTED — deleted orphan rows:")
             for tbl, n in res["deleted"].items():
                 print(f"  {tbl:30s} {n:>12,}")
+            print(f"Weekly calc_state invalidated: {res.get('weekly_state_invalidated', 0):,}")
             print("NOTE: run `python -m backend.cli calc` to refresh stale week-end values.")
         else:
             print("DRY-RUN (no changes). Re-run with --execute to apply.")
@@ -391,6 +394,8 @@ def main():
     cp.add_argument("--date", help="Analysis date YYYYMMDD (default: today)")
     cp.add_argument("--ts-code", nargs="+",
                     help="Stock codes to calculate (omitted = all stocks)")
+    cp.add_argument("--force", action="store_true",
+                    help="Recalculate even if calc_date already completed")
 
     # export
     xp = sp.add_parser("export", help="Export analysis wide table to Excel")
@@ -416,6 +421,8 @@ def main():
     rp.add_argument("--db-path", help="DuckDB file path (default: data/tradeanalysis.duckdb)")
     rp.add_argument("--include-st", action="store_true")
     rp.add_argument("--no-index", action="store_true")
+    rp.add_argument("--force", action="store_true",
+                    help="Force recalc even if calc_date already completed")
 
     # prune
     pp = sp.add_parser("prune", help="Prune superseded DWS snapshots (keep last N runs)")

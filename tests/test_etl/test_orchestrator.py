@@ -622,6 +622,69 @@ def test_resolve_calc_workers_invalid_falls_back(monkeypatch):
     assert resolve_calc_workers() == expected
 
 
+def test_should_skip_calc_idempotent():
+    import json
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.orchestrator import _should_skip_calc_idempotent
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    comp = json.dumps({"calc_date": "20260602", "stocks": 5388})
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('1', 'calc_dws', 't0', 't1', 'success', 1, '', ?)""",
+        [comp],
+    )
+    assert _should_skip_calc_idempotent(con, "20260602", False, False, True) is True
+    assert _should_skip_calc_idempotent(con, "20260602", False, True, True) is False
+    assert _should_skip_calc_idempotent(con, "20260602", True, False, True) is False
+    assert _should_skip_calc_idempotent(con, "20260603", False, False, True) is False
+    con.close()
+
+
+def test_run_calc_idempotent_skip_without_subset(monkeypatch):
+    """Full-market run_calc must hit idempotent gate before resolving active codes."""
+    import json
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.orchestrator import run_calc
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    comp = json.dumps({"calc_date": "20260602", "stocks": 5388})
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('1', 'calc_dws', 't0', 't1', 'success', 1, '', ?)""",
+        [comp],
+    )
+    called = {"n": 0, "active_codes": 0}
+
+    def fail_chunk(*a, **k):
+        called["n"] += 1
+        return 0
+
+    def boom_active_codes(*a, **k):
+        called["active_codes"] += 1
+        raise AssertionError("get_all_active_codes should not run on idempotent skip")
+
+    monkeypatch.setattr("backend.etl.orchestrator._calc_stock_chunk", fail_chunk)
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", boom_active_codes)
+    run_calc(con, ts_codes=None, calc_date="20260602", auto_fetch=False)
+    assert called["n"] == 0
+    assert called["active_codes"] == 0
+    row = con.execute(
+        "SELECT data_completeness FROM ods_etl_log WHERE id != '1' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert json.loads(row[0])["idempotent_skip"] is True
+    con.close()
+
+
 def test_run_calc_uses_thread_pool(monkeypatch):
     """run_calc should dispatch chunks via ThreadPoolExecutor (not multiprocessing)."""
     import duckdb

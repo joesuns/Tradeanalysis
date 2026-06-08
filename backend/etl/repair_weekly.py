@@ -91,9 +91,16 @@ def repair_weekly(con, dry_run: bool = True) -> dict:
         after = con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
         deleted[tbl] = before - after
 
+    from backend.etl.calc_state import invalidate_weekly_calc_state
+    n_state = invalidate_weekly_calc_state(con)
+
     run_checkpoint(con)
     result["executed"] = True
     result["deleted"] = deleted
-    logger.info("repair_weekly executed: deleted %d orphan rows across %d weekly tables",
-                sum(deleted.values()), len(WEEKLY_DWS_TABLES))
+    result["weekly_state_invalidated"] = n_state
+    logger.info(
+        "repair_weekly executed: deleted %d orphan rows across %d weekly tables; "
+        "invalidated %d weekly calc_state rows",
+        sum(deleted.values()), len(WEEKLY_DWS_TABLES), n_state,
+    )
     return result

@@ -88,3 +88,8 @@ def test_repair_weekly_execute_fixes_and_deletes_orphans(temp_db):
         "WHERE ts_code='A.SZ' AND trade_date='20260102'"
     ).fetchone()
     assert bar is not None and bar[0] == 5
+
+    from backend.etl.calc_state import upsert_calc_state
+    upsert_calc_state(temp_db, "A.SZ", "weekly", "macd", "20260102", "fp1", "20260102")
+    res2 = repair_weekly(temp_db, dry_run=False)
+    assert res2.get("weekly_state_invalidated", 0) >= 0

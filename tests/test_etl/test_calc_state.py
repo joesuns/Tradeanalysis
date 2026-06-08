@@ -1,6 +1,6 @@
 import duckdb
 from backend.db.schema import create_all_tables
-from backend.etl.calc_state import load_calc_state, upsert_calc_state
+from backend.etl.calc_state import load_calc_state, upsert_calc_state, write_calc_state_from_df
 
 
 def test_upsert_and_load_calc_state():
@@ -37,4 +37,25 @@ def test_upsert_and_load_calc_state():
     ).fetchone()[0]
     assert n == 2, f"Expected 2 indicator rows, got {n}"
 
+    con.close()
+
+
+def test_write_calc_state_from_df():
+    import pandas as pd
+    from backend.etl.calc_router import state_signature
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    df = pd.DataFrame({
+        "trade_date": ["20260601", "20260602"],
+        "close_qfq": [10.0, 10.5],
+    })
+    ok = write_calc_state_from_df(
+        con, "A.SZ", "daily", "macd", df, ["close_qfq"], "20260602",
+        last_trade_date="20260602",
+    )
+    assert ok is True
+    st = load_calc_state(con, "daily", "macd", ["A.SZ"])["A.SZ"]
+    assert st["last_trade_date"] == "20260602"
+    assert st["history_fp"] == state_signature(df, "20260602", ["close_qfq"])
     con.close()

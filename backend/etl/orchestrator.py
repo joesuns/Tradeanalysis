@@ -687,10 +687,11 @@ def _route_calc(con, calc, name: str, freq: str, ts_code: str, df,
     APPEND computes only new bars (vectorized, seeded); FULL is the existing
     narrow-window recompute (and the equivalence oracle); SKIP is taken when no
     new bar appeared and the fixed-window history signature is unchanged.
-    State (dws_calc_state) is refreshed only when a write actually happened.
+    State (dws_calc_state) is refreshed on SKIP (signature match), APPEND, and FULL
+    writes so routing state never drifts from the frames used to classify.
     """
-    from backend.etl.calc_state import load_calc_state, upsert_calc_state
-    from backend.etl.calc_router import classify_calc_mode, state_signature
+    from backend.etl.calc_state import load_calc_state, write_calc_state_from_df
+    from backend.etl.calc_router import classify_calc_mode
 
     def _full() -> CalcResult:
         if name == "dde":
@@ -708,6 +709,11 @@ def _route_calc(con, calc, name: str, freq: str, ts_code: str, df,
         r = CalcResult()
         r.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
                    "append: no new bars, signature match")
+        if state is not None:
+            write_calc_state_from_df(
+                con, ts_code, freq, name, df, calc.SIGNATURE_COLS, calc_date,
+                last_trade_date=state["last_trade_date"],
+            )
         return r
 
     if mode == "APPEND":
@@ -715,14 +721,10 @@ def _route_calc(con, calc, name: str, freq: str, ts_code: str, df,
     else:  # FULL
         result = _full()
 
-    # Only establish/refresh state when a write actually happened. A FULL that
-    # the calculator skipped (e.g. insufficient rows) leaves no baseline, so
-    # next run re-routes to FULL rather than appending onto nothing.
     if result.calculated > 0 and df is not None and len(df) > 0:
-        max_td = str(df["trade_date"].max())
-        fp = state_signature(df, max_td, calc.SIGNATURE_COLS)
-        upsert_calc_state(con, ts_code, freq, name, last_trade_date=max_td,
-                          history_fp=fp, calc_date=calc_date)
+        write_calc_state_from_df(
+            con, ts_code, freq, name, df, calc.SIGNATURE_COLS, calc_date,
+        )
     return result
 
 
@@ -776,8 +778,15 @@ def calc_stock_pipeline_selective(
     daily_recalc: Optional[str] = None,
     weekly_recalc: Optional[str] = None,
     run_keys: Optional[set] = None,
+    run_modes: Optional[dict] = None,
+    tail_frames: Optional[dict] = None,
 ) -> list:
-    """Run only (indicator, freq) in run_keys; same loads/routing as full pipeline."""
+    """Run only (indicator, freq) in run_keys.
+
+    Loads are narrowed by (freq, source): quote and DDE are fetched separately.
+    APPEND indicators reuse preflight tail_frames when provided; FULL uses the
+    narrow recalc window only for groups that need it.
+    """
     from backend.etl.base import load_quote_groups
     from backend.etl.recalc_spec import resolve_load_start
     from backend.config import CALC_APPEND
@@ -787,47 +796,59 @@ def calc_stock_pipeline_selective(
         return []
 
     outputs = []
-    specs_by_freq = {"daily": [], "weekly": []}
+    # (freq, source) -> [(indicator_name, CalcCls)]
+    groups = {}
     for indicator_name, freq, CalcCls, _, source in CALC_ROUTE_SPECS:
-        if (indicator_name, freq) in run_keys:
-            specs_by_freq[freq].append((indicator_name, CalcCls, source))
-
-    for freq, recalc_start in (("daily", daily_recalc), ("weekly", weekly_recalc)):
-        freq_specs = specs_by_freq[freq]
-        if not freq_specs:
+        if (indicator_name, freq) not in run_keys:
             continue
-        load_start = resolve_load_start(con, recalc_start, freq) if recalc_start else None
+        groups.setdefault((freq, source), []).append((indicator_name, CalcCls))
+
+    for (freq, source), specs in groups.items():
+        recalc_start = daily_recalc if freq == "daily" else weekly_recalc
+        if recalc_start is None:
+            continue
+        load_start = resolve_load_start(con, recalc_start, freq)
         append_on = CALC_APPEND and recalc_start is not None
 
-        quote_groups = {}
-        qdf = None
-        if any(s[2] == "quote" for s in freq_specs):
-            src = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
-            quote_groups = load_quote_groups(
-                con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=load_start,
+        needs_full = True
+        if run_modes is not None:
+            needs_full = any(
+                run_modes.get((indicator_name, freq), ("FULL", []))[0] == "FULL"
+                for indicator_name, _ in specs
             )
-            qdf = quote_groups.get(ts_code)
 
-        dde_groups = {}
-        ddf = None
-        if any(s[0] == "dde" for s in freq_specs):
-            dde = DDECalculator(con, freq)
-            if freq == "daily":
-                dde_groups = dde._load_daily_batch([ts_code], start_date=load_start)
-            else:
-                dde_groups = dde._load_weekly_batch([ts_code], start_date=load_start)
-            ddf = dde_groups.get(ts_code)
+        df = None
+        quote_groups = None
+        if source == "quote":
+            if not needs_full and tail_frames is not None:
+                df = tail_frames.get((freq, "quote"))
+            if df is None or len(df) == 0:
+                src = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
+                quote_groups = load_quote_groups(
+                    con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=load_start,
+                )
+                df = quote_groups.get(ts_code)
+        else:
+            if not needs_full and tail_frames is not None:
+                df = tail_frames.get((freq, "dde"))
+            if df is None or len(df) == 0:
+                dde = DDECalculator(con, freq)
+                if freq == "daily":
+                    dde_groups = dde._load_daily_batch([ts_code], start_date=load_start)
+                else:
+                    dde_groups = dde._load_weekly_batch([ts_code], start_date=load_start)
+                df = dde_groups.get(ts_code)
 
-        for indicator_name, CalcCls, source in freq_specs:
+        for indicator_name, CalcCls in specs:
             calc = CalcCls(con, freq)
             if source == "quote":
                 result = _route_calc(
-                    con, calc, indicator_name, freq, ts_code, qdf, calc_date,
+                    con, calc, indicator_name, freq, ts_code, df, calc_date,
                     recalc_start, quote_groups, append_on,
                 )
             else:
                 result = _route_calc(
-                    con, calc, "dde", freq, ts_code, ddf, calc_date,
+                    con, calc, "dde", freq, ts_code, df, calc_date,
                     recalc_start, None, append_on,
                 )
             outputs.append((indicator_name, freq, result))
@@ -931,6 +952,8 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
             dde_daily = batch_load_dde_tails(con, chunk, "daily")
             dde_weekly = batch_load_dde_tails(con, chunk, "weekly")
 
+        from backend.etl.calc_state import write_calc_state_from_df
+
         for ts_code in chunk:
             modes = None
             if fast_on:
@@ -946,13 +969,37 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                         SkipReason.FINGERPRINT_MATCH, ts_code,
                         "fast_skip: preflight",
                     )
+                    spec = next(
+                        s for s in CALC_ROUTE_SPECS
+                        if s[0] == indicator_name and s[1] == freq
+                    )
+                    _, _, _, sig_cols, source = spec
+                    st = state_map.get((ts_code, freq, indicator_name))
+                    if st is None:
+                        continue
+                    if source == "quote":
+                        tdf = daily_tails.get(ts_code) if freq == "daily" else weekly_tails.get(ts_code)
+                    else:
+                        tdf = dde_daily.get(ts_code) if freq == "daily" else dde_weekly.get(ts_code)
+                    write_calc_state_from_df(
+                        con, ts_code, freq, indicator_name, tdf, sig_cols, calc_date,
+                        last_trade_date=st["last_trade_date"],
+                    )
                 if not run_keys:
                     full_skip_count += 1
                     _report_calc_progress()
                     continue
+                run_modes = {k: modes[k] for k in run_keys}
+                tail_frames = {
+                    ("daily", "quote"): daily_tails.get(ts_code),
+                    ("weekly", "quote"): weekly_tails.get(ts_code),
+                    ("daily", "dde"): dde_daily.get(ts_code),
+                    ("weekly", "dde"): dde_weekly.get(ts_code),
+                }
                 for indicator_name, freq, result in calc_stock_pipeline_selective(
                         con, ts_code, calc_date, daily_recalc, weekly_recalc,
-                        run_keys=run_keys):
+                        run_keys=run_keys, run_modes=run_modes,
+                        tail_frames=tail_frames):
                     key = (indicator_name, freq)
                     agg = agg_by_key[key]
                     agg.calculated += result.calculated
@@ -1009,9 +1056,50 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
         con.close()
 
 
+def _should_skip_calc_idempotent(
+    con,
+    calc_date: str,
+    user_subset: bool,
+    force: bool,
+    skip_stale_fetch: bool,
+) -> bool:
+    """True when a full-market calc for calc_date already completed and data is fresh."""
+    if force or user_subset:
+        return False
+
+    has_prior = con.execute("""
+        SELECT 1 FROM ods_etl_log
+        WHERE step_name = 'calc_dws' AND status = 'success'
+          AND data_completeness IS NOT NULL AND data_completeness != ''
+          AND (
+            json_extract_string(data_completeness, '$.calc_date') = ?
+            OR data_completeness LIKE ?
+          )
+        ORDER BY started_at DESC LIMIT 1
+    """, [calc_date, f'%"calc_date": "{calc_date}"%']).fetchone()
+    if not has_prior:
+        n = con.execute(
+            "SELECT COUNT(DISTINCT ts_code) FROM dws_macd_daily WHERE calc_date = ?",
+            [calc_date],
+        ).fetchone()[0]
+        if n < 4000:
+            return False
+
+    if not skip_stale_fetch:
+        latest_ods = con.execute("SELECT MAX(trade_date) FROM ods_daily").fetchone()[0]
+        # Only guard idempotent skip for "live tail" dates. Historical analysis
+        # dates (calc_date < latest ODS) are stable once calc completed once.
+        if latest_ods and calc_date >= latest_ods:
+            from backend.fetch.ods_daily import get_all_active_codes
+            stale = find_stale_ods_codes(con, get_all_active_codes(con), calc_date)
+            if stale:
+                return False
+    return True
+
+
 def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
              batch_size: int = 100, calc_date: str = None,
-             skip_stale_fetch: bool = False):
+             skip_stale_fetch: bool = False, force: bool = False):
     """执行 DWS 计算流程。
 
     1. 如果未指定 ts_codes，获取全市场活跃股票
@@ -1035,14 +1123,29 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     # connection first so DBs created before this table get it (idempotent).
     ensure_calc_state_table(con)
 
+    user_subset = ts_codes is not None
+
+    if calc_date is None:
+        calc_date = datetime.now().strftime("%Y%m%d")
+
+    if _should_skip_calc_idempotent(con, calc_date, user_subset, force, skip_stale_fetch):
+        lid, t0 = log_etl_start(con, "calc_dws")
+        log_etl_end(
+            con, lid, "calc_dws", t0, "success", row_count=0,
+            data_completeness={"calc_date": calc_date, "idempotent_skip": True},
+        )
+        logger.info(
+            "calc idempotent skip: %s already completed (use --force to recalculate)",
+            calc_date,
+        )
+        return
+
     if ts_codes is None:
         ts_codes = get_all_active_codes(con)
     if not ts_codes:
         logger.warning("No stocks to calculate")
         return
 
-    if calc_date is None:
-        calc_date = datetime.now().strftime("%Y%m%d")
     ts_codes, delisted = _filter_delisted(con, ts_codes, calc_date)
     if delisted:
         classified = {SkipReason.DELISTED: [(c, d) for c, d in delisted.items()]}
@@ -1234,5 +1337,8 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 grand_total, len(CALCULATORS) * 2, total_elapsed)
     logger.info("Skip details: SELECT reason, COUNT(*) FROM ods_calc_skip_log "
                 "WHERE calc_date='%s' GROUP BY reason", calc_date)
-    log_etl_end(con, lid, "calc_dws", t0, "success", row_count=grand_total)
+    log_etl_end(
+        con, lid, "calc_dws", t0, "success", row_count=grand_total,
+        data_completeness={"calc_date": calc_date, "stocks": len(codes_to_calc)},
+    )
     run_checkpoint(con)
