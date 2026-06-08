@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, date
 
 from fastapi import APIRouter, Query, HTTPException
@@ -6,6 +7,8 @@ from backend.api.models import (
     FreshnessInfo, ErrorResponse, AnalysisResponse, MACDData,
     ScreeningResult, HealthResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1")
 
@@ -90,6 +93,7 @@ def analysis(
             (ts_code,),
         ).fetchone()
         if row is None:
+            logger.info("analysis/%s %s: not found", freq, ts_code)
             raise HTTPException(
                 status_code=404,
                 detail={
@@ -159,6 +163,9 @@ def analysis_history(
         data = []
         for row in rows:
             data.append({cols[j]: row[j] for j in range(len(cols))})
+
+        logger.info("analysis/%s/history %s: %d rows (fields=%s)",
+                    freq, ts_code, len(data), fields)
 
         return {
             "ts_code": ts_code,
@@ -231,6 +238,9 @@ def screening(
                 "ma_alignment": row[6],
                 "ddx": row[7],
             })
+
+        logger.info("screening/%s: %d results (macd_zone=%s, ma_alignment=%s, min_ddx=%s)",
+                    freq, len(results), macd_zone, ma_alignment, min_ddx)
 
         return {
             "conditions": {

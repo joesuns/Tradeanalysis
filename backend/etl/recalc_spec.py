@@ -41,10 +41,15 @@ def resolve_warmup_tdays() -> int:
     return max(max(s.min_rows, s.lookback) for s in specs)
 
 
+_WEEKLY_WARMUP_GATE = 120
+
+
 def resolve_weekly_warmup_weeks() -> int:
     """Derive weekly fetch warmup: volume pct_rank (120w), not PP recalc width (250w)."""
     specs = collect_specs("weekly")
-    gate_specs = [s for s in specs if s.lookback <= 120]
+    gate_specs = [s for s in specs if s.lookback <= _WEEKLY_WARMUP_GATE]
+    if not gate_specs:
+        return _WEEKLY_WARMUP_GATE
     return max(s.lookback for s in gate_specs)
 
 

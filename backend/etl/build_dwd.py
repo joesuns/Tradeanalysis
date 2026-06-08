@@ -33,8 +33,32 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
         code_filter = f"AND d.ts_code IN ({placeholders})"
         params = ts_codes
 
+    # Step 0: Diagnostic — count rows that will be excluded due to missing/zero
+    # adj_factor (would otherwise silently produce NULL close_qfq).
+    excluded = con.execute(
+        f"""SELECT COUNT(*)
+        FROM ods_daily d
+        JOIN (
+            SELECT ts_code, adj_factor AS latest_adj
+            FROM ods_daily
+            WHERE (ts_code, trade_date) IN (
+                SELECT ts_code, MAX(trade_date) FROM ods_daily GROUP BY ts_code
+            )
+        ) la ON d.ts_code = la.ts_code
+        WHERE (d.adj_factor IS NULL OR la.latest_adj IS NULL OR la.latest_adj = 0)
+          {code_filter}""",
+        params,
+    ).fetchone()[0]
+    if excluded:
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.warning("build_dwd_daily_quote: excluding %d rows with missing/zero "
+                     "adj_factor (qfq price unavailable)", excluded)
+
     # Step 1: Single-pass batch 前复权 for ALL stocks
     # latest_adj factor computed via correlated max-date subquery per stock
+    # Rows with NULL adj_factor or NULL/zero latest_adj are excluded to avoid
+    # silently producing NULL close_qfq (or division-by-zero).
     con.execute(
         f"""INSERT OR REPLACE INTO dwd_daily_quote
             (ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq,
@@ -57,7 +81,9 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
         ) la ON d.ts_code = la.ts_code
         LEFT JOIN ods_daily_basic b
             ON d.ts_code = b.ts_code AND d.trade_date = b.trade_date
-        WHERE 1=1 {code_filter}""",
+        WHERE d.adj_factor IS NOT NULL
+          AND la.latest_adj IS NOT NULL AND la.latest_adj <> 0
+          {code_filter}""",
         params,
     )
 
@@ -66,13 +92,20 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
     codes_to_fill = ts_codes if ts_codes else [
         r[0] for r in con.execute("SELECT ts_code FROM dim_stock").fetchall()
     ]
-    # Find stocks where dwd row count < expected trading-day count (i.e. gaps exist)
+    # Find stocks with internal gaps: ODS actual rows < trading-calendar days
+    # within the stock's own [min, max] traded span. Comparing dwd.n vs ods.n
+    # is wrong (step1 is a 1:1 insert, so they are always equal) — the real gap
+    # is against the trading calendar.
     gap_rows = con.execute("""
-        SELECT q.ts_code
-        FROM (SELECT ts_code, COUNT(*) AS n FROM dwd_daily_quote GROUP BY ts_code) q
-        JOIN (SELECT ts_code, COUNT(*) AS n FROM ods_daily GROUP BY ts_code) o
-          ON q.ts_code = o.ts_code
-        WHERE q.n < o.n
+        SELECT o.ts_code
+        FROM (SELECT ts_code, COUNT(*) AS n,
+                     MIN(trade_date) AS mn, MAX(trade_date) AS mx
+              FROM ods_daily GROUP BY ts_code) o
+        JOIN dim_date dd
+          ON dd.is_trade_day = 1
+         AND dd.trade_date >= o.mn AND dd.trade_date <= o.mx
+        GROUP BY o.ts_code, o.n
+        HAVING o.n < COUNT(dd.trade_date)
     """).fetchall()
     gap_stocks = set(r[0] for r in gap_rows)
     if gap_stocks:
@@ -81,7 +114,7 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
         _log.info("Suspension fill needed: %d/%d stocks",
                   len(gap_stocks), len(codes_to_fill))
     for ts_code in codes_to_fill:
-        if ts_code not in gap_stocks and len(gap_stocks) < len(codes_to_fill):
+        if ts_code not in gap_stocks:
             continue
         con.execute(
             """INSERT OR REPLACE INTO dwd_daily_quote
@@ -122,8 +155,9 @@ def build_dwd_daily_quote(con, ts_codes=None) -> int:
 def build_dwd_weekly_quote(con, ts_codes=None) -> int:
     """Build rolling weekly bars: each trading day gets a week-to-date bar.
 
-    Uses DuckDB window functions partitioned by ISO week. Each day aggregates
-    all non-suspended days in the same week up to and including the current day.
+    Uses DuckDB window functions partitioned by week via date_trunc('week', ...)
+    (Monday-anchored, so cross-year weeks stay in one partition). Each day
+    aggregates all non-suspended days in the same week up to and including it.
     open uses FIRST_VALUE (Monday's open), close uses current day's close.
     vol/amount normalized to 5-day equivalent (SUM/active_days*5).
     """
@@ -159,7 +193,7 @@ def build_dwd_weekly_quote(con, ts_codes=None) -> int:
         FROM dwd_daily_quote d
         WHERE d.is_suspended = 0 {ts_code_filter}
         WINDOW w AS (PARTITION BY d.ts_code,
-                     strftime(CAST(substr(d.trade_date,1,4)||'-'||substr(d.trade_date,5,2)||'-'||substr(d.trade_date,7,2) AS DATE), '%Y-%W')
+                     date_trunc('week', CAST(substr(d.trade_date,1,4)||'-'||substr(d.trade_date,5,2)||'-'||substr(d.trade_date,7,2) AS DATE))
                      ORDER BY d.trade_date
                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)""",
         params,

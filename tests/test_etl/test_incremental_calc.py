@@ -137,6 +137,26 @@ def test_insert_dws_batch_write_range():
     con.close()
 
 
+def test_insert_dws_batch_returns_zero_on_empty_write_range():
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dws_test (
+            ts_code TEXT, trade_date TEXT, val REAL,
+            calc_date TEXT, input_fingerprint TEXT, spec_version TEXT,
+            PRIMARY KEY (ts_code, trade_date, calc_date)
+        )
+    """)
+    df = pd.DataFrame({"trade_date": ["20260101"], "val": [1.0]})
+    cols = ["ts_code", "trade_date", "val", "calc_date", "input_fingerprint", "spec_version"]
+    n = insert_dws_batch(
+        con, "dws_test", df, "A.SZ", "20260605", cols, ["val"],
+        write_start="20260901", write_end="20260901",
+    )
+    assert n == 0
+    assert con.execute("SELECT COUNT(*) FROM dws_test").fetchone()[0] == 0
+    con.close()
+
+
 def test_warmup_tdays_from_registry():
     assert resolve_warmup_tdays() >= 250
 

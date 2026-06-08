@@ -71,10 +71,10 @@ class VolumeCalculator:
 
             fp = compute_input_fingerprint(df, recalc_start=recalc_start)
             df = self._compute_indicators(df)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp,
-                         write_start=recalc_start,
-                         write_end=calc_date if recalc_start else None)
-            result.calculated += 1
+            if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                            write_start=recalc_start,
+                            write_end=calc_date if recalc_start else None):
+                result.calculated += 1
         return result
 
     def _compute_indicators(self, df: pd.DataFrame,
@@ -164,9 +164,9 @@ class VolumeCalculator:
         zone_seed = self._fetch_zone_seed(ts_code, before_date=first_date)
         df = self._compute_indicators_append(df, zone_seed=zone_seed)
         fp = compute_history_signature(df, self.SIGNATURE_COLS)
-        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
-                     write_start=new_bars[0], write_end=new_bars[-1])
-        result.calculated += 1
+        if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                        write_start=new_bars[0], write_end=new_bars[-1]):
+            result.calculated += 1
         return result
 
     def _compute_pct_rank(self, ma_vol_5: np.ndarray, window: int) -> np.ndarray:
@@ -367,7 +367,7 @@ class VolumeCalculator:
                     "zone", "trend", "volume_ratio", "trend_strength",
                     "divergence", "calc_date", "input_fingerprint", "spec_version"]
         float_cols = ["ma_vol_5", "pct_vol_rank", "volume_ratio", "trend_strength"]
-        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                         dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint,
-                         write_start=write_start, write_end=write_end)
+        return insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                                dws_cols, float_cols,
+                                input_fingerprint=input_fingerprint,
+                                write_start=write_start, write_end=write_end)

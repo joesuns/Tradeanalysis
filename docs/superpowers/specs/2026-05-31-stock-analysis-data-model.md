@@ -1751,6 +1751,9 @@ CREATE INDEX idx_ods_moneyflow_date ON ods_moneyflow(trade_date);
 | `CALC_INCREMENTAL=0` | 回退全量读/写（指纹 skip 仍可用） |
 | `CALC_WORKERS` | 计算**线程**并行度，默认 `min(cpu-1, 8)`（DuckDB 单文件禁跨进程写，故用线程池） |
 | `CALC_APPEND=1`（默认） | 新交易日双路径追算：每股每 freq 每指标按 `dws_calc_state` 路由 SKIP/APPEND/FULL；`=0` 回退 12.7 窄窗 |
+| `CALC_FAST_SKIP=1`（默认） | chunk 级 preflight：12 指标全 SKIP 则跳过 `calc_stock_pipeline`（同日复跑加速）；需 `CALC_APPEND`；尾窗无 `calc_date` 上界；`=0` 回退 |
+
+**同日复跑短路（CALC_FAST_SKIP）：** 见 `docs/superpowers/plans/2026-06-08-calc-fast-skip-preflight.md`。chunk 入口 `batch_load_quote_tails` / `batch_load_dde_tails` + `classify_calc_mode`×12；等价于慢路径 SKIP 判定，DWD 变更则 fallthrough。
 
 **新日追算（append-only，CALC_APPEND）：** 见独立设计 `docs/superpowers/specs/2026-06-07-calc-append-only-design.md`。要点：
 

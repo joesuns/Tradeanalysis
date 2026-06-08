@@ -338,15 +338,17 @@ def _count_week_end_bars_batch(con, ts_codes: list[str],
     try:
         placeholders = ",".join(["?" for _ in ts_codes])
         rows = con.execute(f"""
-            SELECT w.ts_code, COUNT(*)
-            FROM dwd_weekly_quote w
-            JOIN dim_date d ON w.trade_date = d.trade_date AND d.is_week_end = 1
-            LEFT JOIN dim_stock s ON w.ts_code = s.ts_code
-            WHERE w.ts_code IN ({placeholders})
-              AND w.trade_date <= ?
-              AND w.trade_date >= GREATEST(?, COALESCE(s.list_date, ?))
-            GROUP BY w.ts_code
-        """, ts_codes + [calc_date, weekly_start, weekly_start]).fetchall()
+            SELECT s.ts_code, COUNT(d.trade_date)
+            FROM dim_stock s
+            LEFT JOIN dwd_weekly_quote w ON w.ts_code = s.ts_code
+            LEFT JOIN dim_date d
+              ON d.trade_date = w.trade_date
+             AND d.is_week_end = 1
+             AND w.trade_date <= ?
+             AND w.trade_date >= GREATEST(?, COALESCE(s.list_date, ?))
+            WHERE s.ts_code IN ({placeholders})
+            GROUP BY s.ts_code
+        """, [calc_date, weekly_start, weekly_start] + ts_codes).fetchall()
         result = {r[0]: r[1] for r in rows}
         for code in ts_codes:
             result.setdefault(code, 0)
@@ -716,7 +718,7 @@ def _route_calc(con, calc, name: str, freq: str, ts_code: str, df,
     # Only establish/refresh state when a write actually happened. A FULL that
     # the calculator skipped (e.g. insufficient rows) leaves no baseline, so
     # next run re-routes to FULL rather than appending onto nothing.
-    if mode == "APPEND" or result.calculated > 0:
+    if result.calculated > 0 and df is not None and len(df) > 0:
         max_td = str(df["trade_date"].max())
         fp = state_signature(df, max_td, calc.SIGNATURE_COLS)
         upsert_calc_state(con, ts_code, freq, name, last_trade_date=max_td,
@@ -841,8 +843,47 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
             daily_recalc = weekly_recalc = None
         from collections import defaultdict
 
+        from backend.config import CALC_FAST_SKIP, CALC_APPEND
+        from backend.etl.calc_indicators import CALC_ROUTE_SPECS, quote_tail_columns
+        from backend.etl.calc_state import load_calc_state_batch
+        from backend.etl.calc_fast_skip import (
+            batch_load_quote_tails,
+            batch_load_dde_tails,
+            preflight_stock_modes,
+            stock_can_fast_skip,
+        )
+
         agg_by_key = defaultdict(CalcResult)
+        fast_on = CALC_FAST_SKIP and CALC_APPEND and incremental
+        fast_skip_count = 0
+        state_map = {}
+        daily_tails = weekly_tails = dde_daily = dde_weekly = {}
+        if fast_on:
+            state_map = load_calc_state_batch(con, chunk)
+            tail_cols = quote_tail_columns()
+            daily_tails = batch_load_quote_tails(con, chunk, "daily", tail_cols)
+            weekly_tails = batch_load_quote_tails(con, chunk, "weekly", tail_cols)
+            dde_daily = batch_load_dde_tails(con, chunk, "daily")
+            dde_weekly = batch_load_dde_tails(con, chunk, "weekly")
+
         for ts_code in chunk:
+            modes = None
+            if fast_on:
+                modes = preflight_stock_modes(
+                    ts_code, state_map,
+                    daily_tails.get(ts_code), weekly_tails.get(ts_code),
+                    dde_daily.get(ts_code), dde_weekly.get(ts_code),
+                )
+            if modes is not None and stock_can_fast_skip(modes):
+                for indicator_name, freq, _, _, _ in CALC_ROUTE_SPECS:
+                    agg_by_key[(indicator_name, freq)].add_skip(
+                        SkipReason.FINGERPRINT_MATCH, ts_code,
+                        "fast_skip: preflight",
+                    )
+                fast_skip_count += 1
+                _report_calc_progress()
+                continue
+
             for indicator_name, freq, result in calc_stock_pipeline(
                     con, ts_code, calc_date, daily_recalc, weekly_recalc):
                 key = (indicator_name, freq)
@@ -852,6 +893,10 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                     for code, detail in items:
                         agg.add_skip(reason, code, detail)
             _report_calc_progress()
+
+        if fast_on:
+            logger.info("calc fast_skip: %d/%d stocks in chunk",
+                        fast_skip_count, len(chunk))
 
         chunk_total = 0
         for CalcCls in CALCULATORS:

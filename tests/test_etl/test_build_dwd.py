@@ -38,33 +38,70 @@ def test_qfq_formula(temp_db):
     assert abs(rows[1][1] - 12.0) < 0.01
 
 
+def test_build_dwd_excludes_null_adj_factor(temp_db):
+    """Rows with NULL adj_factor must be excluded — never produce NULL close_qfq."""
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('X.SZ','X','X')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) VALUES ('20260101',1),('20260102',1)"
+    )
+    # 20260101 has NULL adj_factor (would yield NULL close_qfq); 20260102 is valid.
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor) "
+        "VALUES ('X.SZ','20260101',10.0,NULL),('X.SZ','20260102',12.0,2.0)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["X.SZ"])
+
+    null_qfq = temp_db.execute(
+        "SELECT COUNT(*) FROM dwd_daily_quote "
+        "WHERE ts_code='X.SZ' AND close_qfq IS NULL"
+    ).fetchone()[0]
+    assert null_qfq == 0, "NULL-adj row must not produce a NULL close_qfq row"
+
+    rows = temp_db.execute(
+        "SELECT trade_date, close_qfq FROM dwd_daily_quote "
+        "WHERE ts_code='X.SZ' ORDER BY trade_date"
+    ).fetchall()
+    # Only the valid 20260102 row survives (latest_adj=2.0 → 12*2/2 = 12.0)
+    assert rows == [("20260102", 12.0)], f"expected only valid row, got {rows}"
+
+
 def test_suspension_detection(temp_db):
-    """Trading day with no ods_daily row -> is_suspended=1, OHLCV=previous close."""
+    """Internal gap (a trading day with no ods_daily row, between two traded days)
+    must be filled as is_suspended=1, vol=0, OHLCV carried from previous close.
+
+    Note: the fill only covers gaps up to the stock's last traded day
+    (cal.trade_date <= max(ods date)); trailing gaps are NOT filled by design.
+    """
     create_all_tables(temp_db)
     temp_db.execute(
         "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
     )
     temp_db.execute(
-        "INSERT INTO ods_trade_cal (cal_date,is_open) VALUES ('20260101',1),('20260102',1)"
+        "INSERT INTO ods_trade_cal (cal_date,is_open) "
+        "VALUES ('20260101',1),('20260102',1),('20260103',1)"
     )
+    # Traded on 0101 and 0103; 0102 is an internal gap -> suspension.
     temp_db.execute(
         "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor) "
-        "VALUES ('TEST.SZ','20260101',10.0,1.0)"
-    )
-    # No data for 20260102 -> should be marked as suspended
-    temp_db.execute(
-        "INSERT INTO ods_daily_basic (ts_code,trade_date) VALUES ('TEST.SZ','20260101')"
+        "VALUES ('TEST.SZ','20260101',10.0,1.0),('TEST.SZ','20260103',10.5,1.0)"
     )
     build_dim_stock(temp_db)
     build_dim_date(temp_db)
     build_dwd_daily_quote(temp_db, ["TEST.SZ"])
     rows = temp_db.execute(
-        "SELECT trade_date, is_suspended, vol FROM dwd_daily_quote "
+        "SELECT trade_date, is_suspended, vol, close_qfq FROM dwd_daily_quote "
         "WHERE ts_code='TEST.SZ' ORDER BY trade_date"
     ).fetchall()
-    assert len(rows) == 2
-    assert rows[1][1] == 1  # is_suspended
-    assert rows[1][2] == 0  # vol=0
+    assert len(rows) == 3, f"0102 internal gap should be filled, got {rows}"
+    assert rows[1][0] == "20260102"
+    assert rows[1][1] == 1       # is_suspended
+    assert rows[1][2] == 0       # vol=0
+    assert abs(rows[1][3] - 10.0) < 0.01  # close carried from 0101
 
 
 def test_weekly_aggregation(temp_db):
@@ -92,13 +129,14 @@ def test_weekly_aggregation(temp_db):
     build_dim_date(temp_db)
     build_dwd_daily_quote(temp_db, ["TEST.SZ"])
 
-    # Now build weekly
+    # Now build weekly — produces one week-to-date bar PER trading day
     cnt = build_dwd_weekly_quote(temp_db, ["TEST.SZ"])
     assert cnt >= 1
 
+    # Inspect the week-end (Friday) bar: full-week aggregates
     row = temp_db.execute(
         "SELECT trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, amount, pct_chg, active_days "
-        "FROM dwd_weekly_quote WHERE ts_code='TEST.SZ'"
+        "FROM dwd_weekly_quote WHERE ts_code='TEST.SZ' AND trade_date='20260109'"
     ).fetchone()
     assert row is not None
     # Week end date should be 20260109
@@ -115,6 +153,46 @@ def test_weekly_aggregation(temp_db):
     assert abs(row[5] - 850.0) < 0.01
     # active_days = 5
     assert row[8] == 5
+
+
+def test_weekly_aggregation_cross_year_week(temp_db):
+    """跨年自然周必须聚合进同一根周线 bar（而非被 %Y-%W 切成两段）。
+
+    2025-12-29(周一)~2026-01-02(周五) 属同一自然周；周五 bar 的 open 应为
+    周一开盘、active_days=5、high/low 覆盖整周。
+    """
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) VALUES "
+        "('20251229',1),('20251230',1),('20251231',1),('20260101',1),('20260102',1)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,open,high,low,close,vol,amount,pct_chg,adj_factor) "
+        "VALUES "
+        "('TEST.SZ','20251229',10.0,11.0,9.0,10.5,100,1000,0.05,1.0),"
+        "('TEST.SZ','20251230',10.5,12.0,10.0,11.0,200,2000,0.03,1.0),"
+        "('TEST.SZ','20251231',11.0,11.5,10.5,10.8,150,1500,-0.02,1.0),"
+        "('TEST.SZ','20260101',10.8,12.5,10.5,12.0,180,1800,0.10,1.0),"
+        "('TEST.SZ','20260102',12.0,13.0,11.5,12.5,220,2200,0.04,1.0)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+    build_dwd_weekly_quote(temp_db, ["TEST.SZ"])
+
+    row = temp_db.execute(
+        "SELECT open_qfq, high_qfq, low_qfq, close_qfq, active_days "
+        "FROM dwd_weekly_quote WHERE ts_code='TEST.SZ' AND trade_date='20260102'"
+    ).fetchone()
+    assert row is not None
+    assert abs(row[0] - 10.0) < 0.01   # open = 周一(12-29)开盘
+    assert abs(row[1] - 13.0) < 0.01   # high = 全周最高
+    assert abs(row[2] - 9.0) < 0.01    # low = 全周最低
+    assert abs(row[3] - 12.5) < 0.01   # close = 周五收盘
+    assert row[4] == 5                 # 整周 5 个交易日聚合进同一 bar
 
 
 def test_moneyflow_mapping(temp_db):

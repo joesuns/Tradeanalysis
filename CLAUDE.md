@@ -131,6 +131,7 @@ fetch（数据拉取层）
 ├── 不传 --ts-code → date-batched 全市场并行拉取（3线程），传 active codes 做 per-stock 增量
 ├── --ts-code → stock-batched per-stock 增量拉取
 ├── per-stock 增量：某日仅当**全部**目标股已有 ODS 才跳过（partial day 会重拉）
+├── per-stock 缺口收口：`_drop_suspension_gaps` 仅拉 head(<first_ods)/tail(>last_ods)，跳过交易区间内部停牌缺口（避免反复 API 空转；内部缺口由 DWD 停牌填充处理）
 └── `fetch_by_date_range_parallel` 在 ts_codes=None 时自动 resolve active codes
 
 calc（计算层）
@@ -154,7 +155,8 @@ calc（计算层）
 │   ├── APPEND `append_calculate()`：仅算/写新 bar（EMA/ddx2 用 `resolve_ema_seeds` 种子递推、Volume 迟滞用 zone 种子、滚动类复用全尾窗算法），INSERT-only 不改写历史
 │   ├── 强签名 `state_signature()`：对 last_td 前 **固定 245 根尾窗**关键输入列做值序列 SHA256（替弱指纹），跨运行稳定；误判只多一次安全 FULL，绝不误 APPEND（新 bar 始终全窗重算）
 │   ├── 状态 `dws_calc_state` PK `(ts_code, freq, indicator)`，写入仅在实际写了行时；`_route_calc()` 在 `calc_stock_pipeline` 内统一路由（DDE 自载 moneyflow 尾窗）
-│   └── 等价性硬约束：各指标 APPEND 与 FULL 逐值 `atol=1e-9`（`tests/test_etl/test_append_calc.py` 锁定）
+│   ├── 等价性硬约束：各指标 APPEND 与 FULL 逐值 `atol=1e-9`（`tests/test_etl/test_append_calc.py` 锁定）
+│   └── **同日复跑短路（`CALC_FAST_SKIP=1` 默认，需 `CALC_APPEND`）：** `_calc_stock_chunk` 入口 chunk 级 batch preflight（state + 245 尾窗 quote/DDE），12 指标全 SKIP 则整股跳过 `calc_stock_pipeline`；尾窗**无 calc_date 上界**（对齐 `last_trade_date` 可领先 `calc_date`）；缺帧/空帧/DWD 签名变 → fallthrough
 └── export 行数 << 预期（<80% 活跃股）→ WARNING
 
 export（导出层）
@@ -249,6 +251,7 @@ export（导出层）
   - fetch 起点：`min(250td_start, 120 week-end_start, list_date)`
 - **导出语义：** `-`=当日无事件信号；`N/A`=不可算或源端无数据（如亏损股 PE、历史不足量能分位）。
 - **Fetch 覆盖率:** `_compute_fetch_range` 要求 100% ODS 覆盖才跳过（对齐 123 项目严格检查模式）。
+- **停牌缺口跳过（stock-batched）:** `fetch_stocks_incremental` 的 `_get_missing_ranges_per_stock` 在合并 range 前调用 `_drop_suspension_gaps`：落在该股 ODS `[first_ods, last_ods]` 内部的缺失日视为停牌（tushare 不返回），不再发 API；head/tail 缺口仍拉取。无 ODS 行时全保留（首次拉取）。
 - **数据质量门禁:** `_validate_ods_batch` 已接入全部 3 条 `daily` 写库路径（`fetch_by_date_range` / `_fetch_chunk` 并行 / `fetch_stocks_incremental`）。在 ODS INSERT 前校验 OHLC 逻辑（high >= low）和必需字段（open/high/low/close/vol/amount）非空，**返回过滤后的有效记录列表**，无效行丢弃并按批次打 WARNING。仅作用于 daily（OHLCV），daily_basic/moneyflow 不校验。
 - **adj_factor 护栏:** `build_dwd_daily_quote` 排除 `adj_factor IS NULL` 或 `latest_adj IS NULL/0` 的行，避免静默产出 NULL `close_qfq` / 除零；插入前诊断 COUNT 被排除行数并打 WARNING（某股 qfq 不可用时可见）。
 - **DWS 指纹跳过（P0.5 策略 A）:** `compute_input_fingerprint(df, recalc_start)` 对
@@ -259,6 +262,7 @@ export（导出层）
   `ROW_NUMBER()`（`ORDER BY calc_date DESC, trade_date DESC` 确定性平局）一次取回整组
   `{ts_code: 最新指纹}`，6 个计算器在循环前预取并传入
   `check_dwd_unchanged(..., latest_fps=...)`，把 ~6.6 万次单股 SELECT 降到每组一次。
+- **同日复跑短路（CALC_FAST_SKIP）:** `calc_fast_skip.py` 在 `_calc_stock_chunk` 对每 chunk 批量加载 `dws_calc_state` + DWD 最新 245 根尾窗（quote daily/weekly + DDE daily/weekly），内存跑 `classify_calc_mode`×12；全 SKIP 则不进入 `calc_stock_pipeline`（同日复跑 ~834s→~20–60s）。**不用** `updated_calc_date` 裸跳过；`CALC_FAST_SKIP=0` 回退原路径。设计见 `docs/superpowers/plans/2026-06-08-calc-fast-skip-preflight.md`。
 - **新日追算（CALC_APPEND，append-only calc）:** 新交易日 calc 不再对每股窄写 255 窗，
   而由 `classify_calc_mode()` 按 `dws_calc_state`（PK `(ts_code, freq, indicator)`）+ 各计算器
   `SIGNATURE_COLS` 路由 SKIP/APPEND/FULL。**APPEND** 仅算/写新 bar（`append_calculate()`，

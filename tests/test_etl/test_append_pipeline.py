@@ -111,3 +111,68 @@ def test_pipeline_routes_new_day_to_append_and_matches_full():
                 f"{col}: {got} != {exp}"
 
     con.close()
+
+
+def test_route_calc_skips_state_when_no_rows_written():
+    """FULL/APPEND 均未写入 DWS 时不得刷新 dws_calc_state。"""
+    from unittest.mock import MagicMock, patch
+    import pandas as pd
+
+    from backend.db.schema import create_all_tables
+    from backend.etl.base import CalcResult
+    from backend.etl.calc_state import load_calc_state
+    from backend.etl.orchestrator import _route_calc
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    df = pd.DataFrame({"trade_date": ["20260101", "20260102"], "close_qfq": [10.0, 11.0]})
+    calc = MagicMock()
+    calc.SIGNATURE_COLS = ["close_qfq"]
+    calc.calculate.return_value = CalcResult()
+    calc.append_calculate.return_value = CalcResult()
+
+    with patch("backend.etl.calc_router.classify_calc_mode", return_value=("FULL", [])):
+        _route_calc(con, calc, "macd", "daily", "T.SZ", df, "20260102",
+                    None, {}, append_on=True)
+
+    assert load_calc_state(con, "daily", "macd", ["T.SZ"]).get("T.SZ") is None
+
+    with patch("backend.etl.calc_router.classify_calc_mode", return_value=("APPEND", ["20260102"])):
+        _route_calc(con, calc, "macd", "daily", "T.SZ", df, "20260102",
+                    None, {}, append_on=True)
+
+    assert load_calc_state(con, "daily", "macd", ["T.SZ"]).get("T.SZ") is None
+    con.close()
+
+
+def test_append_calculate_no_phantom_state_when_insert_empty():
+    """write_start/write_end 过滤后无行 → calculated=0，不得刷新 state。"""
+    from unittest.mock import patch
+    import pandas as pd
+
+    from backend.db.schema import create_all_tables
+    from backend.etl.calc_state import load_calc_state, upsert_calc_state
+    from backend.etl.calc_macd import MACDCalculator
+    from backend.etl.orchestrator import _route_calc
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    df = pd.DataFrame({
+        "trade_date": ["20260101", "20260102"],
+        "close_qfq": [10.0, 11.0],
+    })
+    upsert_calc_state(con, "T.SZ", "daily", "macd",
+                      last_trade_date="20260101", history_fp="fp0",
+                      calc_date="20260101")
+    calc = MACDCalculator(con, "daily")
+
+    with patch("backend.etl.calc_router.classify_calc_mode",
+               return_value=("APPEND", ["20260102"])):
+        with patch.object(calc, "_insert", return_value=0):
+            _route_calc(con, calc, "macd", "daily", "T.SZ", df, "20260102",
+                        None, {}, append_on=True)
+
+    st = load_calc_state(con, "daily", "macd", ["T.SZ"]).get("T.SZ")
+    assert st["last_trade_date"] == "20260101"
+    assert st["history_fp"] == "fp0"
+    con.close()

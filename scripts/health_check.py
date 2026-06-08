@@ -18,6 +18,75 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backend.config import DUCKDB_PATH
 
 INDICATORS = ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
+MATURE_WEEKLY_WEEKS = 120
+MATURE_VOL_FILL_MIN_ABS = 4000
+MATURE_VOL_FILL_MIN_RATIO = 0.8
+
+
+def _mature_list_cutoff_sql() -> str:
+    """第 120 个 week-end（自最新往回）对应的 list_date 上限。"""
+    return f"""
+        SELECT trade_date FROM (
+            SELECT trade_date,
+                   ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
+            FROM dim_date WHERE is_trade_day=1 AND is_week_end=1
+        ) WHERE rn = {MATURE_WEEKLY_WEEKS}
+    """
+
+
+def _latest_week_end_sql() -> str:
+    """最新**已有行情**的 week-end（dim_date 可能含未来日历）。"""
+    return """
+        SELECT MAX(trade_date) FROM dim_date
+        WHERE is_trade_day=1 AND is_week_end=1
+          AND trade_date <= (SELECT MAX(trade_date) FROM ods_daily)
+    """
+
+
+def mature_stock_universe_sql() -> str:
+    cutoff = _mature_list_cutoff_sql()
+    return f"""
+        SELECT COUNT(*) FROM dim_stock s
+        WHERE s.list_date IS NOT NULL
+          AND s.list_date <= ({cutoff})
+    """
+
+
+def mature_volume_weekly_fill_sql(metric_col: str = "pct_vol_rank") -> str:
+    """成熟股在**最新 week-end 截面**上 metric 非空的 distinct 股票数。"""
+    cutoff = _mature_list_cutoff_sql()
+    latest = _latest_week_end_sql()
+    return f"""
+        SELECT COUNT(DISTINCT v.ts_code)
+        FROM v_dws_volume_weekly_latest v
+        JOIN dim_stock s ON v.ts_code = s.ts_code
+        WHERE v.trade_date = ({latest})
+          AND v.{metric_col} IS NOT NULL
+          AND s.list_date IS NOT NULL
+          AND s.list_date <= ({cutoff})
+    """
+
+
+def legacy_mature_volume_weekly_fill_sql(metric_col: str = "pct_vol_rank") -> str:
+    """旧口径：任意历史 week-end 行数（易假 PASS，仅用于回归对比）。"""
+    cutoff = _mature_list_cutoff_sql()
+    return f"""
+        SELECT COUNT(*) FROM v_dws_volume_weekly_latest v
+        JOIN dim_date d ON v.trade_date = d.trade_date AND d.is_week_end = 1
+        JOIN dim_stock s ON v.ts_code = s.ts_code
+        WHERE v.{metric_col} IS NOT NULL
+          AND s.list_date IS NOT NULL
+          AND s.list_date <= ({cutoff})
+    """
+
+
+def mature_volume_fill_minimum(universe: int) -> int:
+    """动态阈值：80% universe，全市场时 floor=4000；小 universe 不强行 4000。"""
+    if universe <= 0:
+        return MATURE_VOL_FILL_MIN_ABS
+    ratio_min = int(universe * MATURE_VOL_FILL_MIN_RATIO)
+    floor = MATURE_VOL_FILL_MIN_ABS if universe >= MATURE_VOL_FILL_MIN_ABS else 0
+    return min(universe, max(ratio_min, floor))
 
 
 class Checker:
@@ -168,33 +237,21 @@ def run(con) -> int:
            "(SELECT 1 FROM dwd_daily_moneyflow mf WHERE mf.ts_code=q.ts_code AND mf.trade_date=q.trade_date)")
     c.info("dim_stock 有 delist_date(已知=0)", "SELECT COUNT(*) FROM dim_stock WHERE delist_date IS NOT NULL")
 
-    print("=== I. 周线 volume 状态指标（成熟股） ===")
-    mature_list_cutoff = """
-        SELECT trade_date FROM (
-            SELECT trade_date,
-                   ROW_NUMBER() OVER (ORDER BY trade_date DESC) AS rn
-            FROM dim_date WHERE is_trade_day=1 AND is_week_end=1
-        ) WHERE rn = 120
-    """
-    mature_vol_rank_sql = f"""
-        SELECT COUNT(*) FROM v_dws_volume_weekly_latest v
-        JOIN dim_date d ON v.trade_date = d.trade_date AND d.is_week_end = 1
-        JOIN dim_stock s ON v.ts_code = s.ts_code
-        WHERE v.pct_vol_rank IS NOT NULL
-          AND s.list_date IS NOT NULL
-          AND s.list_date <= ({mature_list_cutoff})
-    """
-    mature_universe_sql = f"""
-        SELECT COUNT(*) FROM dim_stock s
-        WHERE s.list_date IS NOT NULL
-          AND s.list_date <= ({mature_list_cutoff})
-    """
+    print("=== I. 周线 volume 状态指标（成熟股，最新 week-end 截面） ===")
+    mature_universe_sql = mature_stock_universe_sql()
+    universe = c._scalar(mature_universe_sql) or 0
+    fill_minimum = mature_volume_fill_minimum(universe)
     c.info("成熟股 universe", mature_universe_sql)
-    c.expect_min("volume_weekly pct_vol_rank 非空(成熟股)", mature_vol_rank_sql, minimum=4000)
+    c.info("volume_weekly 填充率阈值", f"SELECT {fill_minimum}")
     c.expect_min(
-        "volume_weekly zone 非空(成熟股)",
-        mature_vol_rank_sql.replace("pct_vol_rank", "zone"),
-        minimum=4000,
+        "volume_weekly pct_vol_rank 非空(成熟股,最新截面)",
+        mature_volume_weekly_fill_sql("pct_vol_rank"),
+        minimum=fill_minimum,
+    )
+    c.expect_min(
+        "volume_weekly zone 非空(成熟股,最新截面)",
+        mature_volume_weekly_fill_sql("zone"),
+        minimum=fill_minimum,
     )
 
     print()

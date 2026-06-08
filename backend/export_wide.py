@@ -487,8 +487,8 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
                     val = ws.cell(row=row_idx, column=col_idx).value
                     fill = value_colors.get(val)
                     if fill is None and isinstance(val, str):
-                        for prefix, color in value_colors.items():
-                            if val.startswith(prefix):
+                        for signal_prefix, color in value_colors.items():
+                            if val.startswith(signal_prefix):
                                 fill = color
                                 break
                     if fill is not None:

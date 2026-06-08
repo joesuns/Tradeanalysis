@@ -73,10 +73,10 @@ class KPatternCalculator:
             fp = compute_input_fingerprint(df, recalc_start=recalc_start)
             is_st = self._is_st_stock(ts_code)
             df = self._compute_patterns(df, is_st)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp,
-                         write_start=recalc_start,
-                         write_end=calc_date if recalc_start else None)
-            result.calculated += 1
+            if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                            write_start=recalc_start,
+                            write_end=calc_date if recalc_start else None):
+                result.calculated += 1
         return result
 
     def _is_st_stock(self, ts_code: str) -> bool:
@@ -393,9 +393,9 @@ class KPatternCalculator:
             is_st = self._is_st_stock(ts_code)
         df = self._compute_patterns_append(df, new_bars, is_st)
         fp = compute_history_signature(df, self.SIGNATURE_COLS)
-        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
-                     write_start=new_bars[0], write_end=new_bars[-1])
-        result.calculated += 1
+        if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                        write_start=new_bars[0], write_end=new_bars[-1]):
+            result.calculated += 1
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
@@ -406,7 +406,7 @@ class KPatternCalculator:
                     "yin_bao_yang", "yin_ke_yang", "strength", "calc_date",
                     "input_fingerprint", "spec_version"]
         float_cols = ["strength"]
-        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                         dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint,
-                         write_start=write_start, write_end=write_end)
+        return insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                                dws_cols, float_cols,
+                                input_fingerprint=input_fingerprint,
+                                write_start=write_start, write_end=write_end)

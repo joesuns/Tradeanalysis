@@ -18,6 +18,9 @@ CALC_INCREMENTAL = os.getenv("CALC_INCREMENTAL", "1").strip() != "0"
 # vectorized APPEND fast path (compute only new bars). =0 falls back to the
 # CALC_INCREMENTAL narrow-window recompute; CALC_INCREMENTAL=0 falls back to full.
 CALC_APPEND = os.getenv("CALC_APPEND", "1").strip() != "0"
+# CALC_FAST_SKIP: chunk batch preflight — skip stocks that would all route to SKIP
+# without per-stock quote/DDE loads (same-day rerun). Requires CALC_APPEND.
+CALC_FAST_SKIP = os.getenv("CALC_FAST_SKIP", "1").strip() != "0"
 # CALC_WORKERS: optional override for calc thread-pool size (default min(cpu-1, 8)).
 # DuckDB single-file lock forbids multi-process writes, so calc parallelism is
 # thread-based (shared in-process instance), not multiprocessing.

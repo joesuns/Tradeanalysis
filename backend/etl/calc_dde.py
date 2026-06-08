@@ -90,10 +90,10 @@ class DDECalculator:
                 ("ddx2",), recalc_start,
             )
             df = self._compute_indicators(df, ema_seeds=ema_seeds)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp,
-                         write_start=recalc_start,
-                         write_end=calc_date if recalc_start else None)
-            result.calculated += 1
+            if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                            write_start=recalc_start,
+                            write_end=calc_date if recalc_start else None):
+                result.calculated += 1
         return result
 
     def _load_daily(self, ts_code: str) -> pd.DataFrame:
@@ -439,9 +439,9 @@ class DDECalculator:
         )
         df = self._compute_indicators(df, ema_seeds=seeds)
         fp = compute_history_signature(df, self.SIGNATURE_COLS)
-        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
-                     write_start=new_bars[0], write_end=new_bars[-1])
-        result.calculated += 1
+        if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                        write_start=new_bars[0], write_end=new_bars[-1]):
+            result.calculated += 1
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
@@ -451,7 +451,7 @@ class DDECalculator:
                     "trend", "trend_strength", "alert", "divergence",
                     "calc_date", "input_fingerprint", "spec_version"]
         float_cols = ["net_mf_amount", "ddx", "ddx2", "trend_strength"]
-        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                         dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint,
-                         write_start=write_start, write_end=write_end)
+        return insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                                dws_cols, float_cols,
+                                input_fingerprint=input_fingerprint,
+                                write_start=write_start, write_end=write_end)

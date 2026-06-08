@@ -16,14 +16,17 @@ import duckdb
 logger = logging.getLogger(__name__)
 
 
-def fetch_by_date_range(client, con, start: str, end: str) -> int:
+def fetch_by_date_range(client, con, start: str, end: str,
+                        ts_codes: list[str] = None) -> int:
     """Fetch daily + daily_basic + moneyflow for all stocks, batched by trade_date.
 
     Returns total rows written across all three ODS tables.
-    Incremental: skips dates already present in ods_daily.
+    Incremental: per-target-stock when ts_codes set (or auto-resolved from dim).
     """
     import time
-    days = _get_trading_days(client, start, end, con=con)
+    if ts_codes is None and con is not None:
+        ts_codes = get_all_active_codes(con)
+    days = _get_trading_days(client, start, end, con=con, ts_codes=ts_codes)
     if not days:
         logger.info("All dates already in DB — nothing to fetch (%s~%s)", start, end)
         return 0
@@ -31,6 +34,7 @@ def fetch_by_date_range(client, con, start: str, end: str) -> int:
 
     t0 = time.time()
     total = 0
+    failed_dates = []
     for i, trade_date in enumerate(days):
         if i > 0 and i % 20 == 0:
             elapsed = time.time() - t0
@@ -49,6 +53,7 @@ def fetch_by_date_range(client, con, start: str, end: str) -> int:
 
             # 1. Daily OHLCV — bulk INSERT via register + SELECT
             recs = client.call("daily", trade_date=trade_date)
+            recs, _ = _validate_ods_batch(recs, "daily", trade_date)
             daily_data = [{"ts_code": r["ts_code"],
                 "trade_date": r["trade_date"], "open": r["open"],
                 "high": r["high"], "low": r["low"], "close": r["close"],
@@ -128,10 +133,45 @@ def fetch_by_date_range(client, con, start: str, end: str) -> int:
                 con.unregister("_mf_batch")
                 total += len(mf_data)
 
-        except Exception as e:
-            logger.error(f"Failed trade_date={trade_date}: {e}")
+        except Exception:
+            failed_dates.append(trade_date)
+            logger.exception("Failed trade_date=%s", trade_date)
 
+    if failed_dates:
+        display = ", ".join(failed_dates[:5])
+        if len(failed_dates) > 5:
+            display += f" ... (+{len(failed_dates) - 5} more)"
+        logger.warning("fetch_by_date_range: %d/%d dates failed: %s",
+                       len(failed_dates), len(days) if days else 0, display)
     return total
+
+
+def _local_trading_days(con, start: str, end: str):
+    """Return trading days from local dim_date, or None if it can't be used.
+
+    Returns None (→ caller falls back to trade_cal API) when dim_date is
+    missing, empty, or does not fully cover [start, end]. Coverage requires
+    dim_date to span from <= start to >= end so we never silently return a
+    truncated calendar.
+    """
+    try:
+        bounds = con.execute(
+            "SELECT MIN(trade_date), MAX(trade_date) FROM dim_date"
+        ).fetchone()
+    except duckdb.CatalogException:
+        return None
+    if not bounds or bounds[0] is None:
+        return None
+    min_d, max_d = bounds
+    if min_d > start or max_d < end:
+        return None
+    rows = con.execute(
+        "SELECT trade_date FROM dim_date "
+        "WHERE is_trade_day = 1 AND trade_date >= ? AND trade_date <= ? "
+        "ORDER BY trade_date",
+        (start, end),
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def _get_trading_days(client, start: str, end: str,
@@ -141,10 +181,16 @@ def _get_trading_days(client, start: str, end: str,
     When con + ts_codes: per-target-stock incremental — only skip dates
     where ALL target stocks already have ODS data.
     When con only: original date-global incremental (any stock → date skipped).
+
+    Calendar source: prefer the local dim_date table when it fully covers the
+    requested [start, end] range (avoids a redundant trade_cal round-trip in
+    incremental runs); otherwise fall back to the trade_cal API.
     """
-    recs = client.call("trade_cal", exchange="SSE", start_date=start, end_date=end,
-                       is_open=1)
-    days = sorted([r["cal_date"] for r in recs])
+    days = _local_trading_days(con, start, end) if con is not None else None
+    if days is None:
+        recs = client.call("trade_cal", exchange="SSE", start_date=start,
+                           end_date=end, is_open=1)
+        days = sorted([r["cal_date"] for r in recs])
 
     if con and ts_codes:
         # Per-target-stock: date is "covered" only when ALL target stocks have it
@@ -182,18 +228,19 @@ def _get_trading_days(client, start: str, end: str,
 
 
 def _validate_ods_batch(recs: list[dict], api_name: str,
-                        trade_date: str = "") -> tuple[int, int]:
-    """Validate ODS batch before INSERT. Returns (valid_count, invalid_count).
+                        trade_date: str = "") -> tuple[list, int]:
+    """Filter an ODS daily batch before INSERT. Returns (valid_recs, invalid_count).
 
-    Checks:
+    Checks (OHLCV daily records only):
       1. Required fields present and non-None (open/high/low/close/vol/amount)
       2. OHLC logic: high >= low
 
-    Invalid rows are logged and counted; caller should skip them.
+    Invalid rows are dropped from the returned list and counted; one WARNING
+    is logged per batch when any rows are rejected.
     """
     import pandas as pd
     required = ["open", "high", "low", "close", "vol", "amount"]
-    valid = 0
+    valid_recs = []
     invalid = 0
 
     for r in recs:
@@ -220,13 +267,13 @@ def _validate_ods_batch(recs: list[dict], api_name: str,
             invalid += 1
             continue
 
-        valid += 1
+        valid_recs.append(r)
 
     if invalid > 0:
         logger.warning("_validate_ods_batch: %s %s %d/%d rows rejected",
                        api_name, trade_date, invalid, len(recs))
 
-    return valid, invalid
+    return valid_recs, invalid
 
 
 def _get_missing_days_for_stock(con, ts_code: str,
@@ -242,11 +289,31 @@ def _get_missing_days_for_stock(con, ts_code: str,
     return [d for d in all_trading_days if d not in existing]
 
 
+def _drop_suspension_gaps(con, ts_code: str,
+                          missing_days: list[str]) -> list[str]:
+    """丢弃落在该股交易区间 [first_ods, last_ods] 内部的缺失日（停牌）。
+
+    保留 head (<first_ods) 与 tail (>last_ods) 缺口；无 ODS 行时全部保留。
+    """
+    if not missing_days:
+        return missing_days
+    row = con.execute(
+        "SELECT MIN(trade_date), MAX(trade_date) FROM ods_daily WHERE ts_code = ?",
+        (ts_code,),
+    ).fetchone()
+    first_ods = row[0] if row else None
+    last_ods = row[1] if row else None
+    if not first_ods or not last_ods:
+        return missing_days
+    return [d for d in missing_days if d < first_ods or d > last_ods]
+
+
 def _get_missing_ranges_per_stock(con, ts_code: str,
                                    all_trading_days: list[str]) -> list[tuple[str, str]]:
     """返回该股票缺失的连续日期段列表，每个元素为 (start, end)。
     连续缺失的日期合并为一个 range，减少 API 调用次数。"""
     missing = _get_missing_days_for_stock(con, ts_code, all_trading_days)
+    missing = _drop_suspension_gaps(con, ts_code, missing)
     if not missing:
         return []
 
@@ -279,6 +346,7 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
     返回写入的总行数。
     """
     import time
+    import pandas as pd
 
     if start is None:
         # Default: 90 calendar-day lookback (~60 trading days) instead of 2015-01-01.
@@ -287,12 +355,17 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
         end_dt = dt.strptime(end[:8], "%Y%m%d") if len(end) >= 8 else dt.now()
         start = (end_dt - timedelta(days=90)).strftime("%Y%m%d")
 
-    try:
-        cal = client.call("trade_cal", exchange="SSE", start_date=start, end_date=end, is_open=1)
-    except Exception as e:
-        logger.error("fetch_stocks_incremental: trade_cal API failed — %s", e)
-        return 0
-    all_days = sorted([r["cal_date"] for r in cal])
+    # Prefer the local dim_date calendar; fall back to trade_cal API when it
+    # doesn't fully cover [start, end] (e.g. the 20991231 sentinel end).
+    all_days = _local_trading_days(con, start, end)
+    if all_days is None:
+        try:
+            cal = client.call("trade_cal", exchange="SSE",
+                              start_date=start, end_date=end, is_open=1)
+        except Exception:
+            logger.exception("fetch_stocks_incremental: trade_cal API failed")
+            return 0
+        all_days = sorted([r["cal_date"] for r in cal])
     if not all_days:
         return 0
 
@@ -310,35 +383,53 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                                        start_date=seg_start, end_date=seg_end)
                 adj_map = {a["trade_date"]: a.get("adj_factor") for a in adj_recs}
 
-                # 1. Daily OHLCV — per-stock
+                # 1. Daily OHLCV — per-stock, bulk insert via register + SELECT
+                #    (~666x faster than row-by-row executemany; mirrors the
+                #     date-batched path in fetch_by_date_range_parallel)
                 recs = client.call("daily", ts_code=ts_code,
                                    start_date=seg_start, end_date=seg_end)
-                for r in recs:
-                    adj = adj_map.get(r["trade_date"])
+                recs, _ = _validate_ods_batch(recs, "daily",
+                                              f"{seg_start}~{seg_end}")
+                daily_data = [{"ts_code": r["ts_code"], "trade_date": r["trade_date"],
+                               "open": r["open"], "high": r["high"], "low": r["low"],
+                               "close": r["close"], "vol": r["vol"],
+                               "amount": r["amount"], "pct_chg": r["pct_chg"],
+                               "adj_factor": adj_map.get(r["trade_date"])}
+                              for r in recs]
+                if daily_data:
+                    df = pd.DataFrame(daily_data)
+                    con.register("_inc_daily", df)
                     con.execute("""INSERT OR REPLACE INTO ods_daily
                         (ts_code, trade_date, open, high, low, close, vol,
                          amount, pct_chg, adj_factor, fetched_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,now())""",
-                        (r["ts_code"], r["trade_date"], r["open"], r["high"],
-                         r["low"], r["close"], r["vol"], r["amount"],
-                         r["pct_chg"], adj))
-                    total += 1
-            except Exception as e:
-                logger.error("fetch_stocks_incremental %s [%s~%s]: %s",
-                             ts_code, seg_start, seg_end, e)
+                        SELECT ts_code, trade_date, open, high, low, close, vol,
+                               amount, pct_chg, adj_factor, now()
+                        FROM _inc_daily""")
+                    con.unregister("_inc_daily")
+                    total += len(daily_data)
+            except Exception:
+                logger.exception("fetch_stocks_incremental %s [%s~%s]",
+                                 ts_code, seg_start, seg_end)
 
             try:
                 recs = client.call("daily_basic", ts_code=ts_code,
                                    start_date=seg_start, end_date=seg_end)
-                for r in recs:
+                basic_data = [{"ts_code": r["ts_code"], "trade_date": r["trade_date"],
+                               "total_mv": r.get("total_mv"), "pe_ttm": r.get("pe_ttm"),
+                               "turnover_rate": r.get("turnover_rate"),
+                               "volume_ratio": r.get("volume_ratio")}
+                              for r in recs]
+                if basic_data:
+                    df = pd.DataFrame(basic_data)
+                    con.register("_inc_basic", df)
                     con.execute("""INSERT OR REPLACE INTO ods_daily_basic
                         (ts_code, trade_date, total_mv, pe_ttm,
                          turnover_rate, volume_ratio, fetched_at)
-                        VALUES (?,?,?,?,?,?,now())""",
-                        (r["ts_code"], r["trade_date"], r.get("total_mv"),
-                         r.get("pe_ttm"), r.get("turnover_rate"),
-                         r.get("volume_ratio")))
-                    total += 1
+                        SELECT ts_code, trade_date, total_mv, pe_ttm,
+                               turnover_rate, volume_ratio, now()
+                        FROM _inc_basic""")
+                    con.unregister("_inc_basic")
+                    total += len(basic_data)
             except Exception as e:
                 logger.warning("fetch_stocks_incremental %s [%s~%s] daily_basic skipped: %s",
                               ts_code, seg_start, seg_end, e)
@@ -346,7 +437,29 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
             try:
                 recs = client.call("moneyflow", ts_code=ts_code,
                                    start_date=seg_start, end_date=seg_end)
-                for r in recs:
+                mf_data = [{"ts_code": r["ts_code"], "trade_date": r["trade_date"],
+                            "buy_sm_vol": r.get("buy_sm_vol"),
+                            "buy_sm_amount": r.get("buy_sm_amount"),
+                            "sell_sm_vol": r.get("sell_sm_vol"),
+                            "sell_sm_amount": r.get("sell_sm_amount"),
+                            "buy_md_vol": r.get("buy_md_vol"),
+                            "buy_md_amount": r.get("buy_md_amount"),
+                            "sell_md_vol": r.get("sell_md_vol"),
+                            "sell_md_amount": r.get("sell_md_amount"),
+                            "buy_lg_vol": r.get("buy_lg_vol"),
+                            "buy_lg_amount": r.get("buy_lg_amount"),
+                            "sell_lg_vol": r.get("sell_lg_vol"),
+                            "sell_lg_amount": r.get("sell_lg_amount"),
+                            "buy_elg_vol": r.get("buy_elg_vol"),
+                            "buy_elg_amount": r.get("buy_elg_amount"),
+                            "sell_elg_vol": r.get("sell_elg_vol"),
+                            "sell_elg_amount": r.get("sell_elg_amount"),
+                            "net_mf_vol": r.get("net_mf_vol"),
+                            "net_mf_amount": r.get("net_mf_amount")}
+                           for r in recs]
+                if mf_data:
+                    df = pd.DataFrame(mf_data)
+                    con.register("_inc_mf", df)
                     con.execute("""INSERT OR REPLACE INTO ods_moneyflow
                         (ts_code, trade_date, buy_sm_vol, buy_sm_amount,
                          sell_sm_vol, sell_sm_amount, buy_md_vol, buy_md_amount,
@@ -354,18 +467,15 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                          sell_lg_vol, sell_lg_amount, buy_elg_vol, buy_elg_amount,
                          sell_elg_vol, sell_elg_amount, net_mf_vol, net_mf_amount,
                          fetched_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,now())""",
-                        (r["ts_code"], r["trade_date"],
-                         r.get("buy_sm_vol"), r.get("buy_sm_amount"),
-                         r.get("sell_sm_vol"), r.get("sell_sm_amount"),
-                         r.get("buy_md_vol"), r.get("buy_md_amount"),
-                         r.get("sell_md_vol"), r.get("sell_md_amount"),
-                         r.get("buy_lg_vol"), r.get("buy_lg_amount"),
-                         r.get("sell_lg_vol"), r.get("sell_lg_amount"),
-                         r.get("buy_elg_vol"), r.get("buy_elg_amount"),
-                         r.get("sell_elg_vol"), r.get("sell_elg_amount"),
-                         r.get("net_mf_vol"), r.get("net_mf_amount")))
-                    total += 1
+                        SELECT ts_code, trade_date, buy_sm_vol, buy_sm_amount,
+                               sell_sm_vol, sell_sm_amount, buy_md_vol, buy_md_amount,
+                               sell_md_vol, sell_md_amount, buy_lg_vol, buy_lg_amount,
+                               sell_lg_vol, sell_lg_amount, buy_elg_vol, buy_elg_amount,
+                               sell_elg_vol, sell_elg_amount, net_mf_vol, net_mf_amount,
+                               now()
+                        FROM _inc_mf""")
+                    con.unregister("_inc_mf")
+                    total += len(mf_data)
             except Exception as e:
                 logger.warning("fetch_stocks_incremental %s [%s~%s] moneyflow skipped: %s",
                               ts_code, seg_start, seg_end, e)
@@ -409,6 +519,8 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
 
     # Get trading days with incremental skip (single-threaded, 1 API call)
     client = TushareClient()
+    if ts_codes is None and con is not None:
+        ts_codes = get_all_active_codes(con)
     days = _get_trading_days(client, start, end, con=con, ts_codes=ts_codes)
     if not days:
         logger.info("All dates already in DB — nothing to fetch (%s~%s)", start, end)
@@ -444,6 +556,7 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
 
                 # --- ods_daily: bulk INSERT via register + SELECT ---
                 recs = thread_client.call("daily", trade_date=trade_date)
+                recs, _ = _validate_ods_batch(recs, "daily", trade_date)
                 daily_data = []
                 for r in recs:
                     if code_set and r["ts_code"] not in code_set:
@@ -556,8 +669,8 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
                                 done, len(days), done * 100 // len(days),
                                 elapsed, rate, eta)
 
-            except Exception as e:
-                logger.error(f"Thread failed trade_date={trade_date}: {e}")
+            except Exception:
+                logger.exception("Thread failed trade_date=%s", trade_date)
         thread_con.close()
         return total
 

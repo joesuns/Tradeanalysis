@@ -74,10 +74,10 @@ class PricePositionCalculator:
 
             fp = compute_input_fingerprint(df, recalc_start=recalc_start)
             df = self._compute_positions(df)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp,
-                         write_start=recalc_start,
-                         write_end=calc_date if recalc_start else None)
-            result.calculated += 1
+            if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                            write_start=recalc_start,
+                            write_end=calc_date if recalc_start else None):
+                result.calculated += 1
         return result
 
     def _compute_positions(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -112,9 +112,9 @@ class PricePositionCalculator:
         result = CalcResult()
         df = self._compute_positions_append(df, new_bars)
         fp = compute_history_signature(df, self.SIGNATURE_COLS)
-        self._insert(ts_code, df, calc_date, input_fingerprint=fp,
-                     write_start=new_bars[0], write_end=new_bars[-1])
-        result.calculated += 1
+        if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                        write_start=new_bars[0], write_end=new_bars[-1]):
+            result.calculated += 1
         return result
 
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
@@ -124,7 +124,7 @@ class PricePositionCalculator:
         dws_cols = ["ts_code", "trade_date"] + pos_cols + [
             "calc_date", "input_fingerprint", "spec_version"]
         float_cols = pos_cols
-        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                         dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint,
-                         write_start=write_start, write_end=write_end)
+        return insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                                dws_cols, float_cols,
+                                input_fingerprint=input_fingerprint,
+                                write_start=write_start, write_end=write_end)

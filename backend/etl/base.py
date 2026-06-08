@@ -543,11 +543,12 @@ def insert_dws_batch(con, table: str, df: "pd.DataFrame", ts_code: str,
                      spec_version: str = "v1",
                      input_fingerprint: str = None,
                      write_start: str = None,
-                     write_end: str = None):
+                     write_end: str = None) -> int:
     """Shared DWS INSERT -- replaces individual Calculator _insert methods.
 
     Handles: calc_date, spec_version, input_fingerprint, to_float_safe.
     When input_fingerprint is provided, uses it directly instead of computing.
+    Returns the number of rows inserted (0 when write range filters to empty).
     """
     import pandas as pd
 
@@ -562,7 +563,7 @@ def insert_dws_batch(con, table: str, df: "pd.DataFrame", ts_code: str,
     if write_end is not None:
         batch = batch[batch["trade_date"] <= write_end]
     if batch.empty:
-        return
+        return 0
     batch["ts_code"] = ts_code
 
     for c in float_cols:
@@ -580,3 +581,4 @@ def insert_dws_batch(con, table: str, df: "pd.DataFrame", ts_code: str,
         f"SELECT {cols_sql} FROM _batch"
     )
     con.unregister("_batch")
+    return len(batch)

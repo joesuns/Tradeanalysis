@@ -145,3 +145,68 @@ def test_cli_help_lists_run():
     )
     assert result.returncode == 0
     assert "run" in result.stdout
+
+
+def test_default_export_path_under_exports():
+    """run/export 默认 Excel 路径应在 exports/ 下。"""
+    from backend.export_wide import default_export_path
+
+    path = default_export_path("20260605")
+    assert path.startswith("exports/")
+    assert "analysis_20260605_gen" in path
+    assert path.endswith(".xlsx")
+    assert default_export_path("20260605", "custom/out.xlsx") == "custom/out.xlsx"
+
+
+def test_cmd_run_closes_date_connection_before_calc(monkeypatch):
+    """cmd_run: resolve date → fetch → calc → export; short-lived conns."""
+    import argparse
+    from backend import cli
+
+    events = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
+
+        def close(self):
+            events.append("con_closed")
+
+    def fake_fetch(*_a, **_k):
+        events.append("fetch_done")
+        return 100
+
+    def fake_rebuild(con, codes):
+        events.append("dwd_rebuilt")
+
+    def fake_calc(_args, skip_stale_fetch=False):
+        events.append("calc_started")
+        assert skip_stale_fetch is True
+
+    monkeypatch.setattr(
+        "backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr(
+        "backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
+    monkeypatch.setattr(
+        "backend.fetch.ods_daily.fetch_by_date_range_parallel", fake_fetch)
+    monkeypatch.setattr("backend.etl.build_dwd.rebuild_all_dwd", fake_rebuild)
+    monkeypatch.setattr(cli, "cmd_calc", fake_calc)
+    monkeypatch.setattr(
+        "backend.export_wide.export_wide_to_excel", lambda *a, **k: 5000)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260605",
+        ts_code=None,
+        output="out.xlsx",
+        include_st=False,
+        no_index=False,
+        db_path=None,
+    )
+    cli.cmd_run(args)
+
+    assert events.count("con_closed") >= 2
+    assert "fetch_done" in events
+    assert "dwd_rebuilt" in events
+    assert "calc_started" in events
+    assert events.index("fetch_done") < events.index("calc_started")

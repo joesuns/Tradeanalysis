@@ -1,5 +1,11 @@
 """Tests for RecalcSpec registry and resolve_recalc_bars aggregation."""
-from backend.etl.recalc_spec import RecalcSpec, collect_specs, resolve_recalc_bars
+from backend.etl.recalc_spec import (
+    RecalcSpec,
+    _WEEKLY_WARMUP_GATE,
+    collect_specs,
+    resolve_recalc_bars,
+    resolve_weekly_warmup_weeks,
+)
 
 
 def test_recalc_spec_total():
@@ -33,3 +39,18 @@ def test_warmup_from_registry():
     specs = collect_specs("daily")
     warmup = max(max(s.min_rows, s.lookback) for s in specs)
     assert warmup >= 250
+
+
+def test_resolve_weekly_warmup_weeks_current_registry():
+    """Volume pct_rank (120w) drives gate; PP 250w must not inflate fetch warmup."""
+    assert resolve_weekly_warmup_weeks() == _WEEKLY_WARMUP_GATE
+
+
+def test_resolve_weekly_warmup_weeks_empty_gate_specs(monkeypatch):
+    """All lookbacks > gate → fallback to gate threshold, not ValueError."""
+
+    def _high_only(_freq):
+        return [RecalcSpec(lookback=250), RecalcSpec(lookback=200)]
+
+    monkeypatch.setattr("backend.etl.recalc_spec.collect_specs", _high_only)
+    assert resolve_weekly_warmup_weeks() == _WEEKLY_WARMUP_GATE

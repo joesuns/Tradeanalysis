@@ -47,7 +47,7 @@ def build_dim_date(con) -> int:
         is_open AS is_trade_day,
         CASE WHEN cal_date = (
             SELECT MAX(o2.cal_date) FROM dates o2
-            WHERE strftime(o2.dt, '%Y-%W') = strftime(dates.dt, '%Y-%W'))
+            WHERE date_trunc('week', o2.dt) = date_trunc('week', dates.dt))
             THEN 1 ELSE 0 END AS is_week_end,
         CASE WHEN cal_date = (
             SELECT MAX(o2.cal_date) FROM dates o2

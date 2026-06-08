@@ -5,18 +5,23 @@ Usage:
     python -m backend.cli run --date 20260604
     python -m backend.cli check
     python -m backend.cli fetch [--ts-code 000543.SZ] [--start 20150101]
-    python -m backend.cli calc [--ts-code 000543.SZ]
+    python -m backend.cli calc [--date 20260605] [--ts-code 000543.SZ]
     python -m backend.cli export --date 20260529 [--ts-code 000543.SZ]
     python -m backend.cli query --ts-code 000001.SZ
+    python -m backend.cli prune [--keep 5]
+    python -m backend.cli repair-weekly [--execute]
     python -m backend.cli status
 """
 
 import argparse
+import logging
 import sys
+import uuid
 
-from backend.log_config import setup_logging
+from backend.log_config import setup_logging, set_run_id
 
 setup_logging()
+logger = logging.getLogger(__name__)
 
 
 def _resolve_trade_date(con, date: str = None) -> str:
@@ -45,8 +50,39 @@ def _ensure_trade_date(con, date: str) -> str:
         return date  # dim_date may be empty — trust the caller
     trade_date = row[0]
     if trade_date != date:
-        print(f"Warning: {date} is not a trading day, using {trade_date} instead")
+        logger.warning("%s is not a trading day, using %s instead", date, trade_date)
     return trade_date
+
+
+def _warn_export_coverage(db_path: str, trade_date: str, n_rows: int,
+                        filter_st: bool, ts_codes=None):
+    """Log WARNING when export rows are far below expected active stocks."""
+    from backend.db.connection import get_connection
+
+    con = get_connection(read_only=True)
+    try:
+        if ts_codes:
+            expected = len(ts_codes)
+        else:
+            st_clause = " AND is_st = 0" if filter_st else ""
+            expected = con.execute(f"""
+                SELECT COUNT(*) FROM dim_stock
+                WHERE list_date <= ?
+                  AND (delist_date IS NULL OR delist_date >= ?)
+                  {st_clause}
+            """, [trade_date, trade_date]).fetchone()[0]
+        ods_count = con.execute(
+            "SELECT COUNT(*) FROM ods_daily WHERE trade_date = ?", [trade_date]
+        ).fetchone()[0]
+        threshold = int(expected * 0.8)
+        if n_rows < threshold:
+            logger.warning(
+                "Export row count %d is far below expected ~%d for %s "
+                "(ods_daily=%d on date). Check fetch/calc logs.",
+                n_rows, expected, trade_date, ods_count,
+            )
+    finally:
+        con.close()
 
 
 # ── check ──
@@ -90,13 +126,13 @@ def cmd_fetch(args):
 
         if args.ts_code:
             codes = args.ts_code if isinstance(args.ts_code, list) else [args.ts_code]
-            print(f"Stock-batched fetch: {len(codes)} stocks, {start}~{end}")
+            logger.info("Stock-batched fetch: %d stocks, %s~%s", len(codes), start, end)
             n = fetch_stocks_incremental(client, con, codes, start=start, end=end)
         else:
             codes = get_all_active_codes(con)
-            print(f"Date-batched fetch: {len(codes)} active stocks, {start}~{end}")
+            logger.info("Date-batched fetch: %d active stocks, %s~%s", len(codes), start, end)
             n = fetch_by_date_range_parallel(
-                start, end, workers=3, con=con
+                start, end, workers=3, ts_codes=codes, con=con
             )
         print(f"Fetched {n} rows")
     finally:
@@ -105,10 +141,10 @@ def cmd_fetch(args):
 
 # ── calc ──
 
-def cmd_calc(args):
+def cmd_calc(args, skip_stale_fetch=False):
     """Compute DWS indicators.
 
-    Auto-fetches missing data before calculating.
+    Auto-fetches missing warmup + stale latest-day ODS before calculating.
     No --ts-code: calculate all active stocks.
     """
     from backend.db.connection import get_connection
@@ -116,8 +152,18 @@ def cmd_calc(args):
 
     con = get_connection()
     try:
+        calc_date = None
+        if getattr(args, "date", None):
+            calc_date = _ensure_trade_date(
+                con, _resolve_trade_date(con, args.date))
         ts_codes = args.ts_code if args.ts_code else None
-        run_calc(con, ts_codes=ts_codes, auto_fetch=True)
+        run_calc(
+            con,
+            ts_codes=ts_codes,
+            auto_fetch=True,
+            calc_date=calc_date,
+            skip_stale_fetch=skip_stale_fetch,
+        )
     finally:
         con.close()
 
@@ -130,12 +176,9 @@ def cmd_export(args):
     Reads DWS data directly from the database. No recalculation.
     Use 'calc' then 'export' separately if fresh data is needed.
     """
-    from backend.export_wide import export_wide_to_excel
+    from backend.export_wide import default_export_path, export_wide_to_excel
 
-    if args.output is None:
-        from datetime import datetime
-        gen_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output = f"analysis_{args.date}_gen{gen_ts}.xlsx"
+    args.output = default_export_path(args.date, args.output)
 
     ts_codes = args.ts_code if args.ts_code else None
 
@@ -147,6 +190,10 @@ def cmd_export(args):
         include_index=not args.no_index,
         ts_codes=ts_codes,
     )
+    _warn_export_coverage(
+        args.db_path or "data/tradeanalysis.duckdb",
+        args.date, n, filter_st=not args.include_st, ts_codes=ts_codes,
+    )
     print(f"Exported {n} rows -> {args.output}")
 
 
@@ -155,45 +202,120 @@ def cmd_export(args):
 def cmd_run(args):
     """One-command daily analysis: fetch → calc → export.
 
-    Resolves the target trading date, auto-fetches any missing ODS data,
-    rebuilds DWD, runs all DWS calculators, and exports the Excel report.
+    Resolves the target trading date, fetches ODS for that day, rebuilds DWD,
+    runs all DWS calculators, and exports the Excel report.
     """
-    import time
     from backend.db.connection import get_connection
-    from backend.export_wide import export_wide_to_excel
+    from backend.export_wide import default_export_path, export_wide_to_excel
+    from backend.fetch.client import TushareClient
+    from backend.fetch.ods_daily import (
+        fetch_by_date_range_parallel,
+        fetch_stocks_incremental,
+        get_all_active_codes,
+    )
+    from backend.etl.build_dwd import rebuild_all_dwd
+
+    # Resolve date on a short-lived connection, then close before later steps.
+    con = get_connection()
+    try:
+        date = _resolve_trade_date(con, args.date)
+        date = _ensure_trade_date(con, date)
+    finally:
+        con.close()
+
+    db_path = args.db_path or "data/tradeanalysis.duckdb"
+    ts_codes = args.ts_code if args.ts_code else None
+
+    logger.info("=== Step 1/3: Fetching market data for %s ===", date)
+    con = get_connection()
+    try:
+        codes = ts_codes or get_all_active_codes(con)
+        if ts_codes:
+            client = TushareClient()
+            n_fetch = fetch_stocks_incremental(
+                client, con, codes, start=date, end=date)
+        else:
+            n_fetch = fetch_by_date_range_parallel(
+                date, date, workers=3, ts_codes=codes, con=con)
+        logger.info("Fetch complete: %d ODS rows for %s", n_fetch, date)
+        rebuild_all_dwd(con, codes)
+    finally:
+        con.close()
+
+    logger.info("=== Step 2/3: Computing indicators for %s ===", date)
+    args.date = date
+    cmd_calc(args, skip_stale_fetch=True)
+
+    logger.info("=== Step 3/3: Exporting analysis for %s ===", date)
+    args.output = default_export_path(date, args.output)
+
+    n = export_wide_to_excel(
+        db_path,
+        date,
+        args.output,
+        filter_st=not args.include_st,
+        include_index=not args.no_index,
+        ts_codes=ts_codes,
+    )
+    _warn_export_coverage(
+        db_path, date, n, filter_st=not args.include_st, ts_codes=ts_codes,
+    )
+    print(f"Exported {n} rows -> {args.output}")
+    logger.info("Done.")
+
+
+# ── prune ──
+
+def cmd_prune(args):
+    """Prune superseded DWS snapshots, keeping the last N runs.
+
+    Deletes only rows made obsolete by newer calc_date snapshots; the
+    latest-per-key value for every (ts_code, trade_date) is always kept,
+    so v_*_latest views are unchanged. Runs a CHECKPOINT afterwards to
+    reclaim space within the database file.
+    """
+    from backend.db.connection import get_connection, prune_dws_snapshots, run_checkpoint
 
     con = get_connection()
     try:
-        # 1. Resolve date
-        date = _resolve_trade_date(con, args.date)
-        date = _ensure_trade_date(con, date)
+        deleted = prune_dws_snapshots(con, keep_runs=args.keep)
+        run_checkpoint(con)
+        total = sum(deleted.values())
+        for table, n in deleted.items():
+            print(f"{table:30s} {n:>12,}")
+        print(f"{'TOTAL':30s} {total:>12,} rows pruned (keep_runs={args.keep})")
+    finally:
+        con.close()
 
-        # 2. Fetch — always full market, per-stock incremental detection
-        print(f"=== Step 1/3: Fetching data for {date} ===")
-        cmd_fetch(args)
 
-        # 3. Calc — auto-fetches missing data before computing
-        print(f"=== Step 2/3: Computing indicators for {date} ===")
-        cmd_calc(args)
+# ── repair-weekly ──
 
-        # 4. Export
-        print(f"=== Step 3/3: Exporting analysis for {date} ===")
-        if args.output is None:
-            from datetime import datetime
-            gen_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            args.output = f"analysis_{date}_gen{gen_ts}.xlsx"
+def cmd_repair_weekly(args):
+    """Repair weekly data after the date_trunc('week') partition fix.
 
-        ts_codes = args.ts_code if args.ts_code else None
-        n = export_wide_to_excel(
-            args.db_path or "data/tradeanalysis.duckdb",
-            date,
-            args.output,
-            filter_st=not args.include_st,
-            include_index=not args.no_index,
-            ts_codes=ts_codes,
-        )
-        print(f"Exported {n} rows -> {args.output}")
-        print("Done.")
+    Default is a read-only dry-run that previews wrongly-marked week-ends and
+    orphan DWS rows. Pass --execute to rebuild dim_date + dwd_weekly_quote and
+    delete orphan rows. After executing, run `calc` to refresh stale week-end
+    values (fingerprint auto-skips unchanged weeks).
+    """
+    from backend.db.connection import get_connection
+    from backend.etl.repair_weekly import repair_weekly
+
+    con = get_connection()
+    try:
+        res = repair_weekly(con, dry_run=not args.execute)
+        print(f"Wrongly-marked week-ends: {len(res['wrongly_marked'])}")
+        print(f"Newly-correct week-ends:  {len(res['newly_marked'])}")
+        print("Orphan rows per weekly DWS table:")
+        for tbl, n in res["orphans"].items():
+            print(f"  {tbl:30s} {n:>12,}")
+        if res["executed"]:
+            print("EXECUTED — deleted orphan rows:")
+            for tbl, n in res["deleted"].items():
+                print(f"  {tbl:30s} {n:>12,}")
+            print("NOTE: run `python -m backend.cli calc` to refresh stale week-end values.")
+        else:
+            print("DRY-RUN (no changes). Re-run with --execute to apply.")
     finally:
         con.close()
 
@@ -266,6 +388,7 @@ def main():
 
     # calc
     cp = sp.add_parser("calc", help="Compute DWS indicators")
+    cp.add_argument("--date", help="Analysis date YYYYMMDD (default: today)")
     cp.add_argument("--ts-code", nargs="+",
                     help="Stock codes to calculate (omitted = all stocks)")
 
@@ -273,7 +396,7 @@ def main():
     xp = sp.add_parser("export", help="Export analysis wide table to Excel")
     xp.add_argument("--date", required=True, help="Analysis date YYYYMMDD")
     xp.add_argument("--output", default=None,
-                    help="Output Excel path. Default: analysis_{date}_gen{now}.xlsx")
+                    help="Output Excel path. Default: exports/analysis_{date}_gen{now}.xlsx")
     xp.add_argument("--ts-code", nargs="+", help="Stock codes to export")
     xp.add_argument("--db-path")
     xp.add_argument("--include-st", action="store_true")
@@ -289,19 +412,38 @@ def main():
     rp.add_argument("--date", help="Analysis date YYYYMMDD (default: today)")
     rp.add_argument("--ts-code", nargs="+", help="Stock codes (omitted = all stocks)")
     rp.add_argument("--output", default=None,
-                    help="Output Excel path. Default: analysis_{date}_gen{now}.xlsx")
+                    help="Output Excel path. Default: exports/analysis_{date}_gen{now}.xlsx")
+    rp.add_argument("--db-path", help="DuckDB file path (default: data/tradeanalysis.duckdb)")
     rp.add_argument("--include-st", action="store_true")
     rp.add_argument("--no-index", action="store_true")
+
+    # prune
+    pp = sp.add_parser("prune", help="Prune superseded DWS snapshots (keep last N runs)")
+    pp.add_argument("--keep", type=int, default=5,
+                    help="Number of most recent calc runs to retain (default 5; 1 = latest only)")
+
+    # repair-weekly
+    rwp = sp.add_parser("repair-weekly",
+                        help="Repair weekly data after date_trunc('week') fix (dry-run default)")
+    rwp.add_argument("--execute", action="store_true",
+                     help="Apply changes (default: dry-run preview only)")
 
     sp.add_parser("status", help="Show database table stats")
 
     args = p.parse_args()
+
+    # Assign a unique run ID for this CLI invocation
+    if args.command:
+        set_run_id(uuid.uuid4().hex[:8])
+
     handlers = {
         "check": cmd_check,
         "fetch": cmd_fetch,
         "calc": cmd_calc,
         "export": cmd_export,
         "run": cmd_run,
+        "prune": cmd_prune,
+        "repair-weekly": cmd_repair_weekly,
         "query": cmd_query,
         "status": cmd_status,
     }

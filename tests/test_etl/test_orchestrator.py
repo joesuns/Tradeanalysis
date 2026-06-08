@@ -1,9 +1,16 @@
 """Tests for backend/etl/orchestrator.py — auto-fetch strategy selection."""
 
+import logging
+
 import duckdb
 from datetime import date, timedelta
 
-from backend.etl.orchestrator import _count_trading_days, _choose_fetch_strategy
+from backend.etl.orchestrator import (
+    _count_trading_days,
+    _choose_fetch_strategy,
+    _init_calc_progress,
+    _report_calc_progress,
+)
 
 
 def _seq_trade_dates(n, start=(2026, 1, 1)):
@@ -644,4 +651,114 @@ def test_run_calc_uses_thread_pool(monkeypatch):
     assert len(calls) == 2
     assert {c[0] for c in calls} == {("A.SZ",), ("B.SZ",)}
     assert all(c[1] == "20260605" for c in calls)
+    con.close()
+
+
+def _count_progress_lines(caplog):
+    return [r for r in caplog.records
+            if r.name == "backend.etl.orchestrator"
+            and r.getMessage().startswith("calc progress:")]
+
+
+def test_calc_progress_throttled_at_5pct(caplog):
+    """100 stocks → step=5 → ~20 progress lines, last at 100%."""
+    _init_calc_progress(100)
+    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+        for _ in range(100):
+            _report_calc_progress()
+
+    lines = _count_progress_lines(caplog)
+    # step = 100 // 20 = 5 → fires at 5,10,...,100 → 20 lines
+    assert len(lines) == 20, f"expected 20 throttled lines, got {len(lines)}"
+    last = lines[-1].getMessage()
+    assert "100/100 (100%)" in last
+    assert "stk/s" in last and "ETA" in last
+
+
+def test_calc_progress_always_logs_final_tick(caplog):
+    """Non-multiple-of-step totals still emit a final 100% line."""
+    _init_calc_progress(7)  # step = max(1, 7//20) = 1 → every tick logs
+    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+        for _ in range(7):
+            _report_calc_progress()
+
+    lines = _count_progress_lines(caplog)
+    assert lines, "expected at least one progress line"
+    assert "7/7 (100%)" in lines[-1].getMessage()
+
+
+def test_calc_progress_thread_safe_total(caplog):
+    """Concurrent ticks from multiple threads count to the true global total."""
+    import threading as _t
+
+    _init_calc_progress(200)
+    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+        def worker():
+            for _ in range(50):
+                _report_calc_progress()
+
+        threads = [_t.Thread(target=worker) for _ in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+    lines = _count_progress_lines(caplog)
+    assert lines, "expected progress lines"
+    # 4 threads × 50 ticks = 200 = total → final line must read 200/200
+    assert "200/200 (100%)" in lines[-1].getMessage()
+
+
+def test_count_week_end_bars_ignores_dwd_without_dim_stock():
+    """dwd_weekly 有数据但 dim_stock 无行 → 不得计入 week_end_bars。"""
+    from backend.etl.orchestrator import _count_week_end_bars_batch
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_trade_day INTEGER, is_week_end INTEGER)
+    """)
+    con.execute("""
+        CREATE TABLE dim_stock (
+            ts_code TEXT PRIMARY KEY, list_date TEXT, delist_date TEXT)
+    """)
+    week_ends = _seq_week_end_dates(130, start=(2020, 1, 3))
+    calc_date = week_ends[-1]
+    for td in week_ends:
+        con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
+    for td in week_ends[-50:]:
+        con.execute("INSERT INTO dwd_weekly_quote VALUES ('ORPHAN.SZ', ?)", [td])
+
+    counts = _count_week_end_bars_batch(con, ["ORPHAN.SZ"], calc_date)
+    assert counts["ORPHAN.SZ"] == 0
+
+    con.close()
+
+
+def test_count_week_end_bars_respects_list_date_floor():
+    """week_end 计数窗口下限 = max(weekly_start, list_date)。"""
+    from backend.etl.orchestrator import _count_week_end_bars_batch
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("""
+        CREATE TABLE dim_date (
+            trade_date TEXT PRIMARY KEY, is_trade_day INTEGER, is_week_end INTEGER)
+    """)
+    con.execute("""
+        CREATE TABLE dim_stock (
+            ts_code TEXT PRIMARY KEY, list_date TEXT, delist_date TEXT)
+    """)
+    week_ends = _seq_week_end_dates(130, start=(2020, 1, 3))
+    calc_date = week_ends[-1]
+    list_date = week_ends[-30]  # only last 30 week-ends are post-IPO
+    con.execute("INSERT INTO dim_stock VALUES ('IPO2.SZ', ?, NULL)", [list_date])
+    for td in week_ends:
+        con.execute("INSERT INTO dim_date VALUES (?, 1, 1)", [td])
+        con.execute("INSERT INTO dwd_weekly_quote VALUES ('IPO2.SZ', ?)", [td])
+
+    counts = _count_week_end_bars_batch(con, ["IPO2.SZ"], calc_date)
+    assert counts["IPO2.SZ"] == 30
+
     con.close()
