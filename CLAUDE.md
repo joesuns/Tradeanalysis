@@ -262,7 +262,7 @@ export（导出层）
   `ROW_NUMBER()`（`ORDER BY calc_date DESC, trade_date DESC` 确定性平局）一次取回整组
   `{ts_code: 最新指纹}`，6 个计算器在循环前预取并传入
   `check_dwd_unchanged(..., latest_fps=...)`，把 ~6.6 万次单股 SELECT 降到每组一次。
-- **同日复跑短路（CALC_FAST_SKIP）:** `calc_fast_skip.py` 在 `_calc_stock_chunk` 对每 chunk 批量加载 `dws_calc_state` + DWD 最新 245 根尾窗（quote daily/weekly + DDE daily/weekly），内存跑 `classify_calc_mode`×12；全 SKIP 则不进入 `calc_stock_pipeline`（同日复跑 ~834s→~20–60s）。**不用** `updated_calc_date` 裸跳过；`CALC_FAST_SKIP=0` 回退原路径。设计见 `docs/superpowers/plans/2026-06-08-calc-fast-skip-preflight.md`。
+- **同日复跑短路（CALC_FAST_SKIP v1）:** 实库同日复跑 **834s→630s**（24%）；12 指标全 SKIP 才短路。未达 60s → v2 partial skip 见 `docs/superpowers/plans/2026-06-08-calc-partial-skip-v2.md`。
 - **新日追算（CALC_APPEND，append-only calc）:** 新交易日 calc 不再对每股窄写 255 窗，
   而由 `classify_calc_mode()` 按 `dws_calc_state`（PK `(ts_code, freq, indicator)`）+ 各计算器
   `SIGNATURE_COLS` 路由 SKIP/APPEND/FULL。**APPEND** 仅算/写新 bar（`append_calculate()`，

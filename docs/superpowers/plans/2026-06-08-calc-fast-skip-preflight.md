@@ -324,7 +324,8 @@ python3 -m backend.cli calc --date 20260608
 - [x] DWD 变更后不误 SKIP（`test_fast_skip_unsafe_on_dwd_change`）
 - [x] 缺股/空帧 fallthrough（`test_fallthrough_on_missing_stock`）
 - [x] 全量 `pytest tests/ -v` 通过（386 passed）
-- [ ] 实库：同日复跑 calc 本体 **< 60s** + 日志 `fast_skip` ~5388 股（待手动验收）
+- [x] 实库 calc 630s（未达 <60s，触发 v2）
+- [x] fast_skip 日志可见（349/674 ~ 59/674 per chunk）
 
 ## 七、架构评审修订记录
 
