@@ -693,8 +693,8 @@ def test_run_calc_uses_thread_pool(monkeypatch):
     con = duckdb.connect(":memory:")
     calls = []
 
-    def fake_chunk(chunk, calc_date, incremental):
-        calls.append((tuple(chunk), calc_date, incremental))
+    def fake_chunk(chunk, calc_date, incremental, batch_ctx=None):
+        calls.append((tuple(chunk), calc_date, incremental, batch_ctx))
         return 0
 
     monkeypatch.setattr("backend.etl.orchestrator._calc_stock_chunk", fake_chunk)
@@ -718,36 +718,36 @@ def test_run_calc_uses_thread_pool(monkeypatch):
 
 
 def _count_progress_lines(caplog):
-    return [r for r in caplog.records
-            if r.name == "backend.etl.orchestrator"
-            and r.getMessage().startswith("calc progress:")]
+    return [r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("progress calc.stocks:")
+            and "%" in r.getMessage()]
 
 
 def test_calc_progress_throttled_at_5pct(caplog):
     """100 stocks → step=5 → ~20 progress lines, last at 100%."""
     _init_calc_progress(100)
-    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+    with caplog.at_level(logging.INFO):
         for _ in range(100):
             _report_calc_progress()
 
     lines = _count_progress_lines(caplog)
     # step = 100 // 20 = 5 → fires at 5,10,...,100 → 20 lines
     assert len(lines) == 20, f"expected 20 throttled lines, got {len(lines)}"
-    last = lines[-1].getMessage()
+    last = lines[-1]
     assert "100/100 (100%)" in last
-    assert "stk/s" in last and "ETA" in last
+    assert "stocks/s" in last and "ETA" in last
 
 
 def test_calc_progress_always_logs_final_tick(caplog):
     """Non-multiple-of-step totals still emit a final 100% line."""
     _init_calc_progress(7)  # step = max(1, 7//20) = 1 → every tick logs
-    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+    with caplog.at_level(logging.INFO):
         for _ in range(7):
             _report_calc_progress()
 
     lines = _count_progress_lines(caplog)
     assert lines, "expected at least one progress line"
-    assert "7/7 (100%)" in lines[-1].getMessage()
+    assert "7/7 (100%)" in lines[-1]
 
 
 def test_calc_progress_thread_safe_total(caplog):
@@ -755,7 +755,7 @@ def test_calc_progress_thread_safe_total(caplog):
     import threading as _t
 
     _init_calc_progress(200)
-    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+    with caplog.at_level(logging.INFO):
         def worker():
             for _ in range(50):
                 _report_calc_progress()
@@ -769,7 +769,7 @@ def test_calc_progress_thread_safe_total(caplog):
     lines = _count_progress_lines(caplog)
     assert lines, "expected progress lines"
     # 4 threads × 50 ticks = 200 = total → final line must read 200/200
-    assert "200/200 (100%)" in lines[-1].getMessage()
+    assert "200/200 (100%)" in lines[-1]
 
 
 def test_count_week_end_bars_ignores_dwd_without_dim_stock():

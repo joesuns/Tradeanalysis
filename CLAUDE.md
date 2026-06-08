@@ -32,7 +32,8 @@ pytest tests/ -v
 
 # ===== 每日分析（一条命令） =====
 python -m backend.cli run                        # 全市场，最近交易日
-python -m backend.cli run --date 20260604        # 指定日期
+python -m backend.cli run --date 20260605              # 同日复跑（rebuild 可能跳过）
+python -m backend.cli run --date 20260605 --skip-export  # 同日复跑不导 Excel
 
 # ===== 数据拉取 =====
 python -m backend.cli fetch                        # 全市场增量拉取
@@ -45,6 +46,7 @@ python -m backend.cli calc --ts-code 000543.SZ 600580.SH  # 指定股票
 
 # ===== Excel 导出 =====
 # 从数据库直接导出（不重算），默认 exports/analysis_{date}_gen{now}.xlsx
+python -m backend.cli export --date 20260605           # 仅导出（最快同日复跑）
 python -m backend.cli export --date 20260603
 python -m backend.cli export --date 20260603 --ts-code 000543.SZ
 
@@ -126,6 +128,9 @@ run（一站式入口）→ fetch（当日 ODS）→ rebuild DWD → calc → ex
 
 run 分步短连接：解析 dim_date → fetch+rebuild → calc（skip_stale_fetch）→ export。
 calc/export 共用同一 analysis_date（`--date`）；calc 收尾 run_checkpoint。
+- **同日复跑快路径：** Step 1 fetch 若 0 rows 且 `find_stale_dwd_codes` 空 → **跳过 rebuild**；Step 2 calc 幂等闸门秒退；`--skip-export` 跳过 Excel。运维：仅需 Excel 时用 `cli export --date X`。
+- **run 观测：** `ods_etl_log` 新增 `run_fetch` / `run_rebuild_dwd` / `run_export` 三步；`run_rebuild_dwd.data_completeness.skipped=true` 表示未重建。
+- **边界：** 除权/adj 回填后若未触发 fetch，须 `fetch` + `calc --force` 或手动 rebuild；同日复跑不覆盖此场景。
 
 fetch（数据拉取层）
 ├── 不传 --ts-code → date-batched 全市场并行拉取（3线程），传 active codes 做 per-stock 增量
@@ -157,6 +162,7 @@ calc（计算层）
 │   ├── 状态 `dws_calc_state` PK `(ts_code, freq, indicator)`，写入仅在实际写了行时；`_route_calc()` 在 `calc_stock_pipeline` 内统一路由（DDE 自载 moneyflow 尾窗）
 │   ├── 等价性硬约束：各指标 APPEND 与 FULL 逐值 `atol=1e-9`（`tests/test_etl/test_append_calc.py` 锁定）
 │   └── **同日复跑短路（`CALC_FAST_SKIP=1` 默认，需 `CALC_APPEND`）：** `_calc_stock_chunk` 入口 chunk 级 batch preflight（state + 245 尾窗 quote/DDE），12 指标全 SKIP 则整股跳过 `calc_stock_pipeline`；尾窗**无 calc_date 上界**（对齐 `last_trade_date` 可领先 `calc_date`）；缺帧/空帧/DWD 签名变 → fallthrough
+├── **跨股 batch APPEND（`CALC_BATCH_APPEND=1` 默认，需 `CALC_APPEND`）：** 全市场新日 `run_calc` 在 ThreadPool 前走 `run_batch_append_phase()`——按 `(indicator,freq)` 批处理 APPEND 股（共享 `batch_load_quote_tails` + batch EMA/zone 种子），SKIP 直接记 skip 并刷新 state；仅 FULL/fallthrough 股进 `_calc_stock_chunk`。`--ts-code` 子集或 `=0` 回退逐股 APPEND。设计见 `docs/superpowers/plans/2026-06-08-cross-stock-batch-append.md`。
 └── export 行数 << 预期（<80% 活跃股）→ WARNING
 
 export（导出层）
@@ -210,7 +216,7 @@ export（导出层）
 ### MA 信号
 
 - **斜率：** 5-bar 线性回归归一化 %/日，alignment 阈值 0.08%/日
-- **alignment：** 10 值（8 方向 + tangle + sideways）
+- **alignment：** 10 值 DWS 枚举（8 方向 + tangle + sideways）；一走平一趋势过渡态 Layer 3 fallback 归入 8 类，不扩枚举
 
 ### K线形态
 
@@ -303,11 +309,10 @@ export（导出层）
   **DuckDB 单文件仅允许一个 read-write 进程**，故禁用 `multiprocessing.Pool`（会触发
  `IOException: Could not set lock`）。与 `ods_daily` fetch 的多线程写模式一致。
  墙钟记 `ods_etl_log`（观测项，非硬 KPI）。
-- **calc 进度心跳（防"假卡死"）:** 多线程 calc 的 per-stock 计算阶段原本静默——`_calc_stock_chunk`
- 只在整个 chunk（数百只）跑完后才打 `calc XXX DONE`，中间几十分钟无输出，易被误判成卡死。
- 现 worker 每算完 1 只调用 `_report_calc_progress()`（`orchestrator.py`），跨线程共享计数器（`threading.Lock`），
- **按数量节流**（step=`total//20`，约每 5%）输出 `calc progress: N/total (X%) | 耗时 | stk/s | ETA`，
- 全程约 20 行真实全局进度。`run_calc` 在启动线程池前调 `_init_calc_progress(total)` 复位。
+- **calc 进度心跳（防"假卡死"）:** `StageProgress`（`backend/etl/progress.py`）统一计数节流 + 30s 时间心跳。
+  worker 每算完 1 只调用 `_report_calc_progress()`，输出 `progress calc.stocks: N/total (X%) | 耗时 | stocks/s | ETA`；
+  `batch_append` 阶段独立打 `progress calc.batch_preflight` / `calc.batch_append`（不再虚假 burst tick）。
+  fetch/DWD/export 同契约，grep `progress ` 即可观察全链路。
 - **周线计算器一律只采样真周末 bar:** `dwd_weekly_quote` 为滚动周线（每交易日一行），
   全部 6 个周线计算器（含已修复的 kpattern）weekly 路径 `JOIN dim_date ... WHERE is_week_end=1`，
   禁止直接查滚动 bar。**注意：** kpattern 周线历史曾遗漏此过滤产出 intra-week 幽灵行，
@@ -327,6 +332,9 @@ export（导出层）
 - **异常日志：** `logger.exception()` 保留完整调用栈；`log_etl_error()` 将完整栈存入 DB
 - **API 中间件：** `log_requests` 记录每个请求 method/path/status/耗时
 - **级别规范：** DEBUG=跳过详情 / INFO=进度+完成 / WARNING=降级 / ERROR=异常
+- **统一进度前缀：** `progress {stage}:` — `fetch.ods` / `fetch.stocks` / `dwd.*` / `calc.batch_append` / `calc.stocks` / `export`
+- **节流：** 默认每 5 交易日 / 5 股票一条；`LOG_PROGRESS_HEARTBEAT_SEC=30` 无输出则打 `still running`
+- **环境变量：** `LOG_PROGRESS_HEARTBEAT_SEC` / `LOG_PROGRESS_DAY_STEP` / `LOG_PROGRESS_STOCK_STEP`
 
 ## 工作流程
 

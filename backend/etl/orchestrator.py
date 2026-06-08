@@ -855,44 +855,22 @@ def calc_stock_pipeline_selective(
     return outputs
 
 
-_calc_progress_lock = threading.Lock()
-_calc_progress = {"done": 0, "total": 0, "t0": 0.0, "step": 1}
+from backend.etl.progress import StageProgress
+
+_calc_progress: Optional[StageProgress] = None
 
 
-def _init_calc_progress(total: int) -> None:
-    """Reset the shared calc progress counter before a multi-threaded run.
-
-    Count-throttled at ~5% (step = total // 20) so the per-stock heartbeat
-    emits ~20 progress lines instead of going silent for the whole calc phase.
-    """
-    with _calc_progress_lock:
-        _calc_progress["done"] = 0
-        _calc_progress["total"] = total
-        _calc_progress["t0"] = time.monotonic()
-        _calc_progress["step"] = max(1, total // 20)
+def _init_calc_progress(total: int, **start_extra: object) -> None:
+    """Reset shared calc progress before a multi-threaded run."""
+    global _calc_progress
+    _calc_progress = StageProgress("calc.stocks", total, unit="stocks")
+    _calc_progress.log_start(**start_extra)
 
 
 def _report_calc_progress() -> None:
-    """Thread-safe per-stock tick. Logs every ~5% of stocks with rate + ETA.
-
-    Called once per stock by every worker thread; threads share one counter so
-    the reported progress is the true global total, not per-chunk.
-    """
-    with _calc_progress_lock:
-        _calc_progress["done"] += 1
-        done = _calc_progress["done"]
-        total = _calc_progress["total"]
-        step = _calc_progress["step"]
-        if total <= 0 or (done % step != 0 and done != total):
-            return
-        elapsed = time.monotonic() - _calc_progress["t0"]
-        rate = done / elapsed if elapsed > 0 else 0.0
-        eta = (total - done) / rate if rate > 0 else 0.0
-        pct = done * 100 // total
-    logger.info(
-        "calc progress: %d/%d (%d%%) | %.0fs | %.1f stk/s | ETA ~%.0fs",
-        done, total, pct, elapsed, rate, eta,
-    )
+    """Thread-safe per-stock tick (true global total across workers)."""
+    if _calc_progress is not None:
+        _calc_progress.tick()
 
 
 def _count_calc_rows(con, table: str, calc_date: str, ts_codes: list) -> int:
@@ -913,7 +891,8 @@ def _count_calc_rows(con, table: str, calc_date: str, ts_codes: list) -> int:
 
 
 def _calc_stock_chunk(chunk: list[str], calc_date: str,
-                      incremental: bool = True) -> int:
+                      incremental: bool = True,
+                      batch_ctx: Optional[dict] = None) -> int:
     """Worker: run all calculators for one stock chunk in a dedicated connection."""
     import duckdb
     from backend.config import DUCKDB_PATH
@@ -937,6 +916,10 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
             partition_preflight_modes,
         )
 
+        completed_keys = set()
+        if batch_ctx:
+            completed_keys = batch_ctx.get("completed_keys", set())
+
         agg_by_key = defaultdict(CalcResult)
         fast_on = CALC_FAST_SKIP and CALC_APPEND and incremental
         full_skip_count = 0
@@ -944,7 +927,21 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
         fallthrough_count = 0
         state_map = {}
         daily_tails = weekly_tails = dde_daily = dde_weekly = {}
-        if fast_on:
+        if batch_ctx and batch_ctx.get("state_map") is not None:
+            state_map = {
+                k: v for k, v in batch_ctx["state_map"].items()
+                if k[0] in chunk
+            }
+            daily_tails = {c: batch_ctx["daily_tails"][c] for c in chunk
+                           if c in batch_ctx.get("daily_tails", {})}
+            weekly_tails = {c: batch_ctx["weekly_tails"][c] for c in chunk
+                            if c in batch_ctx.get("weekly_tails", {})}
+            dde_daily = {c: batch_ctx["dde_daily"][c] for c in chunk
+                         if c in batch_ctx.get("dde_daily", {})}
+            dde_weekly = {c: batch_ctx["dde_weekly"][c] for c in chunk
+                            if c in batch_ctx.get("dde_weekly", {})}
+            fast_on = True
+        elif fast_on:
             state_map = load_calc_state_batch(con, chunk)
             tail_cols = quote_tail_columns()
             daily_tails = batch_load_quote_tails(con, chunk, "daily", tail_cols)
@@ -985,6 +982,11 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                         con, ts_code, freq, indicator_name, tdf, sig_cols, calc_date,
                         last_trade_date=st["last_trade_date"],
                     )
+                if completed_keys:
+                    run_keys = {
+                        k for k in run_keys
+                        if (ts_code, k[0], k[1]) not in completed_keys
+                    }
                 if not run_keys:
                     full_skip_count += 1
                     _report_calc_progress()
@@ -1197,9 +1199,15 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
             all_fetch_codes = {c for c, _, _ in to_fetch}
             attempted_codes = set()
 
-            for (seg_start, seg_end), bucket_codes in range_buckets.items():
+            n_buckets = len(range_buckets)
+            for bucket_idx, ((seg_start, seg_end), bucket_codes) in enumerate(
+                    range_buckets.items(), 1):
                 try:
                     tdays = _count_trading_days(con, seg_start, seg_end)
+                    logger.info(
+                        "progress calc.auto_fetch: bucket %d/%d | %s~%s | stocks=%d",
+                        bucket_idx, n_buckets, seg_start, seg_end, len(bucket_codes),
+                    )
                     if _choose_fetch_strategy(len(bucket_codes), tdays):
                         logger.info(
                             "Auto-fetch bucket [%s~%s]: %d stocks, %d tdays "
@@ -1219,6 +1227,9 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                         rows = fetch_stocks_incremental(
                             client, con, bucket_codes,
                             start=seg_start, end=seg_end)
+                    logger.info(
+                        "progress calc.auto_fetch: bucket done | rows=%d", rows,
+                    )
                     attempted_codes.update(bucket_codes)
                     if rows > 0:
                         n_fetched += rows
@@ -1298,41 +1309,105 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         logger.warning("No stocks with sufficient data to calculate")
         return
 
+    # 3b. Cross-stock batch APPEND (full market only; FULL stocks defer to chunk workers).
+    from backend.config import CALC_APPEND, CALC_BATCH_APPEND, CALC_INCREMENTAL
+    from backend.etl.calc_batch_append import run_batch_append_phase
+
+    batch_ctx = None
+    chunk_codes = codes_to_calc
+    if CALC_APPEND and CALC_BATCH_APPEND and CALC_INCREMENTAL and not user_subset:
+        batch_ctx = run_batch_append_phase(con, codes_to_calc, calc_date)
+        if batch_ctx:
+            chunk_codes = batch_ctx["chunk_codes"]
+            n_batch_only = len(codes_to_calc) - len(chunk_codes)
+            if n_batch_only:
+                logger.info(
+                    "batch_append: %d stocks fully handled (APPEND/SKIP), "
+                    "%d stocks need chunk (FULL/fallthrough)",
+                    n_batch_only, len(chunk_codes),
+                )
+            for (indicator_name, freq), agg in batch_ctx.get("agg_by_key", {}).items():
+                if agg.skipped:
+                    _write_skip_log_batch(con, calc_date, indicator_name, freq, agg.skipped)
+
     # 4. 计算 DWS — ThreadPoolExecutor by stock chunk.
     #    DuckDB 单文件仅允许一个 read-write 进程；multiprocessing 会争文件锁
     #    （IOException: Could not set lock）。线程共享同一进程 DuckDB 实例，
     #    支持多写线程（MVCC），与 ods_daily fetch 的 3 线程模式一致。
     workers = resolve_calc_workers()
-    chunk_size = max(1, (len(codes_to_calc) + workers - 1) // workers)
-    chunks = [codes_to_calc[i:i + chunk_size]
-              for i in range(0, len(codes_to_calc), chunk_size)]
+    if chunk_codes:
+        chunk_size = max(1, (len(chunk_codes) + workers - 1) // workers)
+        chunks = [chunk_codes[i:i + chunk_size]
+                  for i in range(0, len(chunk_codes), chunk_size)]
+    else:
+        chunks = []
 
     logger.info("calc %d stocks with %d threads (%d stocks/chunk)",
-                len(codes_to_calc), workers, chunk_size)
+                len(codes_to_calc), workers,
+                chunk_size if chunk_codes else 0)
 
-    _init_calc_progress(len(codes_to_calc))
+    _init_calc_progress(
+        len(chunk_codes),
+        threads=workers,
+        stocks_per_chunk=chunk_size if chunk_codes else 0,
+        batch_only=len(codes_to_calc) - len(chunk_codes),
+    )
     lid, t0 = log_etl_start(con, "calc_dws")
     calc_start = time.monotonic()
 
-    from backend.config import CALC_INCREMENTAL
     from backend.log_config import _run_id, set_run_id
     from concurrent.futures import ThreadPoolExecutor
 
     rid = _run_id.get()
-    with ThreadPoolExecutor(
-        max_workers=workers,
-        initializer=set_run_id,
-        initargs=(rid,),
-    ) as executor:
-        results = list(executor.map(
-            _calc_stock_chunk,
-            chunks,
-            [calc_date] * len(chunks),
-            [CALC_INCREMENTAL] * len(chunks),
-        ))
-    grand_total = sum(results)
+    if chunks:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            initializer=set_run_id,
+            initargs=(rid,),
+        ) as executor:
+            results = list(executor.map(
+                _calc_stock_chunk,
+                chunks,
+                [calc_date] * len(chunks),
+                [CALC_INCREMENTAL] * len(chunks),
+                [batch_ctx] * len(chunks),
+            ))
+        grand_total = sum(results)
+    else:
+        results = []
+        grand_total = 0
+
+    batch_only = [c for c in codes_to_calc if c not in set(chunk_codes)]
+    if batch_only:
+        for CalcCls in CALCULATORS:
+            for freq in ("daily", "weekly"):
+                calc = CalcCls(con, freq)
+                grand_total += _count_calc_rows(
+                    con, calc.dws_table, calc_date, batch_only,
+                )
+
+    if batch_ctx:
+        from backend.etl.calc_indicators import CALC_ROUTE_SPECS
+        for indicator_name, freq, CalcCls, _, _ in CALC_ROUTE_SPECS:
+            calc = CalcCls(con, freq)
+            n = _count_calc_rows(con, calc.dws_table, calc_date, codes_to_calc)
+            agg = batch_ctx.get("agg_by_key", {}).get((indicator_name, freq), CalcResult())
+            skip_parts = []
+            for reason in SkipReason:
+                items = agg.skipped.get(reason, [])
+                if items:
+                    skip_parts.append(f"{reason.value}={len(items)}")
+            skip_str = ", ".join(skip_parts) if skip_parts else "none skipped"
+            if agg.calculated or skip_parts:
+                logger.info(
+                    "calc %-30s BATCH — %d rows (%d calculated), %s",
+                    f"{CalcCls.__name__} {freq}", n,
+                    agg.calculated, skip_str,
+                )
 
     total_elapsed = time.monotonic() - calc_start
+    if _calc_progress is not None:
+        _calc_progress.log_done(rows=grand_total, elapsed=f"{total_elapsed:.0f}s")
     logger.info("calc ALL DONE — %d total DWS rows across %d indicator×freq pairs, %.0fs",
                 grand_total, len(CALCULATORS) * 2, total_elapsed)
     logger.info("Skip details: SELECT reason, COUNT(*) FROM ods_calc_skip_log "
