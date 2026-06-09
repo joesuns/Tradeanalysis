@@ -329,6 +329,47 @@ def cmd_run(args):
     logger.info("Done.")
 
 
+# ── backfill-state ──
+
+def cmd_backfill_state(args):
+    """Backfill dws_calc_state for stocks missing routing state (one-time FULL)."""
+    from datetime import datetime
+
+    from backend.db.connection import get_connection
+    from backend.etl.calc_gate import assert_calc_date_ready, resolve_effective_calc_date
+    from backend.etl.calc_state_backfill import backfill_calc_state, find_missing_state_keys
+    from backend.config import CALC_STRICT_DATE
+    from backend.db.schema import ensure_calc_state_table
+    from backend.fetch.ods_daily import get_all_active_codes
+
+    con = get_connection()
+    try:
+        ensure_calc_state_table(con)
+        calc_date = args.date
+        if calc_date:
+            calc_date = _ensure_trade_date(con, _resolve_trade_date(con, calc_date))
+        else:
+            calc_date = datetime.now().strftime("%Y%m%d")
+        if CALC_STRICT_DATE:
+            assert_calc_date_ready(con, calc_date, strict=True)
+        else:
+            calc_date = resolve_effective_calc_date(con, calc_date, cap_to_ods=True)
+
+        ts_codes = args.ts_code if args.ts_code else get_all_active_codes(con)
+        gaps = find_missing_state_keys(con, ts_codes)
+        n_keys = sum(len(v) for v in gaps.values())
+        print(f"Missing state: {len(gaps)} stocks, {n_keys} indicator×freq keys")
+        if not gaps:
+            return
+        summary = backfill_calc_state(con, list(gaps.keys()), calc_date)
+        print(
+            f"Backfill complete: {summary['stocks']} stocks, "
+            f"{summary['indicators']} runs, {summary['calculated']} DWS rows"
+        )
+    finally:
+        con.close()
+
+
 # ── prune ──
 
 def cmd_prune(args):
@@ -495,6 +536,14 @@ def main():
     rp.add_argument("--skip-export", action="store_true",
                     help="Skip Excel export (same-day rerun when report unchanged)")
 
+    # backfill-state
+    bsp = sp.add_parser(
+        "backfill-state",
+        help="Backfill dws_calc_state for stocks missing append-routing state",
+    )
+    bsp.add_argument("--date", help="Calc date YYYYMMDD (default: today)")
+    bsp.add_argument("--ts-code", nargs="+", help="Stock codes (default: all active)")
+
     # prune
     pp = sp.add_parser("prune", help="Prune superseded DWS snapshots (keep last N runs)")
     pp.add_argument("--keep", type=int, default=5,
@@ -520,6 +569,7 @@ def main():
         "calc": cmd_calc,
         "export": cmd_export,
         "run": cmd_run,
+        "backfill-state": cmd_backfill_state,
         "prune": cmd_prune,
         "repair-weekly": cmd_repair_weekly,
         "query": cmd_query,
