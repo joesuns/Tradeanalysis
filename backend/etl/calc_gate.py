@@ -2,11 +2,16 @@
 from typing import Optional
 import logging
 
+import duckdb
+
 logger = logging.getLogger(__name__)
 
 
 def get_ods_max_trade_date(con) -> Optional[str]:
-    row = con.execute("SELECT MAX(trade_date) FROM ods_daily").fetchone()
+    try:
+        row = con.execute("SELECT MAX(trade_date) FROM ods_daily").fetchone()
+    except duckdb.CatalogException:
+        return None
     return row[0] if row and row[0] else None
 
 

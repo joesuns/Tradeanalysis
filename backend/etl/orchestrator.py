@@ -796,62 +796,57 @@ def calc_stock_pipeline_selective(
         return []
 
     outputs = []
-    # (freq, source) -> [(indicator_name, CalcCls)]
-    groups = {}
     for indicator_name, freq, CalcCls, _, source in CALC_ROUTE_SPECS:
         if (indicator_name, freq) not in run_keys:
             continue
-        groups.setdefault((freq, source), []).append((indicator_name, CalcCls))
-
-    for (freq, source), specs in groups.items():
         recalc_start = daily_recalc if freq == "daily" else weekly_recalc
         if recalc_start is None:
             continue
         load_start = resolve_load_start(con, recalc_start, freq)
         append_on = CALC_APPEND and recalc_start is not None
-
-        needs_full = True
+        mode = "FULL"
         if run_modes is not None:
-            needs_full = any(
-                run_modes.get((indicator_name, freq), ("FULL", []))[0] == "FULL"
-                for indicator_name, _ in specs
-            )
+            mode = run_modes.get((indicator_name, freq), ("FULL", []))[0]
 
         df = None
         quote_groups = None
         if source == "quote":
-            if not needs_full and tail_frames is not None:
+            if mode != "FULL" and tail_frames is not None:
                 df = tail_frames.get((freq, "quote"))
             if df is None or len(df) == 0:
                 src = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
+                start = load_start if mode == "FULL" else load_start
                 quote_groups = load_quote_groups(
-                    con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=load_start,
+                    con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=start,
                 )
                 df = quote_groups.get(ts_code)
         else:
-            if not needs_full and tail_frames is not None:
+            if mode != "FULL" and tail_frames is not None:
                 df = tail_frames.get((freq, "dde"))
             if df is None or len(df) == 0:
                 dde = DDECalculator(con, freq)
                 if freq == "daily":
-                    dde_groups = dde._load_daily_batch([ts_code], start_date=load_start)
+                    dde_groups = dde._load_daily_batch(
+                        [ts_code], start_date=load_start if mode == "FULL" else load_start,
+                    )
                 else:
-                    dde_groups = dde._load_weekly_batch([ts_code], start_date=load_start)
+                    dde_groups = dde._load_weekly_batch(
+                        [ts_code], start_date=load_start if mode == "FULL" else load_start,
+                    )
                 df = dde_groups.get(ts_code)
 
-        for indicator_name, CalcCls in specs:
-            calc = CalcCls(con, freq)
-            if source == "quote":
-                result = _route_calc(
-                    con, calc, indicator_name, freq, ts_code, df, calc_date,
-                    recalc_start, quote_groups, append_on,
-                )
-            else:
-                result = _route_calc(
-                    con, calc, "dde", freq, ts_code, df, calc_date,
-                    recalc_start, None, append_on,
-                )
-            outputs.append((indicator_name, freq, result))
+        calc = CalcCls(con, freq)
+        if source == "quote":
+            result = _route_calc(
+                con, calc, indicator_name, freq, ts_code, df, calc_date,
+                recalc_start, quote_groups, append_on,
+            )
+        else:
+            result = _route_calc(
+                con, calc, "dde", freq, ts_code, df, calc_date,
+                recalc_start, None, append_on,
+            )
+        outputs.append((indicator_name, freq, result))
     return outputs
 
 

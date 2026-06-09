@@ -362,8 +362,6 @@ def run_batch_append_phase(con, codes: List[str], calc_date: str) -> Optional[di
             preflight.tick()
             continue
         stock_modes[ts_code] = modes
-        if any(mode == "FULL" for mode, _ in modes.values()):
-            chunk_codes.add(ts_code)
         preflight.tick()
     preflight.log_done()
 
@@ -436,6 +434,12 @@ def run_batch_append_phase(con, codes: List[str], calc_date: str) -> Optional[di
             write_calc_state_from_df(
                 con, ts_code, freq, indicator_name, tdf, calc.SIGNATURE_COLS, calc_date,
             )
+
+    from backend.etl.calc_executor import build_work_queue
+
+    wq = build_work_queue(stock_modes, completed_keys)
+    chunk_codes |= {ts for ts, _ in wq.full_items}
+    chunk_codes = sorted(chunk_codes)
 
     logger.info(
         "progress calc.batch_append: done | %.0fs | chunk=%d batch_only=%d",
