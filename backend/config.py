@@ -30,6 +30,8 @@ CALC_BATCH_APPEND = os.getenv("CALC_BATCH_APPEND", "1").strip() != "0"
 CALC_FAST_SKIP = os.getenv("CALC_FAST_SKIP", "1").strip() != "0"
 # CALC_SKIP_STATE_REFRESH: skip dws_calc_state UPSERT when history_fp unchanged on same calc_date
 CALC_SKIP_STATE_REFRESH = os.getenv("CALC_SKIP_STATE_REFRESH", "1").strip() != "0"
+# CALC_STRICT_DATE: when on (default), reject calc_date > MAX(ods_daily). =0 caps to ods_max.
+CALC_STRICT_DATE = os.getenv("CALC_STRICT_DATE", "1").strip() != "0"
 # CALC_WORKERS: optional override for calc thread-pool size (default min(cpu-1, 8)).
 # DuckDB single-file lock forbids multi-process writes, so calc parallelism is
 # thread-based (shared in-process instance), not multiprocessing.

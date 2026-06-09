@@ -685,6 +685,58 @@ def test_run_calc_idempotent_skip_without_subset(monkeypatch):
     con.close()
 
 
+def test_run_calc_logs_batch_chunk_split(monkeypatch):
+    """Successful calc_dws logs batch_only/chunk_stocks/ods_max in data_completeness."""
+    import json
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.orchestrator import run_calc
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    con.execute(
+        "INSERT INTO ods_daily (ts_code, trade_date, open, high, low, close, vol, amount) "
+        "VALUES ('A.SZ', '20260605', 1,1,1,1,1,1)"
+    )
+    etl_end_kwargs = {}
+
+    def capture_end(con, lid, step, t0, status, **kwargs):
+        etl_end_kwargs.update(kwargs)
+
+    monkeypatch.setattr("backend.etl.orchestrator._calc_stock_chunk", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.orchestrator.resolve_calc_workers", lambda: 1)
+    monkeypatch.setattr(
+        "backend.fetch.ods_daily.get_all_active_codes",
+        lambda con: ["A.SZ", "B.SZ", "C.SZ"],
+    )
+    monkeypatch.setattr(
+        "backend.etl.orchestrator.check_data_completeness",
+        lambda *a, **k: {"ok": ["A.SZ", "B.SZ", "C.SZ"], "missing": {}, "weekly_fetch": {}},
+    )
+    monkeypatch.setattr("backend.etl.orchestrator._filter_delisted", lambda *a, **k: (a[1], {}))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start", lambda *a: ("lid", 0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", capture_end)
+    monkeypatch.setattr("backend.etl.orchestrator.run_checkpoint", lambda *a: None)
+    monkeypatch.setattr(
+        "backend.etl.calc_batch_append.run_batch_append_phase",
+        lambda con, codes, calc_date: {
+            "chunk_codes": ["C.SZ"],
+            "completed_keys": set(),
+            "agg_by_key": {},
+        },
+    )
+
+    run_calc(con, ts_codes=None, calc_date="20260605", auto_fetch=False)
+
+    comp = etl_end_kwargs["data_completeness"]
+    assert comp["calc_date"] == "20260605"
+    assert comp["stocks"] == 3
+    assert comp["ods_max"] == "20260605"
+    assert comp["batch_only"] == 2
+    assert comp["chunk_stocks"] == 1
+    con.close()
+
+
 def test_run_calc_uses_thread_pool(monkeypatch):
     """run_calc should dispatch chunks via ThreadPoolExecutor (not multiprocessing)."""
     import duckdb

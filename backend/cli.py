@@ -453,8 +453,14 @@ def main():
     fp.add_argument("--end", help="End date YYYYMMDD (default today)")
 
     # calc
-    cp = sp.add_parser("calc", help="Compute DWS indicators")
-    cp.add_argument("--date", help="Analysis date YYYYMMDD (default: today)")
+    cp = sp.add_parser(
+        "calc",
+        help="Compute DWS indicators (calc_date must be <= ODS max; CALC_STRICT_DATE=0 caps)",
+    )
+    cp.add_argument(
+        "--date",
+        help="Analysis date YYYYMMDD (default: today; rejected if ahead of ODS max)",
+    )
     cp.add_argument("--ts-code", nargs="+",
                     help="Stock codes to calculate (omitted = all stocks)")
     cp.add_argument("--force", action="store_true",

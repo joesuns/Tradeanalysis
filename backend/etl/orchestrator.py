@@ -1138,6 +1138,14 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     if calc_date is None:
         calc_date = datetime.now().strftime("%Y%m%d")
 
+    from backend.config import CALC_STRICT_DATE
+    from backend.etl.calc_gate import assert_calc_date_ready, resolve_effective_calc_date
+
+    if CALC_STRICT_DATE:
+        assert_calc_date_ready(con, calc_date, strict=True)
+    else:
+        calc_date = resolve_effective_calc_date(con, calc_date, cap_to_ods=True)
+
     if _should_skip_calc_idempotent(con, calc_date, user_subset, force, skip_stale_fetch):
         lid, t0 = log_etl_start(con, "calc_dws")
         log_etl_end(
@@ -1420,8 +1428,16 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 grand_total, len(CALCULATORS) * 2, total_elapsed)
     logger.info("Skip details: SELECT reason, COUNT(*) FROM ods_calc_skip_log "
                 "WHERE calc_date='%s' GROUP BY reason", calc_date)
+    from backend.etl.calc_gate import get_ods_max_trade_date
+
     log_etl_end(
         con, lid, "calc_dws", t0, "success", row_count=grand_total,
-        data_completeness={"calc_date": calc_date, "stocks": len(codes_to_calc)},
+        data_completeness={
+            "calc_date": calc_date,
+            "stocks": len(codes_to_calc),
+            "ods_max": get_ods_max_trade_date(con),
+            "batch_only": len(codes_to_calc) - len(chunk_codes),
+            "chunk_stocks": len(chunk_codes),
+        },
     )
     run_checkpoint(con)
