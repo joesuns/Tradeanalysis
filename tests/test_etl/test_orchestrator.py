@@ -581,11 +581,79 @@ def test_find_stale_dwd_codes_detects_ods_without_dwd():
     con = duckdb.connect(":memory:")
     con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
     con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_moneyflow (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE ods_moneyflow (ts_code TEXT, trade_date TEXT)")
     con.execute("INSERT INTO ods_daily VALUES ('A.SZ', '20260605')")
     con.execute("INSERT INTO dwd_daily_quote VALUES ('A.SZ', '20260604')")
 
     stale = find_stale_dwd_codes(con, ["A.SZ"], "20260605")
     assert stale == ["A.SZ"]
+
+    con.close()
+
+
+def test_find_stale_dwd_codes_detects_moneyflow_behind_daily():
+    """Daily DWD fresh but moneyflow behind → still stale."""
+    import duckdb
+    from backend.etl.orchestrator import find_stale_dwd_codes
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE ods_moneyflow (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_moneyflow (ts_code TEXT, trade_date TEXT)")
+    con.execute("INSERT INTO ods_daily VALUES ('A.SZ', '20260605')")
+    con.execute("INSERT INTO ods_moneyflow VALUES ('A.SZ', '20260605')")
+    con.execute("INSERT INTO dwd_daily_quote VALUES ('A.SZ', '20260605')")
+    con.execute("INSERT INTO dwd_weekly_quote VALUES ('A.SZ', '20260605')")
+    con.execute("INSERT INTO dwd_daily_moneyflow VALUES ('A.SZ', '20260604')")
+
+    stale = find_stale_dwd_codes(con, ["A.SZ"], "20260605")
+    assert stale == ["A.SZ"]
+
+    con.close()
+
+
+def test_find_stale_dwd_codes_detects_weekly_behind_daily():
+    """Daily DWD fresh but weekly behind → still stale."""
+    import duckdb
+    from backend.etl.orchestrator import find_stale_dwd_codes
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_moneyflow (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE ods_moneyflow (ts_code TEXT, trade_date TEXT)")
+    con.execute("INSERT INTO ods_daily VALUES ('A.SZ', '20260605')")
+    con.execute("INSERT INTO dwd_daily_quote VALUES ('A.SZ', '20260605')")
+    con.execute("INSERT INTO dwd_weekly_quote VALUES ('A.SZ', '20260604')")
+
+    stale = find_stale_dwd_codes(con, ["A.SZ"], "20260605")
+    assert stale == ["A.SZ"]
+
+    con.close()
+
+
+def test_find_stale_dwd_codes_skips_moneyflow_when_no_ods_moneyflow():
+    """No ODS moneyflow on date → do not flag stale for missing DWD moneyflow."""
+    import duckdb
+    from backend.etl.orchestrator import find_stale_dwd_codes
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_weekly_quote (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE dwd_daily_moneyflow (ts_code TEXT, trade_date TEXT)")
+    con.execute("CREATE TABLE ods_moneyflow (ts_code TEXT, trade_date TEXT)")
+    con.execute("INSERT INTO ods_daily VALUES ('BJ.BJ', '20260605')")
+    con.execute("INSERT INTO dwd_daily_quote VALUES ('BJ.BJ', '20260605')")
+    con.execute("INSERT INTO dwd_weekly_quote VALUES ('BJ.BJ', '20260605')")
+
+    stale = find_stale_dwd_codes(con, ["BJ.BJ"], "20260605")
+    assert stale == []
 
     con.close()
 
@@ -639,9 +707,57 @@ def test_should_skip_calc_idempotent():
         [comp],
     )
     assert _should_skip_calc_idempotent(con, "20260602", False, False, True) is True
-    assert _should_skip_calc_idempotent(con, "20260602", False, True, True) is False
+    assert _should_skip_calc_idempotent(con, "20260602", False, True, True) is True
     assert _should_skip_calc_idempotent(con, "20260602", True, False, True) is False
     assert _should_skip_calc_idempotent(con, "20260603", False, False, True) is False
+    con.close()
+
+
+def test_should_skip_calc_idempotent_force_requires_prior_etl():
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.orchestrator import _should_skip_calc_idempotent
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    assert _should_skip_calc_idempotent(con, "20260602", False, True, True) is False
+    con.close()
+
+
+def test_run_calc_force_same_day_skip(monkeypatch):
+    """--force on unchanged data should short-circuit like idempotent skip."""
+    import json
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.orchestrator import run_calc
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    comp = json.dumps({
+        "calc_date": "20260602",
+        "stocks": 5388,
+        "ods_max": "20260602",
+    })
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('1', 'calc_dws', 't0', 't1', 'success', 1, '', ?)""",
+        [comp],
+    )
+    called = {"n": 0}
+
+    def fail_chunk(*a, **k):
+        called["n"] += 1
+        return 0
+
+    monkeypatch.setattr("backend.etl.orchestrator._calc_stock_chunk", fail_chunk)
+    run_calc(con, ts_codes=None, calc_date="20260602", auto_fetch=False, force=True)
+    assert called["n"] == 0
+    row = con.execute(
+        "SELECT data_completeness FROM ods_etl_log WHERE id != '1' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(row[0])["force_same_day_skip"] is True
     con.close()
 
 
@@ -685,6 +801,71 @@ def test_run_calc_idempotent_skip_without_subset(monkeypatch):
     con.close()
 
 
+def test_run_calc_logs_batch_chunk_split(monkeypatch):
+    """Successful calc_dws logs batch_only/chunk_stocks/ods_max in data_completeness."""
+    import json
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.orchestrator import run_calc
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    con.execute(
+        "INSERT INTO ods_daily (ts_code, trade_date, open, high, low, close, vol, amount) "
+        "VALUES ('A.SZ', '20260605', 1,1,1,1,1,1)"
+    )
+    etl_end_kwargs = {}
+
+    def capture_end(con, lid, step, t0, status, **kwargs):
+        etl_end_kwargs.update(kwargs)
+
+    monkeypatch.setattr("backend.etl.orchestrator._calc_stock_chunk", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.orchestrator._calc_full_work_chunk", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.orchestrator.resolve_calc_workers", lambda: 1)
+    monkeypatch.setattr(
+        "backend.fetch.ods_daily.get_all_active_codes",
+        lambda con: ["A.SZ", "B.SZ", "C.SZ"],
+    )
+    monkeypatch.setattr(
+        "backend.etl.orchestrator.check_data_completeness",
+        lambda *a, **k: {"ok": ["A.SZ", "B.SZ", "C.SZ"], "missing": {}, "weekly_fetch": {}},
+    )
+    monkeypatch.setattr("backend.etl.orchestrator._filter_delisted", lambda *a, **k: (a[1], {}))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start", lambda *a: ("lid", 0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", capture_end)
+    monkeypatch.setattr("backend.etl.orchestrator.run_checkpoint", lambda *a: None)
+    monkeypatch.setattr(
+        "backend.etl.calc_batch_append.run_batch_append_phase",
+        lambda con, codes, calc_date, force=False, preflight_ctx=None: {
+            "chunk_codes": ["C.SZ"],
+            "completed_keys": set(),
+            "agg_by_key": {},
+            "stock_modes": {
+                "C.SZ": {
+                    ("macd", "weekly"): ("FULL", []),
+                    ("kpattern", "weekly"): ("FULL", []),
+                },
+            },
+            "full_items": [
+                ("C.SZ", ("macd", "weekly")),
+                ("C.SZ", ("kpattern", "weekly")),
+            ],
+            "chunk_work_items": 2,
+        },
+    )
+
+    run_calc(con, ts_codes=None, calc_date="20260605", auto_fetch=False)
+
+    comp = etl_end_kwargs["data_completeness"]
+    assert comp["calc_date"] == "20260605"
+    assert comp["stocks"] == 3
+    assert comp["ods_max"] == "20260605"
+    assert comp["batch_only"] == 2
+    assert comp["chunk_stocks"] == 1
+    assert comp["chunk_work_items"] == 2
+    con.close()
+
+
 def test_run_calc_uses_thread_pool(monkeypatch):
     """run_calc should dispatch chunks via ThreadPoolExecutor (not multiprocessing)."""
     import duckdb
@@ -693,8 +874,8 @@ def test_run_calc_uses_thread_pool(monkeypatch):
     con = duckdb.connect(":memory:")
     calls = []
 
-    def fake_chunk(chunk, calc_date, incremental):
-        calls.append((tuple(chunk), calc_date, incremental))
+    def fake_chunk(chunk, calc_date, incremental, batch_ctx=None):
+        calls.append((tuple(chunk), calc_date, incremental, batch_ctx))
         return 0
 
     monkeypatch.setattr("backend.etl.orchestrator._calc_stock_chunk", fake_chunk)
@@ -718,36 +899,36 @@ def test_run_calc_uses_thread_pool(monkeypatch):
 
 
 def _count_progress_lines(caplog):
-    return [r for r in caplog.records
-            if r.name == "backend.etl.orchestrator"
-            and r.getMessage().startswith("calc progress:")]
+    return [r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("progress calc.stocks:")
+            and "%" in r.getMessage()]
 
 
 def test_calc_progress_throttled_at_5pct(caplog):
     """100 stocks → step=5 → ~20 progress lines, last at 100%."""
     _init_calc_progress(100)
-    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+    with caplog.at_level(logging.INFO):
         for _ in range(100):
             _report_calc_progress()
 
     lines = _count_progress_lines(caplog)
     # step = 100 // 20 = 5 → fires at 5,10,...,100 → 20 lines
     assert len(lines) == 20, f"expected 20 throttled lines, got {len(lines)}"
-    last = lines[-1].getMessage()
+    last = lines[-1]
     assert "100/100 (100%)" in last
-    assert "stk/s" in last and "ETA" in last
+    assert "stocks/s" in last and "ETA" in last
 
 
 def test_calc_progress_always_logs_final_tick(caplog):
     """Non-multiple-of-step totals still emit a final 100% line."""
     _init_calc_progress(7)  # step = max(1, 7//20) = 1 → every tick logs
-    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+    with caplog.at_level(logging.INFO):
         for _ in range(7):
             _report_calc_progress()
 
     lines = _count_progress_lines(caplog)
     assert lines, "expected at least one progress line"
-    assert "7/7 (100%)" in lines[-1].getMessage()
+    assert "7/7 (100%)" in lines[-1]
 
 
 def test_calc_progress_thread_safe_total(caplog):
@@ -755,7 +936,7 @@ def test_calc_progress_thread_safe_total(caplog):
     import threading as _t
 
     _init_calc_progress(200)
-    with caplog.at_level(logging.INFO, logger="backend.etl.orchestrator"):
+    with caplog.at_level(logging.INFO):
         def worker():
             for _ in range(50):
                 _report_calc_progress()
@@ -769,7 +950,7 @@ def test_calc_progress_thread_safe_total(caplog):
     lines = _count_progress_lines(caplog)
     assert lines, "expected progress lines"
     # 4 threads × 50 ticks = 200 = total → final line must read 200/200
-    assert "200/200 (100%)" in lines[-1].getMessage()
+    assert "200/200 (100%)" in lines[-1]
 
 
 def test_count_week_end_bars_ignores_dwd_without_dim_stock():
@@ -799,6 +980,117 @@ def test_count_week_end_bars_ignores_dwd_without_dim_stock():
     con.close()
 
 
+def test_calc_stock_chunk_reuses_batch_ctx_without_reload(monkeypatch):
+    """When batch_ctx is provided, chunk must not call load_calc_state_batch / batch_load_*."""
+    import importlib
+
+    import pandas as pd
+
+    import backend.config as cfg
+    from backend.etl.calc_indicators import CALC_ROUTE_SPECS
+    from backend.etl.orchestrator import _calc_stock_chunk
+
+    calls = []
+
+    def spy_load_state(*args, **kwargs):
+        calls.append("state")
+        return {}
+
+    def spy_quote_tails(*args, **kwargs):
+        calls.append("quote")
+        return {}
+
+    def spy_dde_tails(*args, **kwargs):
+        calls.append("dde")
+        return {}
+
+    monkeypatch.setenv("CALC_FAST_SKIP", "1")
+    monkeypatch.setenv("CALC_APPEND", "1")
+    importlib.reload(cfg)
+
+    monkeypatch.setattr("backend.etl.calc_state.load_calc_state_batch", spy_load_state)
+    monkeypatch.setattr("backend.etl.calc_fast_skip.batch_load_quote_tails", spy_quote_tails)
+    monkeypatch.setattr("backend.etl.calc_fast_skip.batch_load_dde_tails", spy_dde_tails)
+    real_connect = duckdb.connect
+    monkeypatch.setattr("duckdb.connect", lambda path: real_connect(":memory:"))
+    monkeypatch.setattr("backend.etl.orchestrator.resolve_recalc_start", lambda *a, **k: None)
+
+    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde):
+        modes = {(s[0], s[1]): ("SKIP", []) for s in CALC_ROUTE_SPECS}
+        return modes, {}
+
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.preflight_stock_modes_with_fps", fake_preflight,
+    )
+    monkeypatch.setattr("backend.etl.orchestrator._write_skip_log_batch", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.orchestrator._count_calc_rows", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.calc_state.upsert_calc_state_batch", lambda *a, **k: 0)
+
+    minimal_df = pd.DataFrame({"trade_date": ["20260608"], "close_qfq": [10.0]})
+    batch_ctx = {
+        "state_map": {},
+        "daily_tails": {"A.SZ": minimal_df},
+        "weekly_tails": {},
+        "dde_daily": {},
+        "dde_weekly": {},
+        "completed_keys": set(),
+    }
+
+    _calc_stock_chunk(["A.SZ"], "20260609", incremental=True, batch_ctx=batch_ctx)
+
+    assert "state" not in calls
+    assert "quote" not in calls
+    assert "dde" not in calls
+
+
+def test_write_skip_log_batch_summary_when_not_verbose():
+    """verbose=False + >100 fingerprint_match → single __batch__ summary row."""
+    from backend.db.schema import create_all_tables
+    from backend.etl.base import SkipReason
+    from backend.etl.orchestrator import _write_skip_log_batch
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+
+    classified = {
+        SkipReason.FINGERPRINT_MATCH: [
+            (f"{i:06d}.SZ", "batch_append: preflight skip") for i in range(101)
+        ],
+    }
+    _write_skip_log_batch(con, "20260609", "macd", "daily", classified, verbose=False)
+
+    rows = con.execute(
+        "SELECT ts_code, detail FROM ods_calc_skip_log WHERE calc_date = '20260609'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "__batch__"
+    assert rows[0][1] == "batch_skip=101"
+    con.close()
+
+
+def test_write_skip_log_batch_verbose_writes_per_stock():
+    """verbose=True (default) writes one row per skipped stock."""
+    from backend.db.schema import create_all_tables
+    from backend.etl.base import SkipReason
+    from backend.etl.orchestrator import _write_skip_log_batch
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+
+    classified = {
+        SkipReason.FINGERPRINT_MATCH: [
+            (f"{i:06d}.SZ", "detail") for i in range(101)
+        ],
+    }
+    _write_skip_log_batch(con, "20260609", "macd", "daily", classified)
+
+    n = con.execute(
+        "SELECT COUNT(*) FROM ods_calc_skip_log WHERE calc_date = '20260609'"
+    ).fetchone()[0]
+    assert n == 101
+    con.close()
+
+
 def test_count_week_end_bars_respects_list_date_floor():
     """week_end 计数窗口下限 = max(weekly_start, list_date)。"""
     from backend.etl.orchestrator import _count_week_end_bars_batch
@@ -825,3 +1117,189 @@ def test_count_week_end_bars_respects_list_date_floor():
     assert counts["IPO2.SZ"] == 30
 
     con.close()
+
+
+def test_run_calc_refreshes_state_after_stale_dwd_rebuild(temp_db, monkeypatch):
+    """G3 stale DWD rebuild 后应 refresh affected codes。"""
+    from backend.etl import orchestrator as orch
+
+    refresh_calls = []
+
+    monkeypatch.setattr(orch, "_should_skip_calc_idempotent", lambda *a, **k: False)
+    monkeypatch.setattr(orch, "_filter_delisted", lambda c, codes, d: (codes, {}))
+    monkeypatch.setattr(orch, "check_data_completeness", lambda con, codes, calc_date=None: {
+        "ok": ["A.SZ"],
+        "missing": {},
+        "weekly_fetch": {},
+    })
+    monkeypatch.setattr(orch, "find_stale_ods_codes", lambda *a, **k: [])
+    monkeypatch.setattr(orch, "find_stale_dwd_codes", lambda con, codes, calc_date: ["A.SZ"])
+
+    def fake_rebuild(con, codes, trade_date):
+        return {"daily_quote": 1, "weekly_quote": 0, "moneyflow": 0}
+
+    monkeypatch.setattr(orch, "rebuild_dwd_for_stale", fake_rebuild)
+    def fake_refresh(con, codes, calc_date, dwd_result, return_artifacts=False):
+        refresh_calls.append((list(codes), calc_date, dwd_result))
+        summary = {"records_written": 1}
+        if return_artifacts:
+            return summary, None
+        return summary
+
+    monkeypatch.setattr(
+        "backend.etl.calc_state_refresh.maybe_refresh_state_after_dwd_rebuild",
+        fake_refresh,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_batch_append.run_batch_append_phase",
+        lambda *a, **k: {"chunk_codes": [], "completed_keys": set(), "agg_by_key": {}},
+    )
+    monkeypatch.setattr(orch, "resolve_calc_workers", lambda: 1)
+    monkeypatch.setattr(orch, "_calc_stock_chunk", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start", lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "run_checkpoint", lambda *a: None)
+
+    con = temp_db
+    orch.run_calc(
+        con, ts_codes=["A.SZ"], auto_fetch=True, calc_date="20260610",
+        skip_stale_fetch=False,
+    )
+    assert len(refresh_calls) == 1
+    assert refresh_calls[0][0] == ["A.SZ"]
+
+
+def test_merge_preflight_after_dwd_rebuild_preserves_base_ctx(monkeypatch):
+    """Patch refresh must merge into existing ctx, not discard it."""
+    from backend.etl.calc_preflight_context import CalcPreflightContext
+    from backend.etl.orchestrator import _merge_preflight_after_dwd_rebuild
+
+    base = CalcPreflightContext(
+        calc_date="20260612",
+        source="refresh_state",
+        stale_codes=["KEEP.SZ"],
+        state_map={},
+        daily_tails={"KEEP.SZ": "keep_tail"},
+        weekly_tails={},
+        dde_daily={},
+        dde_weekly={},
+        stock_modes={"KEEP.SZ": {("macd", "daily"): ("SKIP", [])}},
+        fp_cache_by_stock={"KEEP.SZ": {("macd", "daily"): "fp_keep"}},
+    )
+    patch_bundle = {
+        "daily_tails": {"PATCH.SZ": "patch_tail"},
+        "weekly_tails": {},
+        "dde_daily": {},
+        "dde_weekly": {},
+        "stock_modes": {"PATCH.SZ": {("macd", "daily"): ("APPEND", ["20260612"])}},
+        "fp_cache_by_stock": {"PATCH.SZ": {("macd", "daily"): "fp_patch"}},
+        "state_map": {},
+    }
+
+    def fake_refresh(con, codes, calc_date, dwd_result, return_artifacts=False):
+        if return_artifacts:
+            return {"stocks": 1, "records_written": 0}, patch_bundle
+        return {"stocks": 1, "records_written": 0}
+
+    monkeypatch.setattr(
+        "backend.etl.calc_state_refresh.maybe_refresh_state_after_dwd_rebuild",
+        fake_refresh,
+    )
+    merged = _merge_preflight_after_dwd_rebuild(
+        None, ["PATCH.SZ"], "20260612", {"daily_quote": 1}, base,
+    )
+    assert merged.daily_tails["KEEP.SZ"] == "keep_tail"
+    assert merged.daily_tails["PATCH.SZ"] == "patch_tail"
+    assert merged.stock_modes["PATCH.SZ"][("macd", "daily")][0] == "APPEND"
+
+
+def test_run_calc_stale_dwd_merge_preserves_preflight_ctx(temp_db, monkeypatch):
+    """G3 stale DWD path must pass merged preflight_ctx into batch_append."""
+    from backend.etl import orchestrator as orch
+    from backend.etl.calc_preflight_context import CalcPreflightContext
+
+    monkeypatch.setattr(
+        "backend.fetch.ods_daily.get_all_active_codes", lambda con: ["A.SZ"],
+    )
+
+    base_ctx = CalcPreflightContext(
+        calc_date="20260610",
+        source="refresh_state",
+        stale_codes=["KEEP.SZ"],
+        state_map={},
+        daily_tails={"KEEP.SZ": "keep"},
+        weekly_tails={},
+        dde_daily={},
+        dde_weekly={},
+        stock_modes={"KEEP.SZ": {("macd", "daily"): ("SKIP", [])}},
+        fp_cache_by_stock={"KEEP.SZ": {("macd", "daily"): "fp_k"}},
+    )
+    captured = {"preflight_ctx": None}
+
+    def capture_batch(con, codes, calc_date, force=False, preflight_ctx=None):
+        captured["preflight_ctx"] = preflight_ctx
+        return {
+            "chunk_codes": [],
+            "completed_keys": set(),
+            "agg_by_key": {},
+            "stock_modes": {},
+            "full_items": [],
+            "chunk_work_items": 0,
+            "preflight_source": "refresh" if preflight_ctx else "cold",
+            "tails_load_skipped": bool(preflight_ctx),
+            "preflight_elapsed_sec": 0,
+            "batch_full_items": 0,
+            "full_by_indicator": {},
+        }
+
+    patch_bundle = {
+        "daily_tails": {"A.SZ": "patch"},
+        "weekly_tails": {},
+        "dde_daily": {},
+        "dde_weekly": {},
+        "stock_modes": {"A.SZ": {("macd", "daily"): ("APPEND", ["20260610"])}},
+        "fp_cache_by_stock": {"A.SZ": {("macd", "daily"): "fp_a"}},
+        "state_map": {},
+    }
+
+    monkeypatch.setattr(orch, "_should_skip_calc_idempotent", lambda *a, **k: False)
+    monkeypatch.setattr(orch, "_filter_delisted", lambda c, codes, d: (codes, {}))
+    monkeypatch.setattr(orch, "check_data_completeness", lambda con, codes, calc_date=None: {
+        "ok": ["A.SZ"],
+        "missing": {},
+        "weekly_fetch": {},
+    })
+    monkeypatch.setattr(orch, "find_stale_ods_codes", lambda *a, **k: [])
+    monkeypatch.setattr(orch, "find_stale_dwd_codes", lambda con, codes, calc_date: ["A.SZ"])
+    monkeypatch.setattr(
+        orch, "rebuild_dwd_for_stale",
+        lambda con, codes, trade_date: {"daily_quote": 1, "weekly_quote": 0, "moneyflow": 0},
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state_refresh.maybe_refresh_state_after_dwd_rebuild",
+        lambda con, codes, calc_date, dwd_result, return_artifacts=False: (
+            ({"records_written": 0}, patch_bundle) if return_artifacts
+            else {"records_written": 0}
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_batch_append.run_batch_append_phase", capture_batch,
+    )
+    monkeypatch.setattr(orch, "resolve_calc_workers", lambda: 1)
+    monkeypatch.setattr(orch, "_calc_stock_chunk", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start", lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "run_checkpoint", lambda *a: None)
+
+    orch.run_calc(
+        con=temp_db,
+        ts_codes=None,
+        auto_fetch=True,
+        calc_date="20260610",
+        skip_stale_fetch=False,
+        preflight_ctx=base_ctx,
+    )
+    ctx = captured["preflight_ctx"]
+    assert ctx is not None
+    assert ctx.daily_tails["KEEP.SZ"] == "keep"
+    assert ctx.daily_tails["A.SZ"] == "patch"

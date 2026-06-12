@@ -600,7 +600,8 @@ CREATE TABLE dws_ma_daily (
 | `bear_weakening` | < | > 0 | < 0 | MA5 尝试上拐，空方减弱 |
 | `bear_rolling` | < | > 0 | > 0 | 两线均上行，金叉边缘 |
 | `tangle` | — | — | — | 近 10 日交叉 ≥2 次 + 间距<3%（此时忽略斜率） |
-| NULL | — | — | — | MA5 或 MA10 值不可用（IPO <10 日、停牌复牌后窗口不足） |
+| *(fallback)* | > 或 < | 一走平一走 | — | Layer 3：单斜率过渡态归入最近 8 类（如 s5↑+s10平+多头位→bull_building） |
+| NULL | — | — | — | MA5/MA10/斜率不可用（IPO <10 日、停牌窗口不足）；**不走 fallback** |
 
 **转折点**（不变）：
 
@@ -1752,6 +1753,7 @@ CREATE INDEX idx_ods_moneyflow_date ON ods_moneyflow(trade_date);
 | `CALC_WORKERS` | 计算**线程**并行度，默认 `min(cpu-1, 8)`（DuckDB 单文件禁跨进程写，故用线程池） |
 | `CALC_APPEND=1`（默认） | 新交易日双路径追算：每股每 freq 每指标按 `dws_calc_state` 路由 SKIP/APPEND/FULL；`=0` 回退 12.7 窄窗 |
 | `CALC_FAST_SKIP=1`（默认） | chunk 级 preflight v2：按指标 partial skip（`preflight_stock_modes_v2` + `calc_stock_pipeline_selective`）；BSE DDE 空帧视为 SKIP；需 `CALC_APPEND`；`=0` 回退 |
+| `CALC_BATCH_APPEND=1`（默认） | 全市场新日 `run_calc` 在 ThreadPool 前走 `run_batch_append_phase()`：APPEND/SKIP 股按 `(indicator,freq)` 跨股批处理（共享尾窗加载 + batch 种子）；FULL/fallthrough 股仍进 `_calc_stock_chunk`；`--ts-code` 子集或 `=0` 回退逐股 APPEND；需 `CALC_APPEND`；设计见 `docs/superpowers/plans/2026-06-08-cross-stock-batch-append.md` |
 
 **同日复跑 partial skip（CALC_FAST_SKIP v2）：** v1 实库 **834s→630s**（12 指标全 SKIP 才短路）。v2 见 `docs/superpowers/plans/2026-06-08-calc-partial-skip-v2.md`：`SKIP` 指标直接记 `fingerprint_match`，仅 `APPEND`/`FULL` 走 selective pipeline；DDE weekly batch SQL `tail_window=245`。
 
@@ -2159,9 +2161,9 @@ WHERE calc_date = (
 
 > 补全 12.10 节：dws_kpattern 布尔列 CHECK (0/1)、dws_volume pct_vol_rank 值域 CHECK [0,100] + zone/trend 枚举 CHECK、dws_ma 布尔列+枚举 CHECK、dws_dde 枚举 CHECK。v1.5 切换纯 DuckDB 后 CHECK 由数据库强制执行。
 
-### 12.53 dws_ma.alignment NULL 语义明确（Data Architect Review 未优化项）
+### 12.53 dws_ma.alignment NULL 语义明确
 
-> alignment 取 NULL 的场景：MA5 或 MA10 值不可用（IPO 上市不足 10 日 MA10 尚未计算，或停牌复牌后 MA 窗口内有效交易日不足）。
+> alignment 取 NULL 的唯一场景：MA5、MA10 或斜率不可用（IPO 上市不足 10 日、停牌复牌后窗口内有效交易日不足、斜率 NaN）。「一走平一趋势」过渡态由 Layer 3 fallback 归入现有 8 类，不再 NULL。
 
 ### 12.54 dim_date 补 is_year_end（Data Architect Review 未优化项）
 

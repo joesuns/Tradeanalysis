@@ -189,11 +189,19 @@ def test_cmd_run_closes_date_connection_before_calc(monkeypatch):
         "backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
     monkeypatch.setattr(
         "backend.fetch.ods_daily.fetch_by_date_range_parallel", fake_fetch)
-    monkeypatch.setattr("backend.etl.build_dwd.rebuild_all_dwd", fake_rebuild)
+    monkeypatch.setattr(
+        "backend.etl.orchestrator.find_stale_dwd_codes",
+        lambda con, codes, date: list(codes),
+    )
+    monkeypatch.setattr("backend.etl.build_dwd.rebuild_dwd_incremental",
+                        lambda con, codes, d: fake_rebuild(con, codes))
     monkeypatch.setattr(cli, "cmd_calc", fake_calc)
     monkeypatch.setattr(
         "backend.export_wide.export_wide_to_excel", lambda *a, **k: 5000)
     monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
 
     args = argparse.Namespace(
         date="20260605",
@@ -202,6 +210,8 @@ def test_cmd_run_closes_date_connection_before_calc(monkeypatch):
         include_st=False,
         no_index=False,
         db_path=None,
+        force=False,
+        skip_export=False,
     )
     cli.cmd_run(args)
 
@@ -210,3 +220,397 @@ def test_cmd_run_closes_date_connection_before_calc(monkeypatch):
     assert "dwd_rebuilt" in events
     assert "calc_started" in events
     assert events.index("fetch_done") < events.index("calc_started")
+
+
+def test_cmd_run_skips_rebuild_when_fetch_zero_and_dwd_fresh(monkeypatch):
+    """n_fetch=0 且 find_stale_dwd_codes 空 → 不得 rebuild_all_dwd。"""
+    import argparse
+    from backend import cli
+
+    rebuild_calls = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
+
+        def close(self):
+            pass
+
+    def fake_fetch(*_a, **_k):
+        return 0
+
+    def fake_rebuild(con, codes):
+        rebuild_calls.append(list(codes))
+
+    def fake_stale(con, codes, date):
+        assert date == "20260605"
+        return []
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", fake_fetch)
+    monkeypatch.setattr("backend.etl.build_dwd.rebuild_all_dwd", fake_rebuild)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes", fake_stale)
+    monkeypatch.setattr(cli, "cmd_calc", lambda _a, skip_stale_fetch=False: None)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260605", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=False,
+    )
+    cli.cmd_run(args)
+    assert rebuild_calls == []
+
+
+def test_cmd_run_rebuilds_stale_subset_when_fetch_zero(monkeypatch):
+    """n_fetch=0 但 stale 非空 → incremental rebuild stale 股（DWD_INCREMENTAL 默认）。"""
+    import argparse
+    from backend import cli
+
+    rebuild_calls = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes",
+                        lambda con, codes, date: ["B.SZ"])
+    monkeypatch.setattr("backend.etl.build_dwd.rebuild_dwd_incremental",
+                        lambda con, codes, d: rebuild_calls.append(list(codes)))
+    monkeypatch.setattr(cli, "cmd_calc", lambda _a, skip_stale_fetch=False: None)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260605", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=False,
+    )
+    cli.cmd_run(args)
+    assert rebuild_calls == [["B.SZ"]]
+
+
+def test_cmd_run_n_fetch_zero_uses_full_when_dwd_incremental_disabled(monkeypatch):
+    """DWD_INCREMENTAL=0 → n_fetch=0 stale 路径走 rebuild_all_dwd。"""
+    import argparse
+    from backend import cli
+
+    rebuild_calls = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("backend.config.DWD_INCREMENTAL", False)
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes",
+                        lambda con, codes, date: ["B.SZ"])
+    monkeypatch.setattr("backend.etl.build_dwd.rebuild_all_dwd",
+                        lambda con, codes: rebuild_calls.append(list(codes)))
+    monkeypatch.setattr(cli, "cmd_calc", lambda _a, skip_stale_fetch=False: None)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260605", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=False,
+    )
+    cli.cmd_run(args)
+    assert rebuild_calls == [["B.SZ"]]
+
+
+def test_cmd_run_rebuilds_stale_when_fetch_gt_zero(monkeypatch):
+    """n_fetch>0 → rebuild stale 子集（非全市场）。"""
+    import argparse
+    from backend import cli
+
+    rebuild_calls = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: 100)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes",
+                        lambda con, codes, date: ["B.SZ"])
+    monkeypatch.setattr("backend.etl.build_dwd.rebuild_dwd_incremental",
+                        lambda con, codes, d: rebuild_calls.append(list(codes)))
+    monkeypatch.setattr(cli, "cmd_calc", lambda _a, skip_stale_fetch=False: None)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260605", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=False,
+    )
+    cli.cmd_run(args)
+    assert rebuild_calls == [["B.SZ"]]
+
+
+def test_cmd_run_logs_fetch_rebuild_export_steps(monkeypatch):
+    """cmd_run 应对 fetch/rebuild/export 各写一条 ods_etl_log。"""
+    import argparse
+    from backend import cli
+
+    logged_steps = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
+
+        def close(self):
+            pass
+
+    def fake_log_end(con, lid, step_name, t0, status, row_count=0, **kw):
+        logged_steps.append((step_name, status, row_count, kw.get("data_completeness")))
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "cmd_calc", lambda _a, skip_stale_fetch=False: None)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: 42)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", fake_log_end)
+
+    args = argparse.Namespace(
+        date="20260605", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=False,
+    )
+    cli.cmd_run(args)
+    step_names = [s[0] for s in logged_steps]
+    assert step_names == ["run_fetch", "run_rebuild_dwd", "run_export"]
+    assert logged_steps[0][2] == 0          # n_fetch
+    assert logged_steps[1][3]["skipped"] is True  # rebuild skipped
+    assert logged_steps[2][2] == 42         # export rows
+
+
+def test_cmd_run_skip_export(monkeypatch):
+    """--skip-export → 不调用 export_wide_to_excel。"""
+    import argparse
+    from backend import cli
+
+    export_called = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "cmd_calc", lambda _a, skip_stale_fetch=False: None)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel",
+                        lambda *a, **k: export_called.append(True) or 1)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260605", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=True,
+    )
+    cli.cmd_run(args)
+    assert export_called == []
+
+
+def test_cmd_run_refreshes_state_after_dwd_rebuild(monkeypatch):
+    """DWD rebuild 非空 → 对 stale 子集调用 refresh-state，再 calc。"""
+    import argparse
+    from backend import cli
+
+    events = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260610",)})()
+
+        def close(self):
+            pass
+
+    def fake_rebuild_incremental(con, codes, d):
+        events.append(("rebuild", list(codes)))
+        return {"daily_quote": 10, "weekly_quote": 5, "moneyflow": 3}
+
+    def fake_refresh(con, codes, calc_date, dwd_result, return_artifacts=False):
+        events.append(("refresh", list(codes), calc_date, dwd_result))
+        return {"records_written": 12}
+
+    def fake_calc(_args, skip_stale_fetch=False):
+        events.append("calc")
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: 100)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes",
+                        lambda con, codes, date: ["B.SZ"])
+    monkeypatch.setattr("backend.etl.build_dwd.rebuild_dwd_incremental", fake_rebuild_incremental)
+    monkeypatch.setattr(
+        "backend.etl.calc_state_refresh.maybe_refresh_state_after_dwd_rebuild",
+        fake_refresh,
+    )
+    monkeypatch.setattr(cli, "cmd_calc", fake_calc)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260610", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=True,
+    )
+    cli.cmd_run(args)
+    assert ("rebuild", ["B.SZ"]) in events
+    refresh_events = [e for e in events if isinstance(e, tuple) and e[0] == "refresh"]
+    assert len(refresh_events) == 1
+    assert refresh_events[0][1] == ["B.SZ"]
+    assert refresh_events[0][2] == "20260610"
+    assert events[-1] == "calc"
+
+
+def test_cmd_run_skips_refresh_when_dwd_skipped(monkeypatch):
+    import argparse
+    from backend import cli
+
+    refresh_calls = []
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260610",)})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "backend.etl.calc_state_refresh.maybe_refresh_state_after_dwd_rebuild",
+        lambda *a, **k: refresh_calls.append(1),
+    )
+    monkeypatch.setattr(cli, "cmd_calc", lambda *a, **k: None)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260610", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=True,
+    )
+    cli.cmd_run(args)
+    assert refresh_calls == []
+
+
+def test_cmd_run_sets_preflight_context(monkeypatch):
+    """DWD rebuild + refresh with artifacts → calc receives popped context."""
+    import argparse
+    from backend import cli
+    from backend.etl.calc_preflight_context import pop_run_preflight_context
+
+    captured = {}
+
+    class FakeCon:
+        def execute(self, *args, **kwargs):
+            return type("R", (), {"fetchone": lambda self: ("20260610",)})()
+
+        def close(self):
+            pass
+
+    tails_bundle = {
+        "daily_tails": {"B.SZ": "tail"},
+        "weekly_tails": {},
+        "dde_daily": {},
+        "dde_weekly": {},
+        "stock_modes": {"B.SZ": {("macd", "daily"): ("APPEND", ["20260610"])}},
+        "fp_cache_by_stock": {"B.SZ": {("macd", "daily"): "fp1"}},
+        "state_map": {("B.SZ", "daily", "macd"): {"last_trade_date": "20260609"}},
+    }
+
+    def fake_refresh(con, codes, calc_date, dwd_result, return_artifacts=False):
+        if return_artifacts:
+            return {"records_written": 1}, tails_bundle
+        return {"records_written": 1}
+
+    def fake_calc(_args, skip_stale_fetch=False):
+        ctx = pop_run_preflight_context()
+        captured["preflight_ctx"] = ctx
+
+    monkeypatch.setattr("backend.config.CALC_REUSE_REFRESH_CTX", True)
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: 100)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes",
+                        lambda con, codes, date: ["B.SZ"])
+    monkeypatch.setattr(
+        "backend.etl.build_dwd.rebuild_dwd_for_stale",
+        lambda con, codes, d: {"daily_quote": 10},
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state_refresh.maybe_refresh_state_after_dwd_rebuild",
+        fake_refresh,
+    )
+    monkeypatch.setattr(cli, "cmd_calc", fake_calc)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260610", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=True,
+    )
+    cli.cmd_run(args)
+    ctx = captured.get("preflight_ctx")
+    assert ctx is not None
+    assert ctx.source == "refresh_state"
+    assert "B.SZ" in ctx.stock_modes
+    assert pop_run_preflight_context() is None
