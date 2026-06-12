@@ -182,20 +182,45 @@ def batch_append_macd(
         if core is not None:
             import numpy as np
             from backend.etl.vector.macd_batch import attach_macd_core_to_df
+            from backend.etl.calc_macd import require_b4_weekly_target_indices
+
             base = attach_macd_core_to_df(df, core)
-            td_set = set(base["trade_date"].astype(str).values)
-            target_idx = {
-                int(np.where(base["trade_date"].astype(str).values == td)[0][0])
-                for td in new_bars
-                if td in td_set
-            }
+            if freq == "weekly" and new_bars:
+                target_idx = set(require_b4_weekly_target_indices(
+                    base, new_bars, ts_code=ts_code,
+                ))
+            else:
+                td_set = set(base["trade_date"].astype(str).values)
+                target_idx = {
+                    int(np.where(base["trade_date"].astype(str).values == td)[0][0])
+                    for td in new_bars
+                    if td in td_set
+                }
+            b4_target = target_idx if freq == "weekly" else None
             out = calc._compute_macd_derived(
-                base, daily_for_b4=daily_b4, target_indices=target_idx or None,
+                base,
+                daily_for_b4=daily_b4,
+                target_indices=target_idx or None,
+                b4_target_indices=b4_target,
             )
         else:
-            out = calc._compute_indicators(
-                df, ema_seeds=seeds, daily_for_b4=daily_b4,
-            )
+            if freq == "weekly" and new_bars:
+                from backend.etl.calc_macd import require_b4_weekly_target_indices
+
+                target_idx = set(require_b4_weekly_target_indices(
+                    df, new_bars, ts_code=ts_code,
+                ))
+                base = calc._compute_macd_core(df, ema_seeds=seeds)
+                out = calc._compute_macd_derived(
+                    base,
+                    daily_for_b4=daily_b4,
+                    target_indices=target_idx,
+                    b4_target_indices=target_idx,
+                )
+            else:
+                out = calc._compute_indicators(
+                    df, ema_seeds=seeds, daily_for_b4=daily_b4,
+                )
         fp = compute_history_signature(out, calc.SIGNATURE_COLS)
         stock_rows.append((ts_code, out, fp, new_bars[0], new_bars[-1]))
         prog.tick()
