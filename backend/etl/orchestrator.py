@@ -25,7 +25,7 @@ from backend.etl.base import SkipReason, CalcResult
 from backend.fetch.client import TushareClient
 from backend.fetch.ods_daily import fetch_by_date_range_parallel, get_all_active_codes
 from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
-from backend.etl.build_dwd import rebuild_all_dwd
+from backend.etl.build_dwd import rebuild_all_dwd, rebuild_dwd_for_stale
 from backend.etl.calc_macd import MACDCalculator
 from backend.etl.calc_ma import MACalculator
 from backend.etl.calc_kpattern import KPatternCalculator
@@ -459,11 +459,20 @@ def find_stale_ods_codes(con, ts_codes: list[str], analysis_date: str) -> list[s
 
 
 def find_stale_dwd_codes(con, ts_codes: list[str], analysis_date: str) -> list[str]:
-    """Stocks with ODS on analysis_date but DWD max trade_date behind."""
+    """Stocks with ODS on analysis_date but any DWD layer max trade_date behind.
+
+    Checks daily_quote, weekly_quote, and moneyflow (only when ODS moneyflow exists
+    on analysis_date — BSE etc. without moneyflow are not flagged).
+    """
     if not ts_codes:
         return []
 
     placeholders = ",".join(["?" for _ in ts_codes])
+    params = (
+        list(ts_codes) + list(ts_codes) + list(ts_codes)
+        + [analysis_date] + list(ts_codes)
+        + [analysis_date, analysis_date, analysis_date, analysis_date]
+    )
     rows = con.execute(f"""
         SELECT o.ts_code
         FROM ods_daily o
@@ -472,11 +481,33 @@ def find_stale_dwd_codes(con, ts_codes: list[str], analysis_date: str) -> list[s
             FROM dwd_daily_quote
             WHERE ts_code IN ({placeholders})
             GROUP BY ts_code
-        ) d ON o.ts_code = d.ts_code
+        ) dq ON o.ts_code = dq.ts_code
+        LEFT JOIN (
+            SELECT ts_code, MAX(trade_date) AS dwd_max
+            FROM dwd_weekly_quote
+            WHERE ts_code IN ({placeholders})
+            GROUP BY ts_code
+        ) wq ON o.ts_code = wq.ts_code
+        LEFT JOIN (
+            SELECT ts_code, MAX(trade_date) AS dwd_max
+            FROM dwd_daily_moneyflow
+            WHERE ts_code IN ({placeholders})
+            GROUP BY ts_code
+        ) mf ON o.ts_code = mf.ts_code
         WHERE o.trade_date = ?
           AND o.ts_code IN ({placeholders})
-          AND (d.dwd_max IS NULL OR d.dwd_max < ?)
-    """, list(ts_codes) + [analysis_date] + list(ts_codes) + [analysis_date]).fetchall()
+          AND (
+              dq.dwd_max IS NULL OR dq.dwd_max < ?
+              OR wq.dwd_max IS NULL OR wq.dwd_max < ?
+              OR (
+                  EXISTS (
+                      SELECT 1 FROM ods_moneyflow om
+                      WHERE om.ts_code = o.ts_code AND om.trade_date = ?
+                  )
+                  AND (mf.dwd_max IS NULL OR mf.dwd_max < ?)
+              )
+          )
+    """, params).fetchall()
     return [r[0] for r in rows]
 
 
@@ -514,25 +545,35 @@ def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str) -> in
     tdays = _count_trading_days(con, seg_start, analysis_date)
     client = TushareClient()
 
-    if _choose_fetch_strategy(len(stale_codes), tdays):
-        logger.info(
-            "Stale auto-fetch [%s~%s]: %d stocks, %d tdays → date-batched",
-            seg_start, analysis_date, len(stale_codes), tdays,
-        )
-        n_fetched = fetch_by_date_range_parallel(
-            seg_start, analysis_date, workers=3,
-            ts_codes=stale_codes, con=con,
-        )
-    else:
-        logger.info(
-            "Stale auto-fetch [%s~%s]: %d stocks, %d tdays → stock-batched",
-            seg_start, analysis_date, len(stale_codes), tdays,
-        )
-        n_fetched = fetch_stocks_incremental(
-            client, con, stale_codes, start=seg_start, end=analysis_date)
+    from backend.etl.progress import log_timed_step
 
-    logger.info("Rebuilding DWD for %d stale stocks", len(stale_codes))
-    rebuild_all_dwd(con, stale_codes)
+    mode = "date-batched" if _choose_fetch_strategy(len(stale_codes), tdays) else "stock-batched"
+    logger.info(
+        "progress calc.stale_fetch: started | %s~%s | stocks=%d | mode=%s",
+        seg_start, analysis_date, len(stale_codes), mode,
+    )
+
+    def _fetch_stale():
+        if mode == "date-batched":
+            return fetch_by_date_range_parallel(
+                seg_start, analysis_date, workers=3,
+                ts_codes=stale_codes, con=con,
+            )
+        return fetch_stocks_incremental(
+            client, con, stale_codes, start=seg_start, end=analysis_date,
+        )
+
+    n_fetched = log_timed_step(
+        "calc.stale_fetch", "ods",
+        _fetch_stale,
+        stocks=len(stale_codes),
+        extra=f"{seg_start}~{analysis_date}",
+    )
+    log_timed_step(
+        "calc.stale_fetch", "rebuild_dwd",
+        lambda: rebuild_dwd_for_stale(con, stale_codes, analysis_date),
+        stocks=len(stale_codes),
+    )
     return n_fetched
 
 
@@ -664,8 +705,19 @@ def _classify_still_missing(con, missing: dict) -> dict:
 
 
 def _write_skip_log_batch(con, calc_date: str, indicator: str, freq: str,
-                           classified: dict):
+                           classified: dict, *, verbose: bool = True):
     """Write classified skip reasons to ods_calc_skip_log."""
+    if not verbose:
+        items = classified.get(SkipReason.FINGERPRINT_MATCH, [])
+        if items and len(items) > 100 and len(classified) == 1:
+            con.execute(
+                """INSERT OR REPLACE INTO ods_calc_skip_log
+                   (calc_date, ts_code, indicator, freq, reason, detail)
+                   VALUES (?, '__batch__', ?, ?, ?, ?)""",
+                [calc_date, indicator, freq, SkipReason.FINGERPRINT_MATCH.value,
+                 f"batch_skip={len(items)}"],
+            )
+            return
     rows = []
     for reason, items in classified.items():
         for ts_code, detail in items:
@@ -703,7 +755,9 @@ def _route_calc(con, calc, name: str, freq: str, ts_code: str, df,
         return _full()
 
     state = load_calc_state(con, freq, name, [ts_code]).get(ts_code)
-    mode, new_bars = classify_calc_mode(df, state, calc.SIGNATURE_COLS)
+    spec_version = getattr(calc, "SPEC_VERSION", "v1")
+    mode, new_bars = classify_calc_mode(
+        df, state, calc.SIGNATURE_COLS, expected_spec_version=spec_version)
 
     if mode == "SKIP":
         r = CalcResult()
@@ -713,6 +767,7 @@ def _route_calc(con, calc, name: str, freq: str, ts_code: str, df,
             write_calc_state_from_df(
                 con, ts_code, freq, name, df, calc.SIGNATURE_COLS, calc_date,
                 last_trade_date=state["last_trade_date"],
+                spec_version=spec_version,
             )
         return r
 
@@ -724,6 +779,7 @@ def _route_calc(con, calc, name: str, freq: str, ts_code: str, df,
     if result.calculated > 0 and df is not None and len(df) > 0:
         write_calc_state_from_df(
             con, ts_code, freq, name, df, calc.SIGNATURE_COLS, calc_date,
+            spec_version=spec_version,
         )
     return result
 
@@ -740,6 +796,7 @@ def calc_stock_pipeline(con, ts_code: str, calc_date: str,
     from backend.etl.base import load_quote_groups
     from backend.etl.recalc_spec import resolve_load_start
     from backend.config import CALC_APPEND
+    from backend.etl.calc_indicators import quote_pipeline_columns
 
     outputs = []
     for freq, recalc_start in (("daily", daily_recalc), ("weekly", weekly_recalc)):
@@ -748,7 +805,8 @@ def calc_stock_pipeline(con, ts_code: str, calc_date: str,
             load_start = resolve_load_start(con, recalc_start, freq)
         src = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
         quote_groups = load_quote_groups(
-            con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=load_start,
+            con, src, freq, quote_pipeline_columns(freq), [ts_code],
+            start_date=load_start,
         )
         append_on = CALC_APPEND and recalc_start is not None
         qdf = quote_groups.get(ts_code)
@@ -811,17 +869,21 @@ def calc_stock_pipeline_selective(
         df = None
         quote_groups = None
         if source == "quote":
-            if mode != "FULL" and tail_frames is not None:
+            if tail_frames is not None:
                 df = tail_frames.get((freq, "quote"))
+                if df is not None and len(df) > 0:
+                    quote_groups = {ts_code: df}
             if df is None or len(df) == 0:
                 src = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
                 start = load_start if mode == "FULL" else load_start
+                from backend.etl.calc_indicators import quote_pipeline_columns
                 quote_groups = load_quote_groups(
-                    con, src, freq, QUOTE_COLUMNS, [ts_code], start_date=start,
+                    con, src, freq, quote_pipeline_columns(freq), [ts_code],
+                    start_date=start,
                 )
                 df = quote_groups.get(ts_code)
         else:
-            if mode != "FULL" and tail_frames is not None:
+            if tail_frames is not None:
                 df = tail_frames.get((freq, "dde"))
             if df is None or len(df) == 0:
                 dde = DDECalculator(con, freq)
@@ -885,6 +947,121 @@ def _count_calc_rows(con, table: str, calc_date: str, ts_codes: list) -> int:
     ).fetchone()[0]
 
 
+def _calc_full_work_chunk(
+    work_items: list,
+    calc_date: str,
+    incremental: bool = True,
+    batch_ctx: Optional[dict] = None,
+) -> int:
+    """Worker: run FULL calc for indicator-level work items in a dedicated connection."""
+    import duckdb
+    from backend.config import DUCKDB_PATH
+
+    if not work_items:
+        return 0
+
+    con = duckdb.connect(DUCKDB_PATH)
+    try:
+        if incremental:
+            daily_recalc = resolve_recalc_start(con, calc_date, "daily")
+            weekly_recalc = resolve_recalc_start(con, calc_date, "weekly")
+        else:
+            daily_recalc = weekly_recalc = None
+
+        from collections import defaultdict
+
+        ts_codes = list({ts for ts, _ in work_items})
+        agg_by_key = defaultdict(CalcResult)
+
+        daily_tails = weekly_tails = dde_daily = dde_weekly = {}
+        stock_modes = {}
+        if batch_ctx is not None:
+            stock_modes = batch_ctx.get("stock_modes", {})
+            daily_tails = {
+                c: batch_ctx["daily_tails"][c] for c in ts_codes
+                if c in batch_ctx.get("daily_tails", {})
+            }
+            weekly_tails = {
+                c: batch_ctx["weekly_tails"][c] for c in ts_codes
+                if c in batch_ctx.get("weekly_tails", {})
+            }
+            dde_daily = {
+                c: batch_ctx["dde_daily"][c] for c in ts_codes
+                if c in batch_ctx.get("dde_daily", {})
+            }
+            dde_weekly = {
+                c: batch_ctx["dde_weekly"][c] for c in ts_codes
+                if c in batch_ctx.get("dde_weekly", {})
+            }
+
+        logger.info(
+            "progress calc.chunk: started | work_items=%d | stocks=%d",
+            len(work_items), len(ts_codes),
+        )
+
+        for ts_code, (indicator_name, freq) in work_items:
+            run_keys = {(indicator_name, freq)}
+            run_modes = {(indicator_name, freq): ("FULL", [])}
+            if ts_code in stock_modes:
+                mode_entry = stock_modes[ts_code].get((indicator_name, freq))
+                if mode_entry:
+                    run_modes = {(indicator_name, freq): mode_entry}
+
+            tail_frames = {
+                ("daily", "quote"): daily_tails.get(ts_code),
+                ("weekly", "quote"): weekly_tails.get(ts_code),
+                ("daily", "dde"): dde_daily.get(ts_code),
+                ("weekly", "dde"): dde_weekly.get(ts_code),
+            }
+            for ind, f, result in calc_stock_pipeline_selective(
+                    con, ts_code, calc_date, daily_recalc, weekly_recalc,
+                    run_keys=run_keys, run_modes=run_modes,
+                    tail_frames=tail_frames):
+                key = (ind, f)
+                agg = agg_by_key[key]
+                agg.calculated += result.calculated
+                for reason, items in result.skipped.items():
+                    for code, detail in items:
+                        agg.add_skip(reason, code, detail)
+            _report_calc_progress()
+
+        from backend.config import CALC_SKIP_LOG_VERBOSE
+
+        chunk_total = 0
+        for CalcCls in CALCULATORS:
+            indicator_name = CalcCls.__name__.replace("Calculator", "").lower()
+            for freq in ("daily", "weekly"):
+                calc = CalcCls(con, freq)
+                agg_result = agg_by_key.get((indicator_name, freq), CalcResult())
+
+                _write_skip_log_batch(con, calc_date, indicator_name, freq,
+                                      agg_result.skipped,
+                                      verbose=CALC_SKIP_LOG_VERBOSE)
+
+                n = _count_calc_rows(con, calc.dws_table, calc_date, ts_codes)
+                chunk_total += n
+
+                skip_parts = []
+                for reason in SkipReason:
+                    items = agg_result.skipped.get(reason, [])
+                    if items:
+                        skip_parts.append(f"{reason.value}={len(items)}")
+                skip_str = ", ".join(skip_parts) if skip_parts else "none skipped"
+                if agg_result.calculated or skip_parts:
+                    logger.info(
+                        "calc %-30s DONE — %d rows (%d calculated), %s",
+                        f"{CalcCls.__name__} {freq}", n,
+                        agg_result.calculated, skip_str,
+                    )
+        logger.info(
+            "progress calc.chunk: done | work_items=%d | rows=%d",
+            len(work_items), chunk_total,
+        )
+        return chunk_total
+    finally:
+        con.close()
+
+
 def _calc_stock_chunk(chunk: list[str], calc_date: str,
                       incremental: bool = True,
                       batch_ctx: Optional[dict] = None) -> int:
@@ -907,7 +1084,8 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
         from backend.etl.calc_fast_skip import (
             batch_load_quote_tails,
             batch_load_dde_tails,
-            preflight_stock_modes_v2,
+            build_skip_state_records,
+            preflight_stock_modes_with_fps,
             partition_preflight_modes,
         )
 
@@ -937,26 +1115,55 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                           if c in batch_ctx.get("dde_weekly", {})}
             fast_on = CALC_FAST_SKIP and CALC_APPEND and incremental
         elif fast_on:
-            state_map = load_calc_state_batch(con, chunk)
-            tail_cols = quote_tail_columns()
-            daily_tails = batch_load_quote_tails(con, chunk, "daily", tail_cols)
-            weekly_tails = batch_load_quote_tails(con, chunk, "weekly", tail_cols)
-            dde_daily = batch_load_dde_tails(con, chunk, "daily")
-            dde_weekly = batch_load_dde_tails(con, chunk, "weekly")
+            from backend.etl.progress import log_timed_step
 
-        from backend.config import CALC_SKIP_STATE_REFRESH
-        from backend.etl.calc_router import state_signature
-        from backend.etl.calc_state import should_refresh_calc_state, upsert_calc_state_batch
+            cn = len(chunk)
+            state_map = log_timed_step(
+                "calc.chunk_tails", "state",
+                lambda: load_calc_state_batch(con, chunk), stocks=cn,
+            )
+            daily_tails = log_timed_step(
+                "calc.chunk_tails", "quote_daily",
+                lambda: batch_load_quote_tails(
+                    con, chunk, "daily", quote_tail_columns("daily"),
+                ),
+                stocks=cn,
+            )
+            weekly_tails = log_timed_step(
+                "calc.chunk_tails", "quote_weekly",
+                lambda: batch_load_quote_tails(
+                    con, chunk, "weekly", quote_tail_columns("weekly"),
+                ),
+                stocks=cn,
+            )
+            dde_daily = log_timed_step(
+                "calc.chunk_tails", "dde_daily",
+                lambda: batch_load_dde_tails(con, chunk, "daily"),
+                stocks=cn,
+            )
+            dde_weekly = log_timed_step(
+                "calc.chunk_tails", "dde_weekly",
+                lambda: batch_load_dde_tails(con, chunk, "weekly"),
+                stocks=cn,
+            )
 
-        skip_state_records = []
+        from backend.etl.calc_state import upsert_calc_state_batch
+
+        logger.info("progress calc.chunk: started | stocks=%d", len(chunk))
+
+        stock_modes = {}
+        fp_cache_by_stock = {}
         for ts_code in chunk:
             modes = None
             if fast_on:
-                modes = preflight_stock_modes_v2(
+                modes, fps = preflight_stock_modes_with_fps(
                     ts_code, state_map,
                     daily_tails.get(ts_code), weekly_tails.get(ts_code),
                     dde_daily.get(ts_code), dde_weekly.get(ts_code),
                 )
+                if modes is not None:
+                    stock_modes[ts_code] = modes
+                    fp_cache_by_stock[ts_code] = fps
             if modes is not None:
                 skip_keys, run_keys = partition_preflight_modes(modes)
                 for indicator_name, freq in skip_keys:
@@ -964,25 +1171,6 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                         SkipReason.FINGERPRINT_MATCH, ts_code,
                         "fast_skip: preflight",
                     )
-                    spec = next(
-                        s for s in CALC_ROUTE_SPECS
-                        if s[0] == indicator_name and s[1] == freq
-                    )
-                    _, _, _, sig_cols, source = spec
-                    st = state_map.get((ts_code, freq, indicator_name))
-                    if st is None:
-                        continue
-                    if source == "quote":
-                        tdf = daily_tails.get(ts_code) if freq == "daily" else weekly_tails.get(ts_code)
-                    else:
-                        tdf = dde_daily.get(ts_code) if freq == "daily" else dde_weekly.get(ts_code)
-                    if tdf is None or tdf.empty:
-                        continue
-                    fp = state_signature(tdf, st["last_trade_date"], sig_cols)
-                    if not CALC_SKIP_STATE_REFRESH or should_refresh_calc_state(st, calc_date, fp):
-                        skip_state_records.append((
-                            ts_code, freq, indicator_name, st["last_trade_date"], fp, calc_date, None,
-                        ))
                 if completed_keys:
                     run_keys = {
                         k for k in run_keys
@@ -1024,13 +1212,25 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                         agg.add_skip(reason, code, detail)
             _report_calc_progress()
 
-        upsert_calc_state_batch(con, skip_state_records)
+        skip_state_records = build_skip_state_records(
+            stock_modes, fp_cache_by_stock, state_map, calc_date,
+            daily_tails, weekly_tails, dde_daily, dde_weekly,
+        )
+        if skip_state_records:
+            from backend.etl.progress import log_timed_step as _log_timed_step
+            _log_timed_step(
+                "calc.chunk_state", "skip_refresh",
+                lambda: upsert_calc_state_batch(con, skip_state_records),
+                extra=f"records={len(skip_state_records)}",
+            )
 
         if fast_on:
             logger.info(
                 "calc partial_skip: full_skip=%d partial_run=%d fallthrough=%d / %d stocks",
                 full_skip_count, partial_run_count, fallthrough_count, len(chunk),
             )
+
+        from backend.config import CALC_SKIP_LOG_VERBOSE
 
         chunk_total = 0
         for CalcCls in CALCULATORS:
@@ -1040,7 +1240,8 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                 agg_result = agg_by_key.get((indicator_name, freq), CalcResult())
 
                 _write_skip_log_batch(con, calc_date, indicator_name, freq,
-                                      agg_result.skipped)
+                                      agg_result.skipped,
+                                      verbose=CALC_SKIP_LOG_VERBOSE)
 
                 n = _count_calc_rows(con, calc.dws_table, calc_date, chunk)
                 chunk_total += n
@@ -1056,6 +1257,10 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                     f"{CalcCls.__name__} {freq}", n,
                     agg_result.calculated, skip_str,
                 )
+        logger.info(
+            "progress calc.chunk: done | stocks=%d | rows=%d",
+            len(chunk), chunk_total,
+        )
         return chunk_total
     finally:
         con.close()
@@ -1069,31 +1274,34 @@ def _should_skip_calc_idempotent(
     skip_stale_fetch: bool,
 ) -> bool:
     """True when a full-market calc for calc_date already completed and data is fresh."""
-    if force or user_subset:
+    from backend.config import CALC_FORCE_HARD
+    from backend.etl.calc_gate import (
+        data_mutated_since_last_calc,
+        get_last_calc_log,
+        has_prior_calc_snapshot,
+    )
+
+    if user_subset:
+        return False
+    if force and CALC_FORCE_HARD:
         return False
 
-    has_prior = con.execute("""
-        SELECT 1 FROM ods_etl_log
-        WHERE step_name = 'calc_dws' AND status = 'success'
-          AND data_completeness IS NOT NULL AND data_completeness != ''
-          AND (
-            json_extract_string(data_completeness, '$.calc_date') = ?
-            OR data_completeness LIKE ?
-          )
-        ORDER BY started_at DESC LIMIT 1
-    """, [calc_date, f'%"calc_date": "{calc_date}"%']).fetchone()
-    if not has_prior:
-        n = con.execute(
-            "SELECT COUNT(DISTINCT ts_code) FROM dws_macd_daily WHERE calc_date = ?",
-            [calc_date],
-        ).fetchone()[0]
-        if n < 4000:
+    if force:
+        if not get_last_calc_log(con, calc_date):
             return False
+    elif not has_prior_calc_snapshot(con, calc_date):
+        return False
+
+    if data_mutated_since_last_calc(con, calc_date):
+        return False
+
+    # --force same-day reuse trusts prior calc; stale tail stocks are a subset
+    # handled on the next fetch/calc cycle and must not block the whole market.
+    if force:
+        return True
 
     if not skip_stale_fetch:
         latest_ods = con.execute("SELECT MAX(trade_date) FROM ods_daily").fetchone()[0]
-        # Only guard idempotent skip for "live tail" dates. Historical analysis
-        # dates (calc_date < latest ODS) are stable once calc completed once.
         if latest_ods and calc_date >= latest_ods:
             from backend.fetch.ods_daily import get_all_active_codes
             stale = find_stale_ods_codes(con, get_all_active_codes(con), calc_date)
@@ -1102,9 +1310,63 @@ def _should_skip_calc_idempotent(
     return True
 
 
+def _refresh_state_after_dwd_rebuild(con, ts_codes: list, calc_date: str, dwd_result: dict) -> None:
+    from backend.etl.calc_state_refresh import maybe_refresh_state_after_dwd_rebuild
+
+    summary = maybe_refresh_state_after_dwd_rebuild(con, ts_codes, calc_date, dwd_result)
+    if summary:
+        logger.info(
+            "refresh_state after DWD rebuild: stocks=%d written=%d chunk_stocks=%d",
+            summary.get("stocks", len(ts_codes)),
+            summary.get("records_written", 0),
+            summary.get("chunk_stocks", -1),
+        )
+
+
+def _merge_preflight_after_dwd_rebuild(
+    con,
+    ts_codes: list,
+    calc_date: str,
+    dwd_result: dict,
+    preflight_ctx,
+):
+    """Refresh patch stocks after DWD rebuild and merge into run→calc preflight ctx."""
+    from backend.config import CALC_REUSE_REFRESH_CTX
+    from backend.etl.calc_preflight_context import merge_context_patch
+    from backend.etl.calc_state_refresh import maybe_refresh_state_after_dwd_rebuild
+
+    if not CALC_REUSE_REFRESH_CTX:
+        return preflight_ctx
+    result = maybe_refresh_state_after_dwd_rebuild(
+        con, ts_codes, calc_date, dwd_result, return_artifacts=True,
+    )
+    if not result:
+        return preflight_ctx
+    if isinstance(result, tuple):
+        summary, tails_bundle = result
+    else:
+        summary = result
+        tails_bundle = None
+    if summary:
+        logger.info(
+            "refresh_state after DWD rebuild: stocks=%d written=%d chunk_stocks=%d",
+            summary.get("stocks", len(ts_codes)),
+            summary.get("records_written", 0),
+            summary.get("chunk_stocks", -1),
+        )
+    if tails_bundle is None:
+        return preflight_ctx
+    logger.info(
+        "refresh_state merge: patch_stocks=%d ctx_before=%s",
+        len(ts_codes), "set" if preflight_ctx else "none",
+    )
+    return merge_context_patch(preflight_ctx, ts_codes, tails_bundle, calc_date)
+
+
 def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
              batch_size: int = 100, calc_date: str = None,
-             skip_stale_fetch: bool = False, force: bool = False):
+             skip_stale_fetch: bool = False, force: bool = False,
+             preflight_ctx=None):
     """执行 DWS 计算流程。
 
     1. 如果未指定 ts_codes，获取全市场活跃股票
@@ -1113,6 +1375,9 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     4. 缺 warmup → auto_fetch 补拉（熔断器：连续5次失败中止）
     5. stale ODS（max < calc_date）→ date/stock-batched 补 latest day（可 skip）
     6. 逐 Calculator 计算 DWS
+
+    DWD refresh in run_calc uses rebuild_dwd_for_stale only (G3 / auto-fetch /
+    stale_fetch). rebuild_all_dwd is reserved for legacy run_etl build-dwd step.
     """
     import time
     from datetime import datetime
@@ -1143,14 +1408,22 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
 
     if _should_skip_calc_idempotent(con, calc_date, user_subset, force, skip_stale_fetch):
         lid, t0 = log_etl_start(con, "calc_dws")
+        skip_key = "force_same_day_skip" if force else "idempotent_skip"
         log_etl_end(
             con, lid, "calc_dws", t0, "success", row_count=0,
-            data_completeness={"calc_date": calc_date, "idempotent_skip": True},
+            data_completeness={"calc_date": calc_date, skip_key: True},
         )
-        logger.info(
-            "calc idempotent skip: %s already completed (use --force to recalculate)",
-            calc_date,
-        )
+        if force:
+            logger.info(
+                "calc force same-day skip: %s unchanged since last calc "
+                "(set CALC_FORCE_HARD=1 to force recalc)",
+                calc_date,
+            )
+        else:
+            logger.info(
+                "calc idempotent skip: %s already completed (use --force to recalculate)",
+                calc_date,
+            )
         return
 
     if ts_codes is None:
@@ -1272,8 +1545,16 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
             logger.info("Auto-fetch complete: %d ODS rows fetched (%d batches)",
                         n_fetched, len(range_buckets))
             if n_fetched > 0:
+                from backend.etl.progress import log_timed_step
                 fetched_codes = list({c for c, _, _ in to_fetch})
-                rebuild_all_dwd(con, fetched_codes)
+                dwd_result = log_timed_step(
+                    "calc.auto_fetch", "rebuild_dwd",
+                    lambda: rebuild_dwd_for_stale(con, fetched_codes, calc_date),
+                    stocks=len(fetched_codes),
+                )
+                preflight_ctx = _merge_preflight_after_dwd_rebuild(
+                    con, fetched_codes, calc_date, dwd_result or {}, preflight_ctx,
+                )
                 completeness = check_data_completeness(con, ts_codes, calc_date=calc_date)
         else:
             logger.info("No ODS gaps to fetch; skipping DWD rebuild")
@@ -1294,11 +1575,19 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         else:
             stale_dwd = find_stale_dwd_codes(con, ts_codes, calc_date)
             if stale_dwd:
+                from backend.etl.progress import log_timed_step
                 logger.info(
                     "Stale DWD: %d stocks have ODS on %s but DWD behind — rebuilding",
                     len(stale_dwd), calc_date,
                 )
-                rebuild_all_dwd(con, stale_dwd)
+                dwd_result = log_timed_step(
+                    "calc.stale_dwd", "rebuild",
+                    lambda: rebuild_dwd_for_stale(con, stale_dwd, calc_date),
+                    stocks=len(stale_dwd),
+                )
+                preflight_ctx = _merge_preflight_after_dwd_rebuild(
+                    con, stale_dwd, calc_date, dwd_result or {}, preflight_ctx,
+                )
 
     # 2. 分类仍缺失的股票 + 写 skip_log
     if completeness["missing"]:
@@ -1326,10 +1615,27 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
 
     batch_ctx = None
     chunk_codes = codes_to_calc
+    full_items = []
+    fallthrough_codes = []
+    chunk_work_items = 0
     if CALC_APPEND and CALC_BATCH_APPEND and CALC_INCREMENTAL and not user_subset:
-        batch_ctx = run_batch_append_phase(con, codes_to_calc, calc_date)
+        batch_ctx = run_batch_append_phase(
+            con, codes_to_calc, calc_date, force=force,
+            preflight_ctx=preflight_ctx,
+        )
         if batch_ctx:
             chunk_codes = batch_ctx["chunk_codes"]
+            from backend.etl.calc_executor import build_work_queue
+
+            wq = build_work_queue(
+                batch_ctx.get("stock_modes", {}),
+                batch_ctx.get("completed_keys", set()),
+            )
+            full_items = batch_ctx.get("full_items") or wq.full_items
+            chunk_work_items = batch_ctx.get("chunk_work_items", len(full_items))
+            fallthrough_codes = [
+                c for c in chunk_codes if c not in wq.full_stocks
+            ]
             n_batch_only = len(codes_to_calc) - len(chunk_codes)
             if n_batch_only:
                 logger.info(
@@ -1337,30 +1643,60 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                     "%d stocks need chunk (FULL/fallthrough)",
                     n_batch_only, len(chunk_codes),
                 )
+            if chunk_work_items:
+                logger.info(
+                    "chunk phase: %d work items across %d stocks "
+                    "(%d fallthrough stocks)",
+                    chunk_work_items,
+                    len({ts for ts, _ in full_items}),
+                    len(fallthrough_codes),
+                )
+            from backend.config import CALC_SKIP_LOG_VERBOSE
             for (indicator_name, freq), agg in batch_ctx.get("agg_by_key", {}).items():
                 if agg.skipped:
-                    _write_skip_log_batch(con, calc_date, indicator_name, freq, agg.skipped)
+                    _write_skip_log_batch(
+                        con, calc_date, indicator_name, freq, agg.skipped,
+                        verbose=CALC_SKIP_LOG_VERBOSE,
+                    )
+    else:
+        fallthrough_codes = chunk_codes
 
-    # 4. 计算 DWS — ThreadPoolExecutor by stock chunk.
+    # 4. 计算 DWS — ThreadPoolExecutor by indicator work item + stock fallthrough.
     #    DuckDB 单文件仅允许一个 read-write 进程；multiprocessing 会争文件锁
     #    （IOException: Could not set lock）。线程共享同一进程 DuckDB 实例，
     #    支持多写线程（MVCC），与 ods_daily fetch 的 3 线程模式一致。
     workers = resolve_calc_workers()
-    if chunk_codes:
-        chunk_size = max(1, (len(chunk_codes) + workers - 1) // workers)
-        chunks = [chunk_codes[i:i + chunk_size]
-                  for i in range(0, len(chunk_codes), chunk_size)]
-    else:
-        chunks = []
+    work_chunks = []
+    if full_items:
+        wi_chunk_size = max(1, (len(full_items) + workers - 1) // workers)
+        work_chunks = [
+            full_items[i:i + wi_chunk_size]
+            for i in range(0, len(full_items), wi_chunk_size)
+        ]
+    stock_chunks = []
+    if fallthrough_codes:
+        st_chunk_size = max(1, (len(fallthrough_codes) + workers - 1) // workers)
+        stock_chunks = [
+            fallthrough_codes[i:i + st_chunk_size]
+            for i in range(0, len(fallthrough_codes), st_chunk_size)
+        ]
 
-    logger.info("calc %d stocks with %d threads (%d stocks/chunk)",
-                len(codes_to_calc), workers,
-                chunk_size if chunk_codes else 0)
+    chunk_tasks = [("work", wc) for wc in work_chunks] + [
+        ("stock", sc) for sc in stock_chunks
+    ]
 
+    logger.info(
+        "calc %d stocks with %d threads (%d work_items, %d fallthrough/chunk)",
+        len(codes_to_calc), workers,
+        len(full_items), len(fallthrough_codes),
+    )
+
+    progress_total = len(full_items) + len(fallthrough_codes)
     _init_calc_progress(
-        len(chunk_codes),
+        progress_total or len(chunk_codes),
         threads=workers,
-        stocks_per_chunk=chunk_size if chunk_codes else 0,
+        work_items=len(full_items),
+        fallthrough_stocks=len(fallthrough_codes),
         batch_only=len(codes_to_calc) - len(chunk_codes),
     )
     lid, t0 = log_etl_start(con, "calc_dws")
@@ -1370,26 +1706,37 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     from concurrent.futures import ThreadPoolExecutor
 
     rid = _run_id.get()
-    if chunks:
+
+    def _dispatch_chunk_task(task):
+        kind, chunk = task
+        if kind == "work":
+            return _calc_full_work_chunk(
+                chunk, calc_date, CALC_INCREMENTAL, batch_ctx,
+            )
+        return _calc_stock_chunk(
+            chunk, calc_date, CALC_INCREMENTAL, batch_ctx,
+        )
+
+    if chunk_tasks:
         with ThreadPoolExecutor(
             max_workers=workers,
             initializer=set_run_id,
             initargs=(rid,),
         ) as executor:
-            results = list(executor.map(
-                _calc_stock_chunk,
-                chunks,
-                [calc_date] * len(chunks),
-                [CALC_INCREMENTAL] * len(chunks),
-                [batch_ctx] * len(chunks),
-            ))
+            results = list(executor.map(_dispatch_chunk_task, chunk_tasks))
         grand_total = sum(results)
     else:
         results = []
-        grand_total = 0
+        if batch_ctx:
+            grand_total = sum(
+                agg.calculated
+                for agg in batch_ctx.get("agg_by_key", {}).values()
+            )
+        else:
+            grand_total = 0
 
     batch_only = [c for c in codes_to_calc if c not in set(chunk_codes)]
-    if batch_only:
+    if batch_only and chunk_codes:
         for CalcCls in CALCULATORS:
             for freq in ("daily", "weekly"):
                 calc = CalcCls(con, freq)
@@ -1400,8 +1747,6 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
     if batch_ctx:
         from backend.etl.calc_indicators import CALC_ROUTE_SPECS
         for indicator_name, freq, CalcCls, _, _ in CALC_ROUTE_SPECS:
-            calc = CalcCls(con, freq)
-            n = _count_calc_rows(con, calc.dws_table, calc_date, codes_to_calc)
             agg = batch_ctx.get("agg_by_key", {}).get((indicator_name, freq), CalcResult())
             skip_parts = []
             for reason in SkipReason:
@@ -1410,6 +1755,11 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                     skip_parts.append(f"{reason.value}={len(items)}")
             skip_str = ", ".join(skip_parts) if skip_parts else "none skipped"
             if agg.calculated or skip_parts:
+                if chunk_codes:
+                    calc = CalcCls(con, freq)
+                    n = _count_calc_rows(con, calc.dws_table, calc_date, codes_to_calc)
+                else:
+                    n = agg.calculated
                 logger.info(
                     "calc %-30s BATCH — %d rows (%d calculated), %s",
                     f"{CalcCls.__name__} {freq}", n,
@@ -1425,6 +1775,15 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 "WHERE calc_date='%s' GROUP BY reason", calc_date)
     from backend.etl.calc_gate import get_ods_max_trade_date
 
+    chunk_stock_count = len({ts for ts, _ in full_items}) + len(fallthrough_codes)
+    batch_obs = {}
+    if batch_ctx:
+        batch_obs = {
+            "preflight_source": batch_ctx.get("preflight_source", "cold"),
+            "tails_load_skipped": batch_ctx.get("tails_load_skipped", False),
+            "preflight_elapsed_sec": batch_ctx.get("preflight_elapsed_sec", 0.0),
+            "state_upsert_mode": batch_ctx.get("state_upsert_mode", "per_stock"),
+        }
     log_etl_end(
         con, lid, "calc_dws", t0, "success", row_count=grand_total,
         data_completeness={
@@ -1432,7 +1791,15 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
             "stocks": len(codes_to_calc),
             "ods_max": get_ods_max_trade_date(con),
             "batch_only": len(codes_to_calc) - len(chunk_codes),
-            "chunk_stocks": len(chunk_codes),
+            "chunk_stocks": chunk_stock_count,
+            "chunk_work_items": chunk_work_items,
+            "batch_full_items": (
+                batch_ctx.get("batch_full_items", 0) if batch_ctx else 0
+            ),
+            "full_by_indicator": (
+                batch_ctx.get("full_by_indicator", {}) if batch_ctx else {}
+            ),
+            **batch_obs,
         },
     )
     run_checkpoint(con)

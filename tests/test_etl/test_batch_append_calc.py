@@ -528,6 +528,37 @@ def test_batch_append_kpattern_matches_per_stock_append():
     con.close()
 
 
+def test_batch_append_kpattern_via_quote_tail_columns():
+    """Regression: batch tails from quote_tail_columns must include pct_chg."""
+    import duckdb
+
+    from backend.etl.calc_batch_append import batch_append_kpattern
+    from backend.etl.calc_fast_skip import batch_load_quote_tails
+    from backend.etl.calc_indicators import quote_tail_columns
+    from backend.etl.calc_kpattern import KPatternCalculator
+
+    codes = ["KP1.SZ"]
+    con = duckdb.connect(":memory:")
+    dates = _setup_quote_baseline(con, KPatternCalculator, codes, n=200, ohlcv=True)
+    quote_tails = batch_load_quote_tails(
+        con, codes, "daily", quote_tail_columns("daily"), window=80,
+    )
+    assert "pct_chg" in quote_tails[codes[0]].columns
+
+    new_td = _append_new_bar(con, codes, dates, quote_tails)
+    calc_date = new_td
+    batch_append_kpattern(
+        con, "daily", codes, calc_date, quote_tails, {c: [new_td] for c in codes},
+    )
+    cnt = con.execute(
+        "SELECT COUNT(*) FROM dws_kpattern_daily "
+        "WHERE ts_code = ? AND trade_date = ? AND calc_date = ?",
+        [codes[0], new_td, calc_date],
+    ).fetchone()[0]
+    assert cnt == 1
+    con.close()
+
+
 def test_batch_append_volume_matches_per_stock_append():
     import duckdb
     import pandas as pd
@@ -711,17 +742,18 @@ def test_run_batch_append_phase_pure_append_empty_chunk(monkeypatch):
     new_td = f"41{260:06d}"
 
     def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde):
-        return {("macd", "daily"): ("APPEND", [new_td])}
+        return {("macd", "daily"): ("APPEND", [new_td])}, {}
 
     batch_calls = []
 
     def fake_batch_macd(*args, **kwargs):
         batch_calls.append(kwargs.get("ts_codes") or args[2])
-        return CalcResult(calculated=len(args[2]) if len(args) > 2 else 0)
+        n = len(args[2]) if len(args) > 2 else 0
+        return CalcResult(calculated=n), []
 
     route = [("macd", "daily", MACDCalculator, ["close_qfq"], "quote")]
     monkeypatch.setattr(
-        "backend.etl.calc_fast_skip.preflight_stock_modes_v2", fake_preflight,
+        "backend.etl.calc_fast_skip.preflight_stock_modes_with_fps", fake_preflight,
     )
     monkeypatch.setattr(
         "backend.etl.calc_fast_skip.batch_load_quote_tails",
@@ -794,6 +826,148 @@ def test_batch_append_loop_uses_single_insert(monkeypatch):
     assert calls["single"] == 0
 
 
+def test_batch_append_loop_emits_compute_progress(caplog, monkeypatch):
+    """batch_compute 批算循环应输出带中文标签的进度，避免假卡死。"""
+    import logging
+    import pandas as pd
+
+    from backend.etl import calc_batch_append as mod
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(mod, "insert_dws_batch_multi", lambda *a, **k: 1)
+
+    class FakeCalc:
+        con = None
+        dws_table = "dws_ma_daily"
+        SIGNATURE_COLS = ["close_qfq"]
+
+    df = pd.DataFrame({"trade_date": ["20260608"], "close_qfq": [10.0]})
+    data_groups = {"A.SZ": df}
+    new_bars_map = {"A.SZ": ["20260608"]}
+    dws_cols = [
+        "ts_code", "trade_date", "ma_5", "ma_10", "calc_date",
+        "input_fingerprint", "spec_version",
+    ]
+
+    mod._batch_append_loop(
+        FakeCalc(), ["A.SZ"], "20260608", data_groups, new_bars_map,
+        lambda c, code, frame, bars: frame,
+        dws_cols=dws_cols, float_cols=["ma_5", "ma_10"],
+        label_zh="均线日线",
+    )
+    msgs = [r.getMessage() for r in caplog.records if "calc.batch_compute" in r.getMessage()]
+    assert any("均线日线 开始" in m for m in msgs)
+    assert any("均线日线 完成" in m for m in msgs)
+
+
+def test_run_batch_append_skip_refresh_reuses_preflight_fp(monkeypatch):
+    """skip_refresh must not recompute state_signature — preflight fp cache is reused."""
+    import importlib
+
+    import duckdb
+    import numpy as np
+    import pandas as pd
+
+    from backend.db.schema import create_all_tables, ensure_calc_state_table
+    from backend.etl import calc_router
+    from backend.etl.calc_batch_append import run_batch_append_phase
+    from backend.etl.calc_fast_skip import batch_load_dde_tails, batch_load_quote_tails
+    from backend.etl.calc_indicators import CALC_ROUTE_SPECS, quote_tail_columns
+    from backend.etl.calc_router import state_signature
+    from backend.etl.calc_state import upsert_calc_state
+
+    monkeypatch.setenv("CALC_APPEND", "1")
+    monkeypatch.setenv("CALC_BATCH_APPEND", "1")
+    import backend.config as cfg
+    importlib.reload(cfg)
+
+    codes = ["BA.SZ", "BB.SZ"]
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    ensure_calc_state_table(con)
+    n_daily = 260
+    dates = [
+        (pd.Timestamp("2020-01-01") + pd.Timedelta(days=i)).strftime("%Y%m%d")
+        for i in range(n_daily)
+    ]
+    for d in dates:
+        con.execute(
+            "INSERT INTO dim_date (trade_date, is_trade_day, is_week_end) VALUES (?, 1, 0)",
+            [d],
+        )
+    rng = np.random.default_rng(42)
+    for j, code in enumerate(codes):
+        close = 10.0 + np.cumsum(rng.normal(0, 0.2, n_daily))
+        rows = []
+        for i, d in enumerate(dates):
+            c = float(close[i])
+            rows.append((code, d, c, c + 0.1, c - 0.1, c, 1000.0 + i, 0))
+        con.executemany(
+            "INSERT INTO dwd_daily_quote "
+            "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, is_suspended) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        for d in dates:
+            con.execute(
+                "INSERT INTO dwd_daily_moneyflow "
+                "(ts_code, trade_date, buy_lg_vol, sell_lg_vol, buy_elg_vol, sell_elg_vol, "
+                " total_vol, net_mf_amount) VALUES (?, ?, 10, 5, 3, 2, 1000, 1.5)",
+                [code, d],
+            )
+        week_dates = dates[::5][:60]
+        for i, d in enumerate(week_dates):
+            c = float(close[min(i * 5, len(close) - 1)])
+            con.execute(
+                "UPDATE dim_date SET is_week_end = 1 WHERE trade_date = ?", [d],
+            )
+            con.execute(
+                "INSERT INTO dwd_weekly_quote "
+                "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, "
+                "pct_chg, active_days) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 5)",
+                [code, d, c, c + 0.1, c - 0.1, c, 2000.0 + i],
+            )
+
+    calc_date = dates[-1]
+    for code in codes:
+        daily = batch_load_quote_tails(con, [code], "daily", quote_tail_columns("daily"))
+        weekly = batch_load_quote_tails(con, [code], "weekly", quote_tail_columns("weekly"))
+        dde_d = batch_load_dde_tails(con, [code], "daily")
+        dde_w = batch_load_dde_tails(con, [code], "weekly")
+        last_td = daily[code]["trade_date"].max()
+        for indicator_name, freq, CalcCls, sig_cols, source in CALC_ROUTE_SPECS:
+            if source == "quote":
+                df = daily[code] if freq == "daily" else weekly.get(code)
+            else:
+                df = dde_d.get(code) if freq == "daily" else dde_w.get(code)
+            if df is None or df.empty:
+                continue
+            fp = state_signature(df, last_td, sig_cols)
+            spec_ver = getattr(CalcCls, "SPEC_VERSION", "v1")
+            upsert_calc_state(
+                con, code, freq, indicator_name,
+                last_trade_date=last_td, history_fp=fp, calc_date=calc_date,
+                spec_version=spec_ver,
+            )
+
+    calls = {"n": 0}
+    orig = calc_router.state_signature
+
+    def counted(*args, **kwargs):
+        calls["n"] += 1
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(calc_router, "state_signature", counted)
+
+    ctx = run_batch_append_phase(con, codes, calc_date)
+    assert ctx is not None
+    assert ctx["chunk_codes"] == []
+    n_indicators = len(CALC_ROUTE_SPECS)
+    assert calls["n"] <= n_indicators * len(codes)
+    con.close()
+
+
 def test_insert_dws_batch_multi_writes_all_stocks_one_insert():
     """Multi-stock narrow write == sum of per-stock insert_dws_batch row counts."""
     import duckdb
@@ -836,4 +1010,246 @@ def test_insert_dws_batch_multi_writes_all_stocks_one_insert():
         "SELECT COUNT(*) FROM dws_macd_daily WHERE calc_date = ?", [calc_date],
     ).fetchone()[0]
     assert n_db == 2
+    con.close()
+
+
+def _make_minimal_preflight_ctx(codes, calc_date="20260611"):
+    from backend.etl.calc_preflight_context import CalcPreflightContext
+
+    stock_modes = {
+        c: {("macd", "daily"): ("SKIP", [])} for c in codes
+    }
+    fp_cache = {
+        c: {("macd", "daily"): "fp_cached"} for c in codes
+    }
+    return CalcPreflightContext(
+        calc_date=calc_date,
+        source="refresh_state",
+        stale_codes=list(codes),
+        state_map={},
+        daily_tails={c: None for c in codes},
+        weekly_tails={},
+        dde_daily={},
+        dde_weekly={},
+        stock_modes=stock_modes,
+        fp_cache_by_stock=fp_cache,
+    )
+
+
+def test_batch_append_hot_path_after_partial_ctx_merge(monkeypatch):
+    """ctx covers KEEP; PATCH merged in — cold merge only for PATCH."""
+    import duckdb
+
+    from backend.db.schema import create_all_tables, ensure_calc_state_table
+    from backend.etl.calc_batch_append import run_batch_append_phase
+    from backend.etl.calc_preflight_context import CalcPreflightContext
+
+    quote_calls = []
+
+    def patch_quote_tails(con, codes, freq, columns):
+        quote_calls.append((list(codes), freq))
+        return {c: None for c in codes}
+
+    preflight_calls = []
+
+    def patch_preflight(ts_code, *args, **kwargs):
+        preflight_calls.append(ts_code)
+        return {("macd", "daily"): ("SKIP", [])}, {"macd": "fp_patch"}
+
+    monkeypatch.setenv("CALC_APPEND", "1")
+    monkeypatch.setenv("CALC_BATCH_APPEND", "1")
+    monkeypatch.setenv("CALC_REUSE_REFRESH_CTX", "1")
+    import importlib
+    import backend.config as cfg
+    importlib.reload(cfg)
+
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.batch_load_quote_tails",
+        patch_quote_tails,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.batch_load_dde_tails",
+        lambda *a, **k: {},
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.preflight_stock_modes_with_fps",
+        patch_preflight,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state.load_calc_state_batch",
+        lambda *a, **k: {},
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state.upsert_calc_state_batch",
+        lambda *a, **k: 0,
+    )
+
+    codes = ["KEEP.SZ", "PATCH.SZ"]
+    ctx = CalcPreflightContext(
+        calc_date="20260611",
+        source="refresh_state",
+        stale_codes=["KEEP.SZ"],
+        state_map={},
+        daily_tails={"KEEP.SZ": None},
+        weekly_tails={},
+        dde_daily={},
+        dde_weekly={},
+        stock_modes={"KEEP.SZ": {("macd", "daily"): ("SKIP", [])}},
+        fp_cache_by_stock={"KEEP.SZ": {("macd", "daily"): "fp_keep"}},
+    )
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    ensure_calc_state_table(con)
+    result = run_batch_append_phase(con, codes, "20260611", preflight_ctx=ctx)
+    assert result is not None
+    assert result["preflight_source"] == "refresh"
+    assert all(call[0] == ["PATCH.SZ"] for call in quote_calls)
+    assert len(quote_calls) == 2
+    assert preflight_calls == ["PATCH.SZ"]
+    con.close()
+
+
+def test_batch_append_reuses_preflight_ctx(monkeypatch):
+    """Hot path must not call batch_load_quote_tails when ctx covers all codes."""
+    import duckdb
+
+    from backend.db.schema import create_all_tables, ensure_calc_state_table
+    from backend.etl.calc_batch_append import run_batch_append_phase
+
+    calls = {"quote_tails": 0, "dde_tails": 0, "preflight": 0}
+
+    def counting_quote_tails(*args, **kwargs):
+        calls["quote_tails"] += 1
+        return {}
+
+    def counting_dde_tails(*args, **kwargs):
+        calls["dde_tails"] += 1
+        return {}
+
+    def counting_preflight(*args, **kwargs):
+        calls["preflight"] += 1
+        return None, {}
+
+    monkeypatch.setenv("CALC_APPEND", "1")
+    monkeypatch.setenv("CALC_BATCH_APPEND", "1")
+    monkeypatch.setenv("CALC_REUSE_REFRESH_CTX", "1")
+    import importlib
+    import backend.config as cfg
+    importlib.reload(cfg)
+
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.batch_load_quote_tails",
+        counting_quote_tails,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.batch_load_dde_tails",
+        counting_dde_tails,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.preflight_stock_modes_with_fps",
+        counting_preflight,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state.load_calc_state_batch",
+        lambda *a, **k: {},
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state.upsert_calc_state_batch",
+        lambda *a, **k: 0,
+    )
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    ensure_calc_state_table(con)
+    codes = ["000001.SZ"]
+    ctx = _make_minimal_preflight_ctx(codes)
+    result = run_batch_append_phase(con, codes, "20260611", preflight_ctx=ctx)
+    assert result is not None
+    assert result["preflight_source"] == "refresh"
+    assert result["tails_load_skipped"] is True
+    assert calls["quote_tails"] == 0
+    assert calls["dde_tails"] == 0
+    assert calls["preflight"] == 0
+    con.close()
+
+
+def test_batch_append_state_uses_batch_upsert(monkeypatch):
+    """APPEND state refresh must use upsert_calc_state_batch, not per-stock write."""
+    import importlib
+
+    import duckdb
+    import pandas as pd
+
+    from backend.db.schema import create_all_tables, ensure_calc_state_table
+    from backend.etl.base import CalcResult
+    from backend.etl.calc_batch_append import run_batch_append_phase
+    from backend.etl.calc_ma import MACalculator
+
+    monkeypatch.setenv("CALC_APPEND", "1")
+    monkeypatch.setenv("CALC_BATCH_APPEND", "1")
+    monkeypatch.setenv("CALC_REUSE_REFRESH_CTX", "1")
+    import backend.config as cfg
+    importlib.reload(cfg)
+
+    upsert_calls = {"n": 0, "records": 0}
+
+    def counting_upsert(con, records):
+        upsert_calls["n"] += 1
+        upsert_calls["records"] += len(records)
+        return len(records)
+
+    def forbidden_write(*args, **kwargs):
+        raise AssertionError("per-stock write_calc_state_from_df forbidden")
+
+    monkeypatch.setattr(
+        "backend.etl.calc_state.upsert_calc_state_batch",
+        counting_upsert,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state.write_calc_state_from_df",
+        forbidden_write,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state.load_calc_state_batch",
+        lambda *a, **k: {},
+    )
+
+    ma_spec = (
+        "ma", "daily", MACalculator, MACalculator.SIGNATURE_COLS, "quote",
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_indicators.CALC_ROUTE_SPECS",
+        [ma_spec],
+    )
+
+    code = "SA.SZ"
+    calc_date = "20260611"
+    df_out = pd.DataFrame({"trade_date": [calc_date], "close_qfq": [10.0]})
+
+    def fake_ma_batch(*args, **kwargs):
+        return CalcResult(calculated=1), [(code, df_out, "fp_test", calc_date, calc_date)]
+
+    monkeypatch.setattr(
+        "backend.etl.calc_batch_append.batch_append_ma",
+        fake_ma_batch,
+    )
+
+    ctx_preflight = _make_minimal_preflight_ctx([code], calc_date=calc_date)
+    ctx_preflight.stock_modes = {
+        code: {("ma", "daily"): ("APPEND", [calc_date])},
+    }
+    ctx_preflight.fp_cache_by_stock = {
+        code: {("ma", "daily"): "fp_cached"},
+    }
+    ctx_preflight.daily_tails = {code: df_out}
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    ensure_calc_state_table(con)
+
+    result = run_batch_append_phase(con, [code], calc_date, preflight_ctx=ctx_preflight)
+    assert result is not None
+    assert upsert_calls["n"] >= 1
+    assert upsert_calls["records"] >= 1
     con.close()
