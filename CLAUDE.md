@@ -68,6 +68,15 @@ python -m backend.cli refresh-state --date 20260609 --dry-run
 python -m backend.cli repair-weekly            # dry-run 预览：错误周末数 + 各周线表孤儿行数
 python -m backend.cli repair-weekly --execute  # 重建 dim_date+dwd_weekly+删孤儿，之后再跑 calc 刷新
 
+# ===== B4 周线 DDE 趋势元数据一次性补洞（net_amount_dc + circ_mv，Plan C 按日）=====
+# backfill 期间禁止并行 run/calc（DuckDB 单写）
+python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --dry-run
+# 推荐：一条命令 ODS→DWD→refresh→DDE weekly 重算
+python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date 20260612 \
+  --sync-dwd --workers 3 --sync-dwd-batch 50 --recalc
+python -m backend.cli backfill-dde-meta --sync-dwd-only              # 中断恢复：仅 ODS→DWD
+python -m backend.cli backfill-dde-meta --recalc-only --date 20260612  # ODS/DWD 已就绪，仅 calc 闭环
+
 # 启动 API
 uvicorn backend.api.app:app --reload
 

@@ -426,6 +426,12 @@ def batch_append_dde(
         )
         seeds_by_code.update(batch_seeds)
 
+    daily_trend_groups: dict = {}
+    if freq == "weekly" and ts_codes:
+        daily_trend_groups = calc._load_daily_for_trend_batch(
+            ts_codes, end_date=calc_date,
+        )
+
     from backend.config import CALC_VECTOR_APPEND
     from backend.etl.progress import stock_progress
 
@@ -446,6 +452,7 @@ def batch_append_dde(
             continue
 
         seeds = seeds_by_code.get(ts_code)
+        daily_trend = daily_trend_groups.get(ts_code) if freq == "weekly" else None
         core = vector_cores.get(ts_code)
         if core is not None:
             import numpy as np
@@ -458,10 +465,15 @@ def batch_append_dde(
                 if td in td_set
             }
             out = calc._compute_dde_derived(
-                base, calc_date=calc_date, target_indices=target_idx or None,
+                base,
+                daily_for_trend=daily_trend,
+                calc_date=calc_date,
+                target_indices=target_idx or None,
             )
         else:
-            out = calc._compute_indicators(df, ema_seeds=seeds, calc_date=calc_date)
+            out = calc._compute_indicators(
+                df, ema_seeds=seeds, daily_for_trend=daily_trend, calc_date=calc_date,
+            )
         fp = compute_history_signature(out, calc.SIGNATURE_COLS)
         stock_rows.append((ts_code, out, fp, new_bars[0], new_bars[-1]))
         prog.tick()

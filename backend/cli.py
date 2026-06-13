@@ -10,6 +10,7 @@ Usage:
     python -m backend.cli query --ts-code 000001.SZ
     python -m backend.cli prune [--keep 5]
     python -m backend.cli repair-weekly [--execute]
+    python -m backend.cli backfill-dde-meta [--days 900] [--sync-dwd] [--recalc] [--workers 3]
     python -m backend.cli refresh-state [--date 20260609] [--dry-run]
     python -m backend.cli status
 """
@@ -533,6 +534,94 @@ def cmd_refresh_state(args):
         con.close()
 
 
+# ── backfill-dde-meta ──
+
+def cmd_backfill_dde_meta(args):
+    """Backfill net_amount_dc + circ_mv for B4 weekly DDE trend (ops)."""
+    from backend.db.connection import get_connection, run_checkpoint
+    from backend.fetch.backfill_dde_meta import (
+        MONEYFLOW_DC_MIN,
+        backfill_dde_meta_ods,
+        resolve_backfill_range,
+    )
+    from backend.etl.sync_dwd_dde_meta import sync_dwd_dde_meta
+    from backend.fetch.client import TushareClient
+
+    end = args.end or args.date or datetime.now().strftime("%Y%m%d")
+    since = args.since or MONEYFLOW_DC_MIN
+    start, end = resolve_backfill_range(end, days=args.days, since=since)
+    workers = args.workers
+    sync_batch = args.sync_dwd_batch if args.sync_dwd else 0
+    want_recalc = args.recalc or args.recalc_only
+    recalc_stats = None
+
+    con = get_connection()
+    try:
+        if args.recalc_only:
+            if args.dry_run:
+                from backend.etl.backfill_dde_recalc import prepare_dde_weekly_recalc
+                recalc_stats = prepare_dde_weekly_recalc(
+                    con, end, ts_codes=args.ts_code, dry_run=True,
+                )
+                print(f"DDE recalc (dry-run): {recalc_stats}")
+                return
+            from backend.etl.backfill_dde_recalc import prepare_dde_weekly_recalc
+            recalc_stats = prepare_dde_weekly_recalc(
+                con, end, ts_codes=args.ts_code, dry_run=False,
+            )
+            run_checkpoint(con)
+        elif not args.sync_dwd_only:
+            client = TushareClient()
+
+            def _sync_hook(c):
+                sync_dwd_dde_meta(c, ts_codes=args.ts_code, since=since)
+
+            stats = backfill_dde_meta_ods(
+                con, client, args.ts_code, start, end,
+                dry_run=args.dry_run,
+                workers=workers,
+                sync_dwd_batch=sync_batch,
+                on_batch_sync=_sync_hook if sync_batch else None,
+            )
+            print(f"ODS backfill: {stats}")
+
+            if args.dry_run:
+                if want_recalc:
+                    from backend.etl.backfill_dde_recalc import prepare_dde_weekly_recalc
+                    recalc_stats = prepare_dde_weekly_recalc(
+                        con, end, ts_codes=args.ts_code, dry_run=True,
+                    )
+                    print(f"DDE recalc (dry-run): {recalc_stats}")
+                return
+
+            if args.sync_dwd:
+                if not (sync_batch > 0):
+                    sync_stats = sync_dwd_dde_meta(
+                        con, ts_codes=args.ts_code, since=since,
+                    )
+                    print(f"DWD sync: {sync_stats}")
+        else:
+            if args.dry_run:
+                return
+            sync_stats = sync_dwd_dde_meta(con, ts_codes=args.ts_code, since=since)
+            print(f"DWD sync: {sync_stats}")
+
+        if want_recalc and not args.dry_run and not args.recalc_only:
+            from backend.etl.backfill_dde_recalc import prepare_dde_weekly_recalc
+            recalc_stats = prepare_dde_weekly_recalc(
+                con, end, ts_codes=args.ts_code, dry_run=False,
+            )
+            run_checkpoint(con)
+    finally:
+        con.close()
+
+    if recalc_stats is not None and not args.dry_run:
+        from backend.etl.backfill_dde_recalc import run_calc_force_hard_subprocess
+        print(f"DDE recalc prepare: {recalc_stats}")
+        run_calc_force_hard_subprocess(end, ts_codes=args.ts_code)
+        print("DDE recalc calc: subprocess ok")
+
+
 # ── repair-weekly ──
 
 def cmd_repair_weekly(args):
@@ -683,6 +772,31 @@ def main():
     bsp.add_argument("--date", help="Calc date YYYYMMDD (default: today)")
     bsp.add_argument("--ts-code", nargs="+", help="Stock codes (default: all active)")
 
+    # backfill-dde-meta
+    bdm = sp.add_parser(
+        "backfill-dde-meta",
+        help="Backfill net_amount_dc + circ_mv for B4 weekly DDE trend (ops)",
+    )
+    bdm.add_argument("--date", help="End date YYYYMMDD (default: today)")
+    bdm.add_argument("--end", help="Alias for --date")
+    bdm.add_argument("--since", default="20230911", help="moneyflow_dc min date")
+    bdm.add_argument("--days", type=int, default=900, help="Calendar-day lookback")
+    bdm.add_argument("--ts-code", nargs="+", help="Stock subset (default: all active, excl BSE)")
+    bdm.add_argument("--dry-run", action="store_true",
+                     help="Count gaps only, no API/DWD writes")
+    bdm.add_argument("--sync-dwd", action="store_true",
+                     help="After ODS backfill, sync ODS→DWD")
+    bdm.add_argument("--sync-dwd-only", action="store_true",
+                     help="Skip ODS API; DWD sync only")
+    bdm.add_argument("--workers", type=int, default=3,
+                     help="Parallel day-chunk workers (default 3; use 1 for debug)")
+    bdm.add_argument("--sync-dwd-batch", type=int, default=50,
+                     help="DWD sync every N completed trading days (0=end only; requires --sync-dwd)")
+    bdm.add_argument("--recalc", action="store_true",
+                     help="After ODS+DWD: refresh-state → invalidate dde weekly DWS → calc --force")
+    bdm.add_argument("--recalc-only", action="store_true",
+                     help="Skip ODS API; only run DDE weekly recalc closure (refresh+invalidate+calc)")
+
     # prune
     pp = sp.add_parser("prune", help="Prune superseded DWS snapshots (keep last N runs)")
     pp.add_argument("--keep", type=int, default=5,
@@ -719,6 +833,7 @@ def main():
         "export": cmd_export,
         "run": cmd_run,
         "backfill-state": cmd_backfill_state,
+        "backfill-dde-meta": cmd_backfill_dde_meta,
         "refresh-state": cmd_refresh_state,
         "prune": cmd_prune,
         "repair-weekly": cmd_repair_weekly,
