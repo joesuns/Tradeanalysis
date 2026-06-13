@@ -64,7 +64,8 @@ def db():
         CREATE TABLE dwd_daily_quote (
             ts_code TEXT, trade_date TEXT, close_qfq REAL,
             open_qfq REAL, high_qfq REAL, low_qfq REAL,
-            vol REAL, pct_chg REAL, is_suspended INTEGER DEFAULT 0
+            vol REAL, pct_chg REAL, total_mv REAL, circ_mv REAL,
+            is_suspended INTEGER DEFAULT 0
         )
     """)
     con.execute("""
@@ -101,7 +102,7 @@ class TestCalcSkipBehavior:
         from backend.etl.calc_macd import MACDCalculator
         for i in range(10):
             db.execute(
-                "INSERT INTO dwd_daily_quote VALUES (?, ?, 10.0, 10.0, 10.0, 10.0, 1000, 0, 0)",
+                "INSERT INTO dwd_daily_quote VALUES (?, ?, 10.0, 10.0, 10.0, 10.0, 1000, 0, 1e8, 5e7, 0)",
                 ("000001.SZ", f"202601{i:02d}"),
             )
         calc = MACDCalculator(db, "daily")
@@ -128,10 +129,11 @@ class TestCalcSkipBehavior:
         # DDE needs moneyflow table, not just daily_quote
         db.execute("""
             CREATE TABLE dwd_daily_moneyflow (
-                ts_code TEXT, trade_date TEXT, total_vol REAL,
+                ts_code TEXT, trade_date TEXT,
+                net_mf_vol REAL, net_mf_amount REAL,
                 buy_lg_vol REAL, sell_lg_vol REAL,
                 buy_elg_vol REAL, sell_elg_vol REAL,
-                net_mf_amount REAL
+                total_vol REAL, net_amount_dc REAL
             )
         """)
         calc = DDECalculator(db, "daily")
@@ -155,7 +157,7 @@ class TestCalcSkipBehavior:
         """)
         for i in range(40):
             db.execute(
-                "INSERT INTO dwd_daily_quote VALUES (?, ?, ?, 10.0, 10.0, 10.0, 1000, 0, 0)",
+                "INSERT INTO dwd_daily_quote VALUES (?, ?, ?, 10.0, 10.0, 10.0, 1000, 0, 1e8, 5e7, 0)",
                 ("000001.SZ", f"202601{i:02d}", 10.0 + i * 0.1),
             )
         calc = PricePositionCalculator(db, "daily")
@@ -167,7 +169,7 @@ class TestCalcSkipBehavior:
         """PricePositionCalculator with 1 row should still be skipped (need >= 2)."""
         from backend.etl.calc_price_position import PricePositionCalculator
         db.execute(
-            "INSERT INTO dwd_daily_quote VALUES ('000001.SZ', '20260601', 10.0, 10.0, 10.0, 10.0, 1000, 0, 0)",
+            "INSERT INTO dwd_daily_quote VALUES ('000001.SZ', '20260601', 10.0, 10.0, 10.0, 10.0, 1000, 0, 1e8, 5e7, 0)",
         )
         calc = PricePositionCalculator(db, "daily")
         result = calc.calculate(["000001.SZ"], "20260604")

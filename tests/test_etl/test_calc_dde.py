@@ -53,7 +53,26 @@ def _oracle_dde_trend_strength(ddx2, window=8):
     return result
 
 
-def test_dde_trend_matches_oracle_random():
+def _oracle_moneyflow_trend(net, mv, freq="daily"):
+    calc = DDECalculator.__new__(DDECalculator)
+    calc.freq = freq
+    return calc._compute_moneyflow_trend(net, mv)
+
+
+def test_dde_moneyflow_trend_matches_oracle_random():
+    calc = DDECalculator.__new__(DDECalculator)
+    calc.freq = "daily"
+    rng = np.random.default_rng(21)
+    for _ in range(30):
+        n = rng.integers(20, 90)
+        net = rng.normal(0, 5000, size=n)
+        mv = rng.uniform(1e8, 5e10, size=n)
+        got = calc._compute_moneyflow_trend(net, mv)
+        exp = _oracle_moneyflow_trend(net, mv, "daily")
+        assert got == exp
+
+
+def test_dde_ddx2_trend_matches_oracle_random():
     calc = DDECalculator.__new__(DDECalculator)
     rng = np.random.default_rng(21)
     for _ in range(40):
@@ -61,7 +80,7 @@ def test_dde_trend_matches_oracle_random():
         if rng.random() < 0.5:
             idx = rng.integers(0, len(ddx2), size=max(1, len(ddx2) // 6))
             ddx2[idx] = np.nan
-        assert calc._compute_trend(ddx2) == _oracle_dde_trend(ddx2)
+        assert calc._compute_ddx2_trend(ddx2) == _oracle_dde_trend(ddx2)
 
 
 def test_dde_trend_strength_matches_oracle_random():
@@ -213,89 +232,25 @@ def test_dde_alert_uses_ddx2():
     assert result is not None
 
 
-def test_dde_upturn_flat_alert():
-    """DDX2 prev 2 consecutive rises, then small change <= 2% → upturn_flat."""
+def test_dde_slope_inflection_bull_alert():
+    """123 adjacent-window slope flip → upturn_reverse."""
     calc = DDECalculator.__new__(DDECalculator)
-    n = 10
-    dates = [f"d{i}" for i in range(n)]
-    df = pd.DataFrame({
-        "trade_date": dates,
-        "ddx": [0.1] * n,
-        "ddx2": [0.080, 0.100, 0.120, 0.140, 0.141, 0.130, 0.120, 0.110, 0.100, 0.090],
-    })
+    n = 12
+    ddx2 = np.zeros(n, dtype=float)
+    ddx2[-6:] = [4.0, 3.0, 2.0, 1.0, 0.0, 5.0]
+    df = pd.DataFrame({"trade_date": [f"d{i}" for i in range(n)], "ddx2": ddx2})
     result = calc._compute_alerts(df)
-    # Index 4: prev 2 rises (0.12→0.14), |0.141-0.14|/0.14=0.7% < 2% → upturn_flat
-    assert result[4] == "upturn_flat", f"Expected upturn_flat, got {result[4]}"
+    assert result[-1] == "upturn_reverse"
 
 
-def test_dde_downturn_flat_alert():
-    """DDX2 prev 2 consecutive falls, then small change <= 2% → downturn_flat."""
+def test_dde_slope_inflection_bear_alert():
     calc = DDECalculator.__new__(DDECalculator)
-    n = 10
-    dates = [f"d{i}" for i in range(n)]
-    df = pd.DataFrame({
-        "trade_date": dates,
-        "ddx": [0.1] * n,
-        "ddx2": [0.140, 0.120, 0.100, 0.080, 0.079, 0.090, 0.100, 0.110, 0.120, 0.130],
-    })
+    n = 12
+    ddx2 = np.zeros(n, dtype=float)
+    ddx2[-6:] = [-4.0, -3.0, -2.0, -1.0, 0.0, -5.0]
+    df = pd.DataFrame({"trade_date": [f"d{i}" for i in range(n)], "ddx2": ddx2})
     result = calc._compute_alerts(df)
-    assert result[4] == "downturn_flat", f"Expected downturn_flat, got {result[4]}"
-
-
-def test_dde_divergence_window_60():
-    """Divergence uses exactly 60-bar window (not 61)."""
-    calc = DDECalculator.__new__(DDECalculator)
-    # Build 65 bars: price peaks at 60, DDX2 peaks earlier
-    n = 68
-    close = np.full(n, 10.0)
-    ddx2 = np.full(n, 0.1)
-    for i in range(30, 61):
-        close[i] = 10.0 + (i - 30) * 0.1
-    for i in range(30, 57):
-        ddx2[i] = 0.1 + (i - 30) * 0.01  # DDX2 peaks at day 56
-    for i in range(57, n):
-        ddx2[i] = ddx2[56] - (i - 56) * 0.01  # DDX2 declining
-    for i in range(61, n):
-        close[i] = close[60] * 0.99  # slight decline from peak
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close,
-        "ddx": ddx2,   # 新增：_compute_divergence 现在读 ddx 列
-        "ddx2": ddx2,
-    })
-    result = calc._compute_divergence(df)
-    # Should find divergence on confirmation day (not at peak)
-    divs = [i for i in range(n) if result[i] == "top_divergence"]
-    assert len(divs) >= 1, "Expected at least one top_divergence"
-
-
-def test_dde_divergence_no_tie_false_positive():
-    """DDX2 exactly equal to previous 60d peak should NOT trigger divergence."""
-    calc = DDECalculator.__new__(DDECalculator)
-    n = 70
-    close = np.full(n, 10.0)
-    ddx2 = np.full(n, 0.05)
-    for i in range(30, n):
-        close[i] = 10.0 + (i - 30) * 0.05  # steady price rise
-    for i in range(30, 65):
-        ddx2[i] = 0.05 + (i - 30) * 0.002  # DDX2 rises with price
-    # At day 65+, DDX2 plateaus at its 60d peak value — tied, not below
-    for i in range(65, n):
-        ddx2[i] = ddx2[64]  # exactly equals 60d peak
-    # Price continues rising → no divergence (DDX2 is AT peak, not below)
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close,
-        "ddx": ddx2,   # 新增：_compute_divergence 现在读 ddx 列
-        "ddx2": ddx2,
-    })
-    result = calc._compute_divergence(df)
-    for i in range(65, n):
-        assert result[i] != "top_divergence", (
-            f"Index {i}: DDX2 ties peak, should not be divergence"
-        )
+    assert result[-1] == "downturn_reverse"
 
 
 def test_dde_trend_8bar_window():
@@ -303,101 +258,30 @@ def test_dde_trend_8bar_window():
     calc = DDECalculator.__new__(DDECalculator)
     ddx2 = np.array([0.001, 0.002, 0.003, 0.004, 0.005,
                      0.006, 0.007, 0.008, 0.009, 0.010])
-    result = calc._compute_trend(ddx2, window=8)
-    assert result[9] is not None, "8-bar 窗口下第 9 根应有趋势值"
+    result = calc._compute_ddx2_trend(ddx2, window=8)
+    assert result[7] is not None, "8-bar 窗口下第 7 根应有 DDX2 趋势值"
 
 
-def test_dde_divergence_uses_ddx():
-    """背离检测使用原始 DDX（非 DDX2），信号更早触发。"""
-    calc = DDECalculator.__new__(DDECalculator)
+def test_dde_structure_spike_filtered():
+    """Isolated DDX spike in segment must not trigger structure top divergence."""
+    from backend.etl.divergence_structure import compute_dde_structure_divergence
+
     n = 68
     close = np.full(n, 10.0)
     ddx = np.full(n, 0.05)
-    for i in range(30, 57):
-        ddx[i] = 0.05 + (i - 30) * 0.01   # DDX 第 56 天见顶
-    for i in range(57, n):
-        ddx[i] = ddx[56] - (i - 56) * 0.01  # DDX 回落
-    for i in range(30, 61):
-        close[i] = 10.0 + (i - 30) * 0.1   # 价格第 60 天见顶
-    for i in range(61, n):
-        close[i] = close[60] * 0.99
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close, "ddx": ddx,
-    })
-    result = calc._compute_divergence(df)
-    div_indices = [i for i, v in enumerate(result) if v == "top_divergence"]
-    assert len(div_indices) >= 1, "DDX 背离应至少检测到一次"
-
-
-def test_dde_divergence_spike_filtered():
-    """单日 DDX 尖刺不应成为 60 日伪峰值触发假背离。"""
-    calc = DDECalculator.__new__(DDECalculator)
-    n = 68
-    close = np.full(n, 10.0)
-    ddx = np.full(n, 0.05)
-    ddx[55] = 0.50  # 单日尖刺 10x，邻域无确认
+    ddx2 = np.full(n, 0.03)
+    ddx[55] = 0.50  # isolated spike, neighbors < 0.8× peak
     for i in range(30, 61):
         close[i] = 10.0 + (i - 30) * 0.1
     for i in range(61, n):
         close[i] = close[60] * 0.99
 
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close, "ddx": ddx,
-    })
-    result = calc._compute_divergence(df)
+    result = compute_dde_structure_divergence(
+        close, ddx, ddx2, dedup=10, spike_filter_top=True, require_finite=True,
+    )
     for i in range(55, 60):
         assert result[i] != "top_divergence", (
-            f"idx {i}: 单日尖刺不应触发背离"
-        )
-
-
-def test_dde_bottom_div_triggers():
-    """DDX 谷值回升 >10% + 价格止跌 → DDE 底背离触发。"""
-    calc = DDECalculator.__new__(DDECalculator)
-    n = 68
-    close = np.full(n, 10.0)
-    ddx = np.full(n, 0.05)
-    for i in range(30, 58):
-        close[i] = 10.0 - (i - 30) * 0.1
-    for i in range(30, 56):
-        ddx[i] = 0.05 - (i - 30) * 0.01
-    ddx[55] = -0.20
-    for i in range(56, n):
-        ddx[i] = ddx[i-1] + 0.03              # DDX 快速回升
-        close[i] = close[57] * 1.001          # 价格在低点附近
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close, "ddx": ddx,
-    })
-    result = calc._compute_divergence(df)
-    any_bottom = any(r == "bottom_divergence" for r in result[58:])
-    assert any_bottom, "DDX回升>10%+价格止跌应触发底背离"
-
-
-def test_dde_top_div_spike_still_filtered():
-    """顶背离尖刺过滤仍然有效。"""
-    calc = DDECalculator.__new__(DDECalculator)
-    n = 68
-    close = np.full(n, 10.0)
-    ddx = np.full(n, 0.05)
-    ddx[55] = 0.50  # 单日尖刺
-    for i in range(30, 61):
-        close[i] = 10.0 + (i - 30) * 0.1
-    for i in range(61, n):
-        close[i] = close[60] * 0.99
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close, "ddx": ddx,
-    })
-    result = calc._compute_divergence(df)
-    for i in range(55, 60):
-        assert result[i] != "top_divergence", (
-            f"顶背离尖刺过滤应仍然有效，idx {i} 实际 {result[i]}"
+            f"idx {i}: spike-filtered DDX must not trigger top divergence"
         )
 
 
@@ -411,9 +295,9 @@ def test_integration_dde_daily(db_with_schema):
     # Insert 30 days of moneyflow and quote data
     for i in range(1, 31):
         con.execute(
-            "INSERT INTO dwd_daily_quote (ts_code, trade_date, close_qfq, is_suspended) "
-            "VALUES (?,?,?,0)",
-            ("TEST.SZ", f"202601{i:02d}", 10.0 + i * 0.1),
+            "INSERT INTO dwd_daily_quote (ts_code, trade_date, close_qfq, total_mv, is_suspended) "
+            "VALUES (?,?,?,?,0)",
+            ("TEST.SZ", f"202601{i:02d}", 10.0 + i * 0.1, 1e10),
         )
         con.execute(
             "INSERT INTO dwd_daily_moneyflow (ts_code, trade_date, buy_lg_vol, sell_lg_vol, "
@@ -444,7 +328,7 @@ def test_dde_trend_weighted_regression():
     # 前 4 天下降，后 4 天快速上升 → 加权回归应判 up
     ddx2 = np.array([0.010, 0.008, 0.006, 0.004, 0.003,
                      0.005, 0.008, 0.012, 0.016, 0.020])
-    result = calc._compute_trend(ddx2, window=8)
+    result = calc._compute_ddx2_trend(ddx2, window=8)
     assert result[9] == "up", (
         f"加权回归应捕捉近期上升势头，实际 {result[9]}"
     )
@@ -456,7 +340,7 @@ def test_dde_trend_weighted_flat():
 
     ddx2 = np.array([0.010, 0.011, 0.009, 0.010, 0.011,
                      0.009, 0.010, 0.010, 0.011, 0.009])
-    result = calc._compute_trend(ddx2, window=8)
+    result = calc._compute_ddx2_trend(ddx2, window=8)
     assert result[9] == "flat", (
         f"无明显趋势应判 flat，实际 {result[9]}"
     )
@@ -521,9 +405,11 @@ def _dde_schema(con):
         """CREATE TABLE dwd_daily_moneyflow (
             ts_code TEXT, trade_date TEXT, buy_lg_vol REAL, sell_lg_vol REAL,
             buy_elg_vol REAL, sell_elg_vol REAL, total_vol REAL,
-            net_mf_amount REAL, PRIMARY KEY (ts_code, trade_date))""",
+            net_mf_amount REAL, net_amount_dc REAL,
+            PRIMARY KEY (ts_code, trade_date))""",
         """CREATE TABLE dwd_daily_quote (
-            ts_code TEXT, trade_date TEXT, close_qfq REAL, is_suspended INTEGER,
+            ts_code TEXT, trade_date TEXT, close_qfq REAL, total_mv REAL,
+            circ_mv REAL, is_suspended INTEGER,
             PRIMARY KEY (ts_code, trade_date))""",
         """CREATE TABLE dwd_weekly_quote (
             ts_code TEXT, trade_date TEXT, close_qfq REAL,
@@ -543,11 +429,13 @@ def _seed_dde_two_stocks(con):
             for d in range(1, 6):
                 day = f"202601{w*7+d:02d}"
                 con.execute("INSERT OR REPLACE INTO dwd_daily_moneyflow VALUES "
-                            "(?,?,?,?,?,?,?,?)",
+                            "(?,?,?,?,?,?,?,?,?)",
                             (code, day, 100+random.random(), 50, 80, 30, 300,
-                             500+random.random()))
-                con.execute("INSERT OR REPLACE INTO dwd_daily_quote VALUES (?,?,?,0)",
-                            (code, day, 10.0 + random.random()))
+                             500+random.random(), None))
+                con.execute(
+                    "INSERT OR REPLACE INTO dwd_daily_quote VALUES (?,?,?,?,?,0)",
+                    (code, day, 10.0 + random.random(), 1e10, None),
+                )
                 is_we = 1 if d == 5 else 0
                 con.execute("INSERT OR REPLACE INTO dim_date VALUES (?, ?, 1)",
                             (day, is_we))
@@ -601,9 +489,11 @@ def test_load_weekly_produces_weekly_rows():
         """CREATE TABLE dwd_daily_moneyflow (
             ts_code TEXT, trade_date TEXT, buy_lg_vol REAL, sell_lg_vol REAL,
             buy_elg_vol REAL, sell_elg_vol REAL, total_vol REAL,
-            net_mf_amount REAL, PRIMARY KEY (ts_code, trade_date))""",
+            net_mf_amount REAL, net_amount_dc REAL,
+            PRIMARY KEY (ts_code, trade_date))""",
         """CREATE TABLE dwd_daily_quote (
-            ts_code TEXT, trade_date TEXT, close_qfq REAL, is_suspended INTEGER,
+            ts_code TEXT, trade_date TEXT, close_qfq REAL, total_mv REAL,
+            circ_mv REAL, is_suspended INTEGER,
             PRIMARY KEY (ts_code, trade_date))""",
         """CREATE TABLE dwd_weekly_quote (
             ts_code TEXT, trade_date TEXT, close_qfq REAL,
@@ -619,9 +509,12 @@ def test_load_weekly_produces_weekly_rows():
         for d in range(1, 6):
             day = f"202601{w*7+d:02d}"
             con.execute("INSERT OR REPLACE INTO dwd_daily_moneyflow "
-                        "VALUES ('TEST.SZ', ?, 100,50,80,30,300,500)", (day,))
-            con.execute("INSERT OR REPLACE INTO dwd_daily_quote "
-                        "VALUES ('TEST.SZ', ?, 10.0, 0)", (day,))
+                        "VALUES ('TEST.SZ', ?, 100,50,80,30,300,500,NULL)", (day,))
+            con.execute(
+                "INSERT OR REPLACE INTO dwd_daily_quote "
+                "VALUES ('TEST.SZ', ?, 10.0, 1e10, NULL, 0)",
+                (day,),
+            )
             is_we = 1 if d == 5 else 0
             con.execute("INSERT OR REPLACE INTO dim_date VALUES (?, ?, 1)",
                         (day, is_we))
@@ -653,9 +546,11 @@ def test_load_weekly_empty_stock():
         """CREATE TABLE dwd_daily_moneyflow (
             ts_code TEXT, trade_date TEXT, buy_lg_vol REAL, sell_lg_vol REAL,
             buy_elg_vol REAL, sell_elg_vol REAL, total_vol REAL,
-            net_mf_amount REAL, PRIMARY KEY (ts_code, trade_date))""",
+            net_mf_amount REAL, net_amount_dc REAL,
+            PRIMARY KEY (ts_code, trade_date))""",
         """CREATE TABLE dwd_daily_quote (
-            ts_code TEXT, trade_date TEXT, close_qfq REAL, is_suspended INTEGER,
+            ts_code TEXT, trade_date TEXT, close_qfq REAL, total_mv REAL,
+            circ_mv REAL, is_suspended INTEGER,
             PRIMARY KEY (ts_code, trade_date))""",
         """CREATE TABLE dwd_weekly_quote (
             ts_code TEXT, trade_date TEXT, close_qfq REAL,
@@ -682,9 +577,11 @@ def test_load_weekly_moneyflow_insufficient_coverage():
         """CREATE TABLE dwd_daily_moneyflow (
             ts_code TEXT, trade_date TEXT, buy_lg_vol REAL, sell_lg_vol REAL,
             buy_elg_vol REAL, sell_elg_vol REAL, total_vol REAL,
-            net_mf_amount REAL, PRIMARY KEY (ts_code, trade_date))""",
+            net_mf_amount REAL, net_amount_dc REAL,
+            PRIMARY KEY (ts_code, trade_date))""",
         """CREATE TABLE dwd_daily_quote (
-            ts_code TEXT, trade_date TEXT, close_qfq REAL, is_suspended INTEGER,
+            ts_code TEXT, trade_date TEXT, close_qfq REAL, total_mv REAL,
+            circ_mv REAL, is_suspended INTEGER,
             PRIMARY KEY (ts_code, trade_date))""",
         """CREATE TABLE dwd_weekly_quote (
             ts_code TEXT, trade_date TEXT, close_qfq REAL,
@@ -698,13 +595,16 @@ def test_load_weekly_moneyflow_insufficient_coverage():
     # 1 week of 5 trading days, but only 2 days have moneyflow (2/5 = 40% < 60%)
     for d in range(1, 6):
         day = f"2026010{d}"
-        con.execute("INSERT OR REPLACE INTO dwd_daily_quote "
-                    "VALUES ('TEST.SZ', ?, 10.0, 0)", (day,))
+        con.execute(
+            "INSERT OR REPLACE INTO dwd_daily_quote "
+            "VALUES ('TEST.SZ', ?, 10.0, 1e10, NULL, 0)",
+            (day,),
+        )
         con.execute("INSERT OR REPLACE INTO dim_date VALUES (?, ?, 1)",
                     (day, 1 if d == 5 else 0))
         if d <= 2:
             con.execute("INSERT OR REPLACE INTO dwd_daily_moneyflow "
-                        "VALUES ('TEST.SZ', ?, 100,50,80,30,300,500)", (day,))
+                        "VALUES ('TEST.SZ', ?, 100,50,80,30,300,500,NULL)", (day,))
     con.execute("INSERT OR REPLACE INTO dwd_weekly_quote "
                 "VALUES ('TEST.SZ', '20260105', 10.0)")
 
@@ -716,3 +616,48 @@ def test_load_weekly_moneyflow_insufficient_coverage():
         f"2/5=40% < 60% → _skip_dde should be 1, got {df['_skip_dde'].iloc[0]}")
 
     con.close()
+
+
+def test_weekly_trend_resamples_net_before_circ_join():
+    """Weekly net must sum all MF days in week, not only circ-overlap days."""
+    calc = DDECalculator.__new__(DDECalculator)
+    calc.freq = "weekly"
+    rows = []
+    for d, net, circ in [
+        ("2026-07-08", 100.0, None),
+        ("2026-07-09", 200.0, None),
+        ("2026-07-10", 300.0, None),
+        ("2026-07-11", 400.0, None),
+        ("2026-07-12", -500.0, 1e6),
+    ]:
+        rows.append({
+            "trade_date": d,
+            "net_mf_amount": net,
+            "net_amount_dc": net,
+            "circ_mv": circ,
+            "total_mv": None,
+        })
+    daily = pd.DataFrame(rows)
+    _, ddx3 = calc._build_123_weekly_dde_series(daily)
+    assert not ddx3.empty
+    # full-week net sum 100+200+300+400-500 = 500, not single-day -500
+    ddx, _ = calc._build_123_weekly_dde_series(daily)
+    assert abs(ddx.iloc[-1] - 0.05) < 1e-6
+
+
+def test_weekly_trend_nan_ddx3_tail_is_flat():
+    """123 polyfit on NaN ddx3 tail → flat, not ddx fallback."""
+    calc = DDECalculator.__new__(DDECalculator)
+    calc.freq = "weekly"
+    n = 11
+    daily = pd.DataFrame({
+        "trade_date": pd.date_range("2025-01-06", periods=n, freq="7D"),
+        "net_mf_amount": np.linspace(1000, 500, n),
+        "net_amount_dc": np.linspace(1000, 500, n),
+        "circ_mv": np.full(n, 1e6),
+        "total_mv": np.full(n, 1e6),
+    })
+    trend = calc._weekly_trend_from_daily(
+        daily, [daily["trade_date"].iloc[-1].strftime("%Y%m%d")],
+    )
+    assert trend[-1] == "flat"

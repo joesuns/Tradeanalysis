@@ -35,14 +35,17 @@ def test_route_calc_skip_writes_no_dws_rows():
     tails = batch_load_quote_tails(con, [ts], "daily", quote_tail_columns())
     df = tails[ts]
     last_td = str(df["trade_date"].max())
-    fp = state_signature(df, last_td, MACDCalculator(None, "daily").SIGNATURE_COLS)
-    upsert_calc_state(con, ts, "daily", "macd", last_td, fp, calc_date)
+    calc = MACDCalculator(con, "daily")
+    fp = state_signature(df, last_td, calc.SIGNATURE_COLS)
+    upsert_calc_state(
+        con, ts, "daily", "macd", last_td, fp, calc_date,
+        spec_version=calc.SPEC_VERSION,
+    )
 
     before = con.execute(
         "SELECT COUNT(*) FROM dws_macd_daily WHERE calc_date = ?", [calc_date],
     ).fetchone()[0]
 
-    calc = MACDCalculator(con, "daily")
     result = _route_calc(
         con, calc, "macd", "daily", ts, df, calc_date,
         calc_date, None, append_on=True,

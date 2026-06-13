@@ -8,45 +8,255 @@ from backend.etl.base import (
     weighted_window_slopes, sliding_window_mean_abs,
     compute_price_signal_divergence,
     insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
-    load_latest_fingerprints, load_quote_groups, SkipReason, CalcResult,
+    load_latest_fingerprints, load_latest_spec_versions,
+    load_quote_groups, SkipReason, CalcResult,
 )
 from backend.etl.recalc_spec import RecalcSpec
 
 logger = logging.getLogger(__name__)
+
+# B4 vol_trend / w_vol_trend: 123 ``volume_trend_v2`` (分位生态法) params
+VOLUME_TREND_V2_DAILY = {
+    "anchor_bars": 60,
+    "ma_window": 5,
+    "confirm_window": 10,
+    "confirm_count": 3,
+    "high_percentile": 80,
+    "low_percentile": 20,
+    "amp_threshold": 1.4,
+    "fast_count": 3,
+    "recent_count": 2,
+    "vol_flat_eps": 0.001,
+}
+
+VOLUME_TREND_V2_WEEKLY = {
+    "anchor_bars": 30,
+    "ma_window": 5,
+    "confirm_window": 8,
+    "confirm_count": 2,
+    "high_percentile": 80,
+    "low_percentile": 20,
+    "amp_threshold": 1.4,
+    "fast_count": 2,
+    "recent_count": 2,
+    "vol_flat_eps": 0.001,
+}
+
+_V2_DIRECTION_TO_TREND = {
+    "放量中": "expanding",
+    "缩量中": "shrinking",
+    "平量": "flat",
+}
+
+
+def _slope_over_mean_abs(y_values, denom_eps=1e-9):
+    """Tail linear slope / mean(|y|); matches 123 ``utils_volume.slope_over_mean_abs``."""
+    y = np.asarray(y_values, dtype=float)
+    y = y[np.isfinite(y)]
+    if len(y) < 2:
+        return None
+    x = np.arange(len(y), dtype=float)
+    try:
+        slope = float(np.polyfit(x, y, 1)[0])
+    except (np.linalg.LinAlgError, ValueError, TypeError):
+        return None
+    scale = float(np.mean(np.abs(y)) + denom_eps)
+    if not np.isfinite(scale) or scale <= 0:
+        return None
+    v = slope / scale
+    if not np.isfinite(v):
+        return None
+    return float(v)
+
+
+def volume_trend_v2(raw_volume_series, anchor_bars=60, ma_window=5,
+                    confirm_window=10, confirm_count=3,
+                    high_percentile=80, low_percentile=20,
+                    amp_threshold=1.4, fast_count=3, recent_count=2,
+                    vol_flat_eps=0.001):
+    """123 分位生态法量能趋势；返回 (score, label)。label 形如 ``正常区·放量中``。"""
+    y = np.asarray(raw_volume_series, dtype=float)
+    y = y[np.isfinite(y)]
+    if len(y) < anchor_bars:
+        return None, "数据不足"
+
+    ma = pd.Series(y).rolling(window=ma_window, min_periods=ma_window).mean()
+    ma = ma.dropna().to_numpy(dtype=float)
+    if len(ma) < anchor_bars:
+        return None, "数据不足"
+    anchor = ma[-anchor_bars:]
+    p80 = float(np.percentile(anchor, high_percentile))
+    p20 = float(np.percentile(anchor, low_percentile))
+
+    amp = p80 / max(p20, 1e-9)
+    if amp < amp_threshold:
+        regime = "振幅不足"
+    else:
+        recent_ma = ma[-confirm_window:] if len(ma) >= confirm_window else ma
+        if len(recent_ma) >= fast_count and bool(np.all(recent_ma[-fast_count:] >= p80)):
+            regime = "爆量区"
+        elif len(recent_ma) >= fast_count and bool(np.all(recent_ma[-fast_count:] <= p20)):
+            regime = "地量区"
+        else:
+            boom_days = int(np.sum(recent_ma >= p80))
+            dry_days = int(np.sum(recent_ma <= p20))
+            boom_recent = int(np.sum(recent_ma[-5:] >= p80)) if len(recent_ma) >= 5 else 0
+            dry_recent = int(np.sum(recent_ma[-5:] <= p20)) if len(recent_ma) >= 5 else 0
+            if boom_days >= confirm_count and boom_recent >= recent_count:
+                regime = "爆量区"
+            elif dry_days >= confirm_count and dry_recent >= recent_count:
+                regime = "地量区"
+            else:
+                regime = "正常区"
+
+    obs_5 = y[-5:] if len(y) >= 5 else y
+    dir_val = _slope_over_mean_abs(obs_5)
+    if dir_val is None:
+        dir_val = 0.0
+    if dir_val > vol_flat_eps:
+        direction = "放量中"
+    elif dir_val < -vol_flat_eps:
+        direction = "缩量中"
+    else:
+        direction = "平量"
+
+    label = f"{regime}·{direction}"
+    pct = float(np.searchsorted(np.sort(anchor), ma[-1]) / len(anchor) * 100.0)
+    eco_score = max(min((pct - 50.0) / 40.0, 1.0), -1.0)
+    trend_score = max(min(dir_val * 100.0, 1.0), -1.0)
+    score = round(float(max(min(eco_score * 0.4 + trend_score * 0.6, 1.0), -1.0)), 6)
+    return score, label
+
+
+def trend_from_v2_label(label: Optional[str]) -> Optional[str]:
+    """Map 123 v2 label to DWS trend enum (direction only for B4)."""
+    if label is None or label == "数据不足":
+        return None
+    if "·" in label:
+        direction = label.split("·", 1)[1].strip()
+    else:
+        direction = label.strip()
+    return _V2_DIRECTION_TO_TREND.get(direction)
+
+
+def compute_volume_trend_series(
+    vol_series,
+    params: dict,
+    target_indices: Optional[list] = None,
+) -> list:
+    """Per-bar ``volume_trend_v2`` on expanding prefixes; None until anchor met.
+
+    When ``target_indices`` is set (APPEND path), only those bar indices are
+    computed — each call uses ``vol[:i+1]`` identical to the full-series path.
+    Volume uses an ordered index **list**; MACD/DDE divergence uses a **set**
+    for output cropping only.
+    """
+    vol = np.asarray(vol_series, dtype=float)
+    n = len(vol)
+    anchor = int(params["anchor_bars"])
+    result = [None] * n
+    kw = {k: params[k] for k in params if k != "anchor_bars"}
+    indices = range(n) if target_indices is None else target_indices
+    for i in indices:
+        if i < 0 or i >= n:
+            continue
+        if i + 1 < anchor:
+            continue
+        _, label = volume_trend_v2(vol[: i + 1], anchor_bars=anchor, **kw)
+        result[i] = trend_from_v2_label(label)
+    return result
+
+
+def resolve_trend_target_indices(
+    df: pd.DataFrame, new_bars: list,
+) -> list:
+    """Map APPEND ``new_bars`` trade dates to row indices in ``df`` (no validation)."""
+    td_set = {str(d) for d in new_bars}
+    return [i for i, d in enumerate(df["trade_date"].astype(str)) if d in td_set]
+
+
+def require_trend_target_indices(
+    df: pd.DataFrame,
+    new_bars: Optional[list],
+    *,
+    ts_code: str = "",
+) -> list:
+    """APPEND gate: ``new_bars`` must 1:1 map to tail df row indices."""
+    prefix = f"ts_code={ts_code} " if ts_code else ""
+    if new_bars is None:
+        raise ValueError(f"{prefix}APPEND volume trend requires new_bars")
+    if len(new_bars) == 0:
+        raise ValueError(f"{prefix}APPEND volume trend new_bars must be non-empty")
+    indices = resolve_trend_target_indices(df, new_bars)
+    if len(indices) != len(new_bars):
+        str_bars = [str(d) for d in new_bars]
+        if len(set(str_bars)) != len(str_bars):
+            raise ValueError(
+                f"{prefix}duplicate dates in new_bars: {new_bars}"
+            )
+        td_in_df = set(df["trade_date"].astype(str))
+        missing = [s for s in str_bars if s not in td_in_df]
+        raise ValueError(
+            f"{prefix}new_bars not found in tail df: missing={missing} "
+            f"new_bars={new_bars} mapped={len(indices)}"
+        )
+    return indices
 
 
 class VolumeCalculator:
     """Volume indicator calculator.
 
     Computes MA5 volume, percentile rank, zone classification (explosive,
-    low_volume, normal), and trend (expanding, shrinking, flat).
+    low_volume, normal), and trend (expanding, shrinking, flat via 123 v2).
+    ``trend_strength`` remains ln(vol) weighted regression (non-B4).
     Works for both daily and weekly frequencies.
     """
+
+    # B4 vol_trend v2: bump invalidates fingerprint-only skip (pre-v2 DWS rows).
+    SPEC_VERSION = "v2"
 
     RECALC_SPEC_DAILY = RecalcSpec(lookback=120, seed=5, event_tail=5, min_rows=5)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=120, seed=5, event_tail=5, min_rows=5)
 
-    SIGNATURE_COLS = ["close_qfq", "vol"]
+    DWS_COLS = [
+        "ts_code", "trade_date", "ma_vol_5", "pct_vol_rank",
+        "zone", "trend", "volume_ratio", "trend_strength",
+        "divergence", "calc_date", "input_fingerprint", "spec_version",
+    ]
+    FLOAT_COLS = ["ma_vol_5", "pct_vol_rank", "volume_ratio", "trend_strength"]
 
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
         self.src_table = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
         self.dws_table = f"dws_volume_{freq}"
+        self.SIGNATURE_COLS = ["close_qfq", "vol"]
+        if freq == "weekly":
+            self.SIGNATURE_COLS = ["close_qfq", "vol", "active_days"]
+
+    @staticmethod
+    def quote_load_columns(freq: str) -> list:
+        cols = ["trade_date", "vol", "close_qfq"]
+        if freq == "weekly":
+            cols.append("active_days")
+        return cols
 
     def calculate(self, ts_codes: list[str], calc_date: str,
                   recalc_start: str = None,
                   quote_groups: dict = None) -> CalcResult:
         result = CalcResult()
         latest_fps = load_latest_fingerprints(self.con, self.dws_table, ts_codes)
+        latest_specs = load_latest_spec_versions(self.con, self.dws_table, ts_codes)
         if quote_groups is None:
             load_start = None
             if recalc_start:
                 from backend.etl.recalc_spec import resolve_load_start
                 load_start = resolve_load_start(self.con, recalc_start, self.freq)
-            groups = load_quote_groups(self.con, self.src_table, self.freq,
-                                       ["trade_date", "vol", "close_qfq"], ts_codes,
-                                       start_date=load_start)
+            groups = load_quote_groups(
+                self.con, self.src_table, self.freq,
+                self.quote_load_columns(self.freq), ts_codes,
+                start_date=load_start,
+            )
         else:
             groups = quote_groups
         for ts_code in ts_codes:
@@ -79,34 +289,38 @@ class VolumeCalculator:
 
     def _compute_indicators(self, df: pd.DataFrame,
                              zone_seed: Optional[str] = None) -> pd.DataFrame:
+        df = self._compute_volume_core(df)
+        return self._compute_volume_derived(df, zone_seed=zone_seed)
+
+    def _compute_volume_core(self, df: pd.DataFrame) -> pd.DataFrame:
         v = df["vol"].values.astype(float)
-
-        # MA5 volume
         df["ma_vol_5"] = sma(v, 5)
-
-        # Volume ratio: vol / MA5_vol
         df["volume_ratio"] = self._compute_volume_ratio(df)
-
-        # Percentile rank of MA5_vol within last 120 days
         df["pct_vol_rank"] = self._compute_pct_rank(df["ma_vol_5"].values, 120)
+        return df
 
-        # Zone: explosive / low_volume / normal (hysteresis; pass seed for append mode)
+    def _compute_volume_derived(
+        self, df: pd.DataFrame, zone_seed: Optional[str] = None,
+        trend_target_indices: Optional[list] = None,
+    ) -> pd.DataFrame:
+        v = df["vol"].values.astype(float)
         df["zone"] = self._compute_zone(df, zone_seed=zone_seed)
-
-        # Trend: linear regression slope on ln(raw_vol) over 10 days
-        df["trend"] = self._compute_trend(df["vol"].values, 10)
-
-        # Trend strength: de-unitized slope
+        vol_for_trend = v
+        if getattr(self, "freq", "daily") == "weekly" and "active_days" in df.columns:
+            ad = df["active_days"].astype(float).values
+            vol_for_trend = v * ad / 5.0
+        df["trend"] = self._compute_trend(
+            vol_for_trend, 10, target_indices=trend_target_indices,
+        )
         window = 10
         df["trend_strength"] = self._compute_trend_strength(df["vol"].values, window=window)
-
-        # Divergence: vol vs close over 60-day window
         df["divergence"] = self._compute_divergence(df)
-
         return df
 
     def _compute_indicators_append(self, df: pd.DataFrame,
-                                    zone_seed: Optional[str] = None) -> pd.DataFrame:
+                                    new_bars: list,
+                                    zone_seed: Optional[str] = None,
+                                    ts_code: str = "") -> pd.DataFrame:
         """Compute volume indicators for append / tail-window mode.
 
         Delegates to _compute_indicators with the zone_seed initialising the
@@ -116,9 +330,18 @@ class VolumeCalculator:
         The zone state at the first bar of df is seeded from zone_seed
         (the stored DWS zone of the bar immediately before df starts).
 
+        ``new_bars`` restricts ``volume_trend_v2`` to those indices only
+        (O(k) vs O(n²) expanding); other derived columns still use full tail.
+
         Callers must supply df with >= 120 bars for pct_vol_rank accuracy.
         """
-        return self._compute_indicators(df, zone_seed=zone_seed)
+        df = self._compute_volume_core(df)
+        trend_target = require_trend_target_indices(
+            df, new_bars, ts_code=ts_code,
+        )
+        return self._compute_volume_derived(
+            df, zone_seed=zone_seed, trend_target_indices=trend_target,
+        )
 
     def _fetch_zone_seed(self, ts_code: str, before_date: str) -> Optional[str]:
         """Return the stored zone of the last DWS bar strictly before before_date.
@@ -162,7 +385,9 @@ class VolumeCalculator:
         result = CalcResult()
         first_date = str(df["trade_date"].min())
         zone_seed = self._fetch_zone_seed(ts_code, before_date=first_date)
-        df = self._compute_indicators_append(df, zone_seed=zone_seed)
+        df = self._compute_indicators_append(
+            df, new_bars, zone_seed=zone_seed, ts_code=ts_code,
+        )
         fp = compute_history_signature(df, self.SIGNATURE_COLS)
         if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
                         write_start=new_bars[0], write_end=new_bars[-1]):
@@ -308,26 +533,24 @@ class VolumeCalculator:
             scales[i] = float(np.mean(np.abs(log_segment)))
         return slopes, scales, valid
 
-    def _compute_trend(self, vol_series: np.ndarray, window: int) -> list:
-        """Volume trend via exponentially weighted linear regression on ln(vol).
+    def _compute_trend(
+        self,
+        vol_series: np.ndarray,
+        window: int,
+        target_indices: Optional[list] = None,
+    ) -> list:
+        """B4 trend via 123 ``volume_trend_v2`` (daily anchor=60, weekly=30).
 
-        Weighted regression (decay=0.20) — same method as _compute_trend_strength
-        and DDE trend. Ensures trend direction and trend_strength never contradict.
-        - expanding: weighted_slope > 0.008
-        - shrinking: weighted_slope < -0.008
-        - flat: otherwise
+        ``window`` kept for API compatibility; v2 uses its own tail windows.
         """
-        slopes, _, valid = self._log_slope_and_scale(vol_series, window)
-        result = [None] * len(vol_series)
-        for i in np.nonzero(valid)[0]:
-            s = slopes[i]
-            if s > 0.008:
-                result[i] = "expanding"
-            elif s < -0.008:
-                result[i] = "shrinking"
-            else:
-                result[i] = "flat"
-        return result
+        params = (
+            VOLUME_TREND_V2_DAILY
+            if getattr(self, "freq", "daily") == "daily"
+            else VOLUME_TREND_V2_WEEKLY
+        )
+        return compute_volume_trend_series(
+            vol_series, params, target_indices=target_indices,
+        )
 
     def _compute_volume_ratio(self, df: pd.DataFrame) -> np.ndarray:
         """volume_ratio = vol / MA5_vol. NaN where MA5 not available."""
@@ -363,11 +586,8 @@ class VolumeCalculator:
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
                 input_fingerprint: str = None,
                 write_start: str = None, write_end: str = None):
-        dws_cols = ["ts_code", "trade_date", "ma_vol_5", "pct_vol_rank",
-                    "zone", "trend", "volume_ratio", "trend_strength",
-                    "divergence", "calc_date", "input_fingerprint", "spec_version"]
-        float_cols = ["ma_vol_5", "pct_vol_rank", "volume_ratio", "trend_strength"]
         return insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                                dws_cols, float_cols,
+                                self.DWS_COLS, self.FLOAT_COLS,
+                                spec_version=self.SPEC_VERSION,
                                 input_fingerprint=input_fingerprint,
                                 write_start=write_start, write_end=write_end)

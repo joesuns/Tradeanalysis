@@ -23,7 +23,17 @@ class KPatternCalculator:
     RECALC_SPEC_DAILY = RecalcSpec(lookback=60, seed=10, event_tail=5, min_rows=30)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=60, seed=10, event_tail=5, min_rows=30)
 
-    SIGNATURE_COLS = ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol"]
+    SIGNATURE_COLS = [
+        "open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol", "pct_chg",
+    ]
+
+    DWS_COLS = [
+        "ts_code", "trade_date", "yang_bao_yin", "yang_ke_yin",
+        "mu_bei_xian", "bi_lei_zhen", "gao_kai_chang_yin",
+        "yin_bao_yang", "yin_ke_yang", "strength", "calc_date",
+        "input_fingerprint", "spec_version",
+    ]
+    FLOAT_COLS = ["strength"]
 
     def __init__(self, con, freq: str = "daily"):
         self.con = con
@@ -401,12 +411,7 @@ class KPatternCalculator:
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
                 input_fingerprint: str = None,
                 write_start: str = None, write_end: str = None):
-        dws_cols = ["ts_code", "trade_date", "yang_bao_yin", "yang_ke_yin",
-                    "mu_bei_xian", "bi_lei_zhen", "gao_kai_chang_yin",
-                    "yin_bao_yang", "yin_ke_yang", "strength", "calc_date",
-                    "input_fingerprint", "spec_version"]
-        float_cols = ["strength"]
         return insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                                dws_cols, float_cols,
+                                self.DWS_COLS, self.FLOAT_COLS,
                                 input_fingerprint=input_fingerprint,
                                 write_start=write_start, write_end=write_end)

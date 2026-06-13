@@ -18,8 +18,9 @@ TS = "T.SZ"
 
 
 def _dates(n):
-    # Lexicographically sortable surrogate trade dates (calendar-agnostic).
-    return [f"30{i:06d}" for i in range(n)]
+    # Valid YYYYMMDD — MACD weekly B4 calls datetime.strptime(calc_date, "%Y%m%d").
+    base = pd.Timestamp("2020-01-01")
+    return [(base + pd.Timedelta(days=i)).strftime("%Y%m%d") for i in range(n)]
 
 
 def _setup(con, n):
@@ -68,7 +69,7 @@ def test_pipeline_routes_new_day_to_append_and_matches_full():
     assert st1 is not None and st1["last_trade_date"] == t1
 
     # New trading day arrives.
-    t2 = f"30{260:06d}"
+    t2 = (pd.Timestamp(dates[-1]) + pd.Timedelta(days=1)).strftime("%Y%m%d")
     _add_bar(con, t2, 12.34)
 
     calc_stock_pipeline(con, TS, calc_date=t2, daily_recalc=t2, weekly_recalc=None)

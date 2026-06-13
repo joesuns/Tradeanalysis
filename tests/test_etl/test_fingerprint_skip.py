@@ -300,6 +300,63 @@ def test_volume_calculator_skips_on_fingerprint_match():
     con.close()
 
 
+def test_volume_calculator_recalculates_when_spec_version_stale():
+    """Fingerprint match but pre-v2 spec_version must still recalculate."""
+    import duckdb
+    from backend.etl.calc_volume import VolumeCalculator
+    from backend.etl.base import compute_input_fingerprint
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE dwd_daily_quote (
+            ts_code TEXT, trade_date TEXT,
+            open_qfq REAL, high_qfq REAL, low_qfq REAL, close_qfq REAL,
+            vol REAL, amount REAL, pct_chg REAL,
+            total_mv REAL, pe_ttm REAL, turnover_rate REAL, volume_ratio REAL,
+            is_suspended INTEGER
+        )
+    """)
+    for i in range(30):
+        con.execute(
+            "INSERT INTO dwd_daily_quote VALUES "
+            "('TEST.SZ', ?, 10,11,9,10,100,1000,0,100,15,0.5,1,0)",
+            (f"202601{i:02d}",),
+        )
+    con.execute("""
+        CREATE TABLE dws_volume_daily (
+            ts_code TEXT, trade_date TEXT,
+            ma_vol_5 REAL, pct_vol_rank REAL, zone TEXT, trend TEXT,
+            volume_ratio REAL, trend_strength REAL, divergence TEXT,
+            calc_date TEXT, input_fingerprint TEXT, spec_version TEXT,
+            PRIMARY KEY (ts_code, trade_date, calc_date)
+        )
+    """)
+
+    calc = VolumeCalculator(con, "daily")
+    df = con.execute(
+        "SELECT * FROM dwd_daily_quote WHERE ts_code='TEST.SZ' ORDER BY trade_date"
+    ).df()
+    fp = compute_input_fingerprint(df)
+    con.execute("""
+        INSERT INTO dws_volume_daily VALUES
+        ('TEST.SZ', '20260129', 100, 50, 'normal', 'shrinking',
+         1, 0, NULL, '20260604', ?, 'v1')
+    """, [fp])
+
+    result = calc.calculate(["TEST.SZ"], "20260604")
+    assert result.calculated == 1
+    assert result.total_skipped == 0
+    row = con.execute("""
+        SELECT trend, spec_version FROM dws_volume_daily
+        WHERE ts_code='TEST.SZ' AND calc_date='20260604'
+        ORDER BY trade_date DESC LIMIT 1
+    """).fetchone()
+    assert row[1] == "v2"
+    assert row[0] != "shrinking" or row[0] in ("expanding", "shrinking", "flat")
+
+    con.close()
+
+
 def test_volume_calculator_recalculates_when_dwd_changes():
     """VolumeCalculator should recalculate when DWD data changes."""
     import duckdb

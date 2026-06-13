@@ -15,12 +15,13 @@ def test_recalc_spec_total():
 
 def test_resolve_recalc_bars_daily_current_registry():
     specs = collect_specs("daily")
-    assert resolve_recalc_bars(specs, safety=5) == 255
+    # MACD lookback=250 seed=26 event_tail=10 → total=286 dominates registry
+    assert resolve_recalc_bars(specs, safety=5) == 291
 
 
 def test_resolve_recalc_bars_weekly_current_registry():
     specs = collect_specs("weekly")
-    assert resolve_recalc_bars(specs, safety=5) == 255
+    assert resolve_recalc_bars(specs, safety=5) == 291
 
 
 def test_resolve_recalc_bars_empty():

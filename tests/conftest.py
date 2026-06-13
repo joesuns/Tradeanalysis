@@ -4,6 +4,14 @@ import os
 import tempfile
 
 
+def pytest_configure(config):
+    """Suppress environment-only warnings that do not indicate test failures."""
+    config.addinivalue_line(
+        "filterwarnings",
+        "ignore:urllib3 v2 only supports OpenSSL:urllib3.exceptions.NotOpenSSLWarning",
+    )
+
+
 @pytest.fixture
 def temp_db():
     """Create a temporary DuckDB database, auto-cleaned after test."""

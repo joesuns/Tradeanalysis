@@ -2,20 +2,27 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**立项：** 2026-06-12（pipeline M6 / 附录 D）。触发证据：`20260610` benchmark `chunk_stocks=5003`、`calc_dws=598s`；M4 墙钟 977s PASS 但附录 B chunk 门禁 FAIL。
+
+**用户审批（2026-06-12）：** 稳态真新日整条链路（**含 export**）≤30min；双档验收（稳态 vs 迁移日）；首个实施 **Task 5**（非 Phase 0）。子计划：`docs/superpowers/plans/2026-06-12-p4-indicator-chunk-impl.md`。
+
+**计划审计（2026-06-12）：** Phase 0 Task 0–1、Phase 1 Task 2、Phase 2 Task 4、Task 6 已 ship；`needs_full` 已移除。剩余核心：**Task 5 + Task 5b（Batch FULL）**。
+
 **Goal:** 在 **零指标语义变更、强签名门禁不变** 前提下，将 **真新日 calc 本体** 从实库 ~48–72 min 压到 **≤5 min（stretch ≤3 min）**，同日复跑 **≤60s**，端到端 `fetch+calc` **≤10 min**（fetch 单独立项）。
 
 **Architecture:** 当前性能瓶颈不是 CPU 公式，而是 **(1) 错误 calc_date 触发全量假跑**、**(2) 每股/每指标固定 I/O**、**(3) SKIP 仍可能写窄窗快照**、**(4) 2549 股 FULL chunk 占 ~48 min**（Run B 实库）。本方案分四支柱：**P0 数据质量门禁** → **P1 指标级执行图（打破 any-FULL 拖全股）** → **P2 物化尾窗 + 跨股向量化** → **P3 写入模型收敛（APPEND 只写新 bar）**。每层可独立开关、可 golden-master 验收。
 
 **Tech Stack:** Python 3.9、DuckDB、pandas、numpy、pytest；沿用 `dws_calc_state` / `classify_calc_mode` / `insert_dws_batch_multi`。
 
-**实库基线（2026-06-08/09 调查结论）：**
+**实库基线（2026-06-08/09 调查 + 2026-06-12 M4 签字）：**
 
 | 场景 | 当前 | 根因 | 目标 |
 |------|------|------|------|
 | 假新日（calc_date>ODS max） | **72 min**，10M 行无效快照 | 无 fail-fast；5388 股全 chunk partial_run | **拒绝运行** |
 | 真新日（20260608 Run B） | **62 min**（batch 10min + chunk 48min） | 2549 股 FULL chunk；周线窄窗重快照 | **≤5 min** |
+| 真新日（20260610 签字跑） | **598s calc** / 977s E2E；chunk **5003** | kpattern 签名变更 FULL 尖峰 + 整股 chunk poison | calc **≤300s**，chunk **<400** |
 | 真新日（稳定态 preflight） | 5183 batch_only / 341 chunk | 缺 state 136 + DDE 401 | chunk **≤400 股** |
-| 同日复跑 | **34s**（20260608）/ 630s（--force） | partial skip 未全 SKIP | **≤60s** |
+| 同日复跑 | **319s**（20260610 silent-gap）/ 630s（--force） | partial skip 未全 SKIP | **≤60s** |
 | 端到端 fetch+calc | fetch ~320s + calc | freshness 与 calc 串行 | **≤10 min**（calc≤5min） |
 
 **前置依赖：** `CALC_APPEND=1`、`CALC_BATCH_APPEND=1`、`CALC_FAST_SKIP=1`；性能专项 Task 1–7（`insert_dws_batch_multi` 等）已合入或待合入。
@@ -86,7 +93,7 @@ flowchart TD
 | `backend/etl/calc_executor.py` | **新建** — `CalcWorkQueue` / `run_indicator_batch` |
 | `backend/etl/build_dwd_tails.py` | **新建** — 物化 `dwd_quote_tail_245` |
 | `backend/db/schema.py` | 尾窗表 DDL + 索引 |
-| `backend/etl/calc_state.py` | 一次性 state 回填 CLI |
+| `backend/etl/calc_state_backfill.py` | 一次性 state 回填（`backfill-state` CLI） |
 | `backend/config.py` | `CALC_STRICT_DATE=1`、`CALC_VECTOR_APPEND=1` |
 | `tests/test_etl/test_calc_gate.py` | **新建** |
 | `tests/test_etl/test_calc_executor.py` | **新建** |
@@ -95,11 +102,11 @@ flowchart TD
 
 ---
 
-## Phase 0 — 数据质量门禁（P0，防 72min 假跑）
+## Phase 0 — 数据质量门禁（✅ 已 ship 2026-06-11）
 
-> **ROI：** 零公式改动；避免无效 10M 行写入；1 天内可 ship。
+> **ROI：** 零公式改动；避免无效 10M 行写入。
 
-### Task 0: `calc_gate` — calc_date 与 ODS 对齐
+### Task 0: `calc_gate` — calc_date 与 ODS 对齐（✅）
 
 **Files:**
 - Create: `backend/etl/calc_gate.py`
@@ -107,7 +114,7 @@ flowchart TD
 - Modify: `backend/cli.py`（`cmd_calc` / `cmd_run`）
 - Test: `tests/test_etl/test_calc_gate.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_etl/test_calc_gate.py
@@ -223,7 +230,7 @@ git commit -m "feat: reject calc_date ahead of ODS max to prevent phantom calc r
 
 ---
 
-### Task 1: `ods_etl_log` 可观测性 — 写入路由统计
+### Task 1: `ods_etl_log` 可观测性 — 写入路由统计（✅）
 
 **Files:**
 - Modify: `backend/etl/orchestrator.py`（`log_etl_end` data_completeness）
@@ -247,11 +254,11 @@ data_completeness={
 
 ---
 
-## Phase 1 — State 回填 + Gen4 验收（P0，chunk 从 2549→~341）
+## Phase 1 — State 回填 + Gen4 验收（Task 2 ✅；Task 3 稳态待复测）
 
 > **根因：** 136 股缺 quote state、401 股缺 DDE state → 永久 FULL。Run B 2549 FULL 远高于稳定态 341。
 
-### Task 2: 一次性 `backfill_calc_state` CLI
+### Task 2: 一次性 `backfill_calc_state` CLI（✅）
 
 **Files:**
 - Create: `backend/etl/calc_state_backfill.py`
@@ -304,7 +311,7 @@ grep -E 'batch_append|calc ALL DONE|partial_skip' /tmp/calc_bench.log
 
 > **核心改动：** chunk 不再处理「整股」，只处理 `CalcWorkItem(ts_code, indicator, freq, mode)` 队列。
 
-### Task 4: `CalcWorkQueue` 数据结构
+### Task 4: `CalcWorkQueue` 数据结构（✅ 数据结构已 ship；消费在 Task 5）
 
 **Files:**
 - Create: `backend/etl/calc_executor.py`
@@ -368,9 +375,33 @@ for indicator_name, CalcCls in specs:
 
 **预期收益：** 341 股 × 平均 1–2 指标 FULL × 窄窗 ≈ **5–15 min → 2–5 min**（较 Run B 48min chunk 量降 10×+）。
 
+**实施子计划：** `docs/superpowers/plans/2026-06-12-p4-indicator-chunk-impl.md`
+
 ---
 
-### Task 6: SKIP 零 DWS 写 硬断言
+### Task 5b: Batch FULL — 单指标 mass FULL 批算（新增，P0）
+
+> **根因：** 20260610 kpattern 周线签名变更 → ~5000 股 FULL；APPEND 批路径只处理 APPEND/SKIP，FULL 仍落 stock chunk。
+
+**Files:**
+- Modify: `backend/etl/calc_batch_append.py` — `run_batch_full_phase` 或扩展 batch 阶段
+- Modify: `backend/etl/orchestrator.py` — batch 后仅余少量 fallthrough 进 chunk worker
+- Test: `tests/test_etl/test_batch_full_equiv.py`（**新建**）
+
+**量化护栏（硬约束）：**
+- 每股独立递推，禁止跨股 EMA/zone 状态串扰
+- Batch FULL 输出 ≡ 逐股 `calc_stock_pipeline_selective` FULL（`atol=1e-9`）
+- 按 `(indicator,freq)` 分批；单批失败不污染其他指标
+
+- [ ] **Step 1:** golden — kpattern weekly mass FULL：batch vs 逐股 oracle
+- [ ] **Step 2:** `group_by_indicator(wq.full_items)` → 共享 tail 窄窗批算 + `insert_dws_batch_multi`
+- [ ] **Step 3:** `ods_etl_log` 增 `full_by_indicator`、`chunk_work_items`
+- [ ] **Step 4:** 实库 — 迁移日墙钟 vs 20260610 基线对比
+- [ ] **Step 5: Commit** — `perf: batch FULL for mass single-indicator migrations`
+
+---
+
+### Task 6: SKIP 零 DWS 写 硬断言（✅ 已 ship）
 
 **Files:**
 - Modify: `backend/etl/orchestrator.py` — `_route_calc` / batch SKIP 路径
@@ -458,16 +489,34 @@ CREATE INDEX IF NOT EXISTS idx_tail245_code_freq ON dwd_quote_tail_245(ts_code, 
 
 ---
 
-## 验收标准（全部 Phase 完成后）
+## 验收标准（双档 — 用户四条硬约束，2026-06-12 审批）
+
+### 稳态真新日（合同门禁）
 
 | 检查项 | 命令 | 目标 |
 |--------|------|------|
+| **整条链路 ≤30min（含 export）** | `python3 scripts/benchmark_run.py --date $ODS_MAX --run` | exit 0，墙钟 ≤1800s |
+| 数据质量 | `python3 scripts/health_check.py` | 无 CRITICAL |
+| calc 分项 | `ods_etl_log.calc_dws` | `chunk_stocks<400`，`calc_dws≤300s` |
+| 等价性 | `pytest tests/test_etl/test_append_calc.py -v` | 全绿 atol=1e-9 |
 | 假新日拒绝 | `calc --date 20991231` | ERROR，0 行 DWS |
-| 真新日 calc | `calc --date $ODS_MAX --force` | **≤5 min**，batch_only ≥90% |
-| 同日复跑 | 连续两次 calc 同 date | 第二次 **≤60s**，row 增量 0 |
-| 等价性 | `pytest tests/test_etl/test_append_calc.py tests/test_etl/test_vector_append.py` | 全绿 atol=1e-9 |
-| 质量 | `python scripts/health_check` | 全绿 |
-| 端到端 | `python -m backend.cli run` | **≤10 min**（含 fetch） |
+| 不全库 rebuild | 日志 grep | 无 `dwd.rebuild stocks=all` |
+
+### 迁移日（SIGNATURE/SPEC 变更）
+
+| 检查项 | 命令 | 目标 |
+|--------|------|------|
+| 可交付 | `benchmark_run --run` + `health_check` | exit 0 + 无 CRITICAL |
+| 截面一致 | L3 spot-check 脚本/手工 | 50 股 × 受影响指标，`atol=1e-9` |
+| 观测 | `full_by_indicator` | 记录 mass FULL，**不卡 chunk** |
+
+### Phase 3–4 完成后（stretch）
+
+| 检查项 | 目标 |
+|--------|------|
+| calc 本体 | ≤5 min |
+| 同日复跑 | 第二次 ≤60s |
+| 向量化 | `test_vector_append.py` 全绿 |
 
 ---
 
@@ -481,30 +530,81 @@ CREATE INDEX IF NOT EXISTS idx_tail245_code_freq ON dwd_quote_tail_245(ts_code, 
 | M3 向量化 | 3–4 | 1–2w | **≤5 min** | 中 |
 | M4 端到端 | 5 | 2–3d | run ≤10min | 低 |
 
-**推荐路径：** M0 → M1 → M2 先 ship（2 周内可交付 **~5× 提速**）；M3 向量化并行；M4 收尾端到端。
+**推荐路径（2026-06-12 修订）：** ~~M0~~ ✅ → **Task 5 + 5b**（2 周）→ M3 尾窗 → M4 向量化 → Phase 5 fetch。
 
 ---
 
-## Self-Review（plan vs 需求）
+## Self-Review（plan vs 用户四条硬约束）
 
-| 需求 | 任务 |
-|------|------|
-| 根本性解决 | Phase 2 执行图 + Phase 4 向量化 + Phase 6 零写 SKIP |
-| 数据质量 | 强签名不变；Phase 0 门禁；golden 测试 |
-| 越快越好 | 目标 5min calc / 60s 同日复跑 / 10min E2E |
-| 调查根因覆盖 | Phase 0 假新日；Phase 1 state；Phase 2 chunk poison |
-| Gen4 不足 | Task 3 验收后进入 Phase 2+ |
+| # | 用户要求 | 任务 | 稳态可达 |
+|---|---------|------|---------|
+| 1 | 整条链路 ≤30min（含 export） | M1–M3 + Task 5/5b | **是**（典型 8–20min） |
+| 2 | 数据质量 | 强签名 + golden + health_check | **是** |
+| 3 | 无不必要计算 | Task 5/5b + DWD 增量 | **是**（迁移日 FULL 必要） |
+| 4 | 不全库 rebuild | stale 子集（已落地） | **是** |
 
 **Placeholder scan:** 无 TBD。
 
 ---
 
-## Execution Handoff
+## Execution Handoff（2026-06-12 用户已审批）
 
-Plan complete and saved to `docs/superpowers/plans/2026-06-09-calc-fundamental-performance.md`. Two execution options:
+**首个 Task：** ~~Phase 2 Task 5 + 5b~~ ✅ **已 ship**（2026-06-12）
 
-**1. Subagent-Driven (recommended)** — 按 Phase 0 → 1 → 2 派发子 agent，每 Task 后 review + pytest
+**当前 Task（M1 P0）：** `docs/superpowers/plans/2026-06-13-calc-preflight-context-p0.md` — `CalcPreflightContext` 热路径
 
-**2. Inline Execution** — 本会话用 executing-plans 连续执行，Phase 0 完成后 checkpoint
+**下一 Task（M2 P1）：** 见下文 **附录 M2 — Vector Append 分层**（M1 签字后立项，**禁止与 M1 同 PR**）
 
-**Which approach?**
+**模式：** Subagent-Driven — 每 Task 后架构师 review + pytest + 稳态 benchmark（含 export）
+
+---
+
+## 附录 — 量化/架构验收合同（L1–L6，2026-06-13 整合）
+
+| 级别 | 内容 | 门槛 | 失败 |
+|------|------|------|------|
+| **L1** | `pytest tests/ -v` | 全绿 | No-Go |
+| **L2** | `test_append_calc.py` | APPEND≡FULL `atol=1e-9` | No-Go |
+| **L3** | 结构背离 golden + smoke 25 | 无新增 diff | No-Go |
+| **L4** | B4 硬门禁 12 列 | `diff_vs_123` 无 hard 回归 | No-Go |
+| **L5** | `benchmark_run --run` | 稳态真新日墙钟 ≤1800s（含 export） | KPI（不替代 L1–L4） |
+| **L6** | 路由不变量 | 稳态 `chunk=0`；迁移日 `full_by_indicator` 可观测 | No-Go |
+
+**M1 附加 KPI：** `preflight_source=refresh` 时 `batch_tails`+`batch_preflight` 合计 **<15s**。
+
+**M2 附加：** 随机 100 股 latest 行 blind diff（离散列完全相等，连续列 `atol=1e-9`）。
+
+---
+
+## 附录 M2 — Vector Append 分层（待 M1 后立项）
+
+**触发：** M1 签字 + 真新日 E2E 仍 **>30min**（预期 ~58min）。
+
+**实施顺序（分 PR）：**
+
+| 波次 | 内容 | 文件 | 验收 |
+|------|------|------|------|
+| **M2a** | MACD/DDE EMA 跨股向量化；Volume `pct_rank` 向量化 | `backend/etl/vector/macd_batch.py`、`volume_batch.py`；`CALC_VECTOR_APPEND=1` | `tests/test_etl/test_vector_append.py` |
+| **M2b** | 结构背离 **new_bars 输出裁剪**（全窗输入不变） | `divergence_structure.py` 扩展 `target_indices` | L3 golden |
+| **M2c** | `volume_trend_v2` profiling → 做或不做 | spike only | 不阻塞 M2a/b 发布 |
+| **并行** | 周五 `week_end` 真新日 benchmark | `benchmark_run` | 附录 B 单独一行 |
+
+**禁止：** 关 `DWD_REBUILD_REFRESH_STATE`；缩 `SIG_WINDOW`；`vector/` 内复制 `b4_macd.py`（须 import 唯一源）。
+
+**目标墙钟（周四真新日）：** M1+M2 E2E **15–20min**（含 export）。
+
+---
+
+## 附录 — 0fd66428 真新日基线（2026-06-11）
+
+| 桶 | 秒 |
+|----|-----|
+| fetch+DWD | 29 |
+| refresh_state | 344 |
+| 路由重复（tails+preflight） | ~387 |
+| batch_state | 345 |
+| batch_compute（MACD/量能/DDE） | 2496 |
+| export | 105 |
+| **E2E** | **4078（68min）** |
+
+路由：`chunk=0` `batch_only=5389` `batch_full=5`；`health_check` PASS。

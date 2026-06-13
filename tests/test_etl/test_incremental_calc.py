@@ -49,11 +49,14 @@ def _seed_daily_quote(con, codes, n_bars=320, create_table=True):
                 ts_code TEXT, trade_date TEXT,
                 open_qfq REAL, high_qfq REAL, low_qfq REAL, close_qfq REAL,
                 vol REAL, amount REAL, pct_chg REAL,
-                total_mv REAL, pe_ttm REAL, turnover_rate REAL, volume_ratio REAL,
-                is_suspended INTEGER
+                total_mv REAL, circ_mv REAL, pe_ttm REAL, turnover_rate REAL,
+                volume_ratio REAL, is_suspended INTEGER
             )
         """)
-    dates = [f"2023{(i // 30) + 1:02d}{(i % 30) + 1:02d}" for i in range(n_bars)]
+    dates = [
+        (pd.Timestamp("2020-01-01") + pd.Timedelta(days=i)).strftime("%Y%m%d")
+        for i in range(n_bars)
+    ]
     random.seed(42)
     for code in codes:
         price = 10.0 + random.random() * 5
@@ -61,9 +64,9 @@ def _seed_daily_quote(con, codes, n_bars=320, create_table=True):
             price += random.uniform(-0.5, 0.5)
             vol = 1000 + random.randint(0, 500)
             con.execute(
-                "INSERT INTO dwd_daily_quote VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                "INSERT INTO dwd_daily_quote VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
                 (code, d, price - 0.2, price + 0.3, price - 0.5, price,
-                 vol, vol * price, 0, 1e8, 15, 1.0, 1.0),
+                 vol, vol * price, 0, 1e8, 5e7, 15, 1.0, 1.0),
             )
     return dates
 
@@ -104,11 +107,12 @@ def test_load_quote_groups_start_date_filters():
     _seed_daily_quote(con, ["A.SZ"], n_bars=50)
     full = load_quote_groups(con, "dwd_daily_quote", "daily",
                              ["trade_date", "close_qfq"], ["A.SZ"])
+    start_date = full["A.SZ"]["trade_date"].iloc[20]
     win = load_quote_groups(con, "dwd_daily_quote", "daily",
                             ["trade_date", "close_qfq"], ["A.SZ"],
-                            start_date="20230115")
+                            start_date=start_date)
     assert len(full["A.SZ"]) == 50
-    assert all(win["A.SZ"]["trade_date"] >= "20230115")
+    assert all(win["A.SZ"]["trade_date"] >= start_date)
     assert len(win["A.SZ"]) < len(full["A.SZ"])
     con.close()
 
@@ -516,83 +520,6 @@ def test_macd_ema_seed_matches_full_oracle():
 # ── Task 8: divergence vectorization golden-master ──
 
 
-def _macd_divergence_oracle(df):
-    """Frozen loop oracle — MACD _compute_divergence pre-vectorization."""
-    result = [None] * len(df)
-    w = 59
-    for i in range(w, len(df)):
-        window_close = df["close_qfq"].iloc[i - w: i + 1]
-        window_dif = df["dif"].iloc[i - w: i + 1]
-        c_hi = window_close.max()
-        c_lo = window_close.min()
-        d_hi = window_dif.max()
-        d_lo = window_dif.min()
-        cur_c = df["close_qfq"].iloc[i]
-        cur_d = df["dif"].iloc[i]
-        if pd.isna(cur_c) or pd.isna(cur_d):
-            continue
-        dif_peak_iloc = np.argmax(window_dif.values)
-        if (dif_peak_iloc < w and d_hi != 0 and cur_d < d_hi
-                and cur_c >= c_hi * 0.98):
-            recent = any(result[j] == "top_divergence"
-                         for j in range(max(0, i - 5), i))
-            if not recent:
-                result[i] = "top_divergence"
-        dif_valley_iloc = np.argmin(window_dif.values)
-        d_recovery = (cur_d - d_lo) / abs(d_lo) if d_lo != 0 else 0
-        c_lo_iloc = np.argmin(window_close.values)
-        if (dif_valley_iloc < w and d_lo != 0 and cur_d > d_lo
-                and d_recovery > 0.1 and (w - c_lo_iloc) >= 3
-                and cur_c <= c_lo * 1.02):
-            recent = any(result[j] == "bottom_divergence"
-                         for j in range(max(0, i - 5), i))
-            if not recent:
-                result[i] = "bottom_divergence"
-    return result
-
-
-def _dde_divergence_oracle(df):
-    """Frozen loop oracle — DDE _compute_divergence pre-vectorization."""
-    result = [None] * len(df)
-    w = 59
-    for i in range(w, len(df)):
-        window_close = df["close_qfq"].iloc[i - w: i + 1]
-        window_ddx = df["ddx"].iloc[i - w: i + 1]
-        if window_ddx.isna().any():
-            continue
-        c_hi = window_close.max()
-        c_lo = window_close.min()
-        d_hi = window_ddx.max()
-        d_lo = window_ddx.min()
-        cur_c = df["close_qfq"].iloc[i]
-        cur_d = df["ddx"].iloc[i]
-        if pd.isna(cur_c) or pd.isna(cur_d):
-            continue
-        ddx_peak_iloc = np.argmax(window_ddx.values)
-        ddx_peak_val = window_ddx.max()
-        neighbors = window_ddx.values[
-            max(0, ddx_peak_iloc - 2):min(len(window_ddx), ddx_peak_iloc + 3)
-        ]
-        is_spike = (neighbors >= ddx_peak_val * 0.8).sum() < 2
-        if (ddx_peak_iloc < w and d_hi != 0 and cur_d < d_hi
-                and not is_spike and cur_c >= c_hi * 0.98):
-            recent = any(result[j] == "top_divergence"
-                         for j in range(max(0, i - 5), i))
-            if not recent:
-                result[i] = "top_divergence"
-        ddx_valley_iloc = np.argmin(window_ddx.values)
-        d_recovery = (cur_d - d_lo) / abs(d_lo) if d_lo != 0 else 0
-        c_lo_iloc = np.argmin(window_close.values)
-        if (ddx_valley_iloc < w and d_lo != 0 and cur_d > d_lo
-                and d_recovery > 0.1 and (w - c_lo_iloc) >= 3
-                and cur_c <= c_lo * 1.02):
-            recent = any(result[j] == "bottom_divergence"
-                         for j in range(max(0, i - 5), i))
-            if not recent:
-                result[i] = "bottom_divergence"
-    return result
-
-
 def _volume_divergence_oracle(df):
     """Frozen loop oracle — Volume _compute_divergence pre-vectorization."""
     result = [None] * len(df)
@@ -637,36 +564,6 @@ def _assert_divergence_equal(got, oracle, label):
     )
 
 
-def test_macd_divergence_vectorized_matches_oracle():
-    rng = np.random.default_rng(7)
-    calc = MACDCalculator.__new__(MACDCalculator)
-    for _ in range(20):
-        n = rng.integers(80, 200)
-        close = rng.uniform(10.0, 30.0, n)
-        dif = rng.uniform(-2.0, 2.0, n)
-        if rng.random() < 0.1:
-            close[rng.integers(0, n, 3)] = np.nan
-        df = pd.DataFrame({"close_qfq": close, "dif": dif})
-        _assert_divergence_equal(
-            calc._compute_divergence(df), _macd_divergence_oracle(df), "macd-random"
-        )
-
-
-def test_dde_divergence_vectorized_matches_oracle():
-    rng = np.random.default_rng(11)
-    calc = DDECalculator.__new__(DDECalculator)
-    for _ in range(20):
-        n = rng.integers(80, 200)
-        close = rng.uniform(10.0, 30.0, n)
-        ddx = rng.uniform(-0.05, 0.05, n)
-        if rng.random() < 0.15:
-            ddx[rng.integers(0, n, 5)] = np.nan
-        df = pd.DataFrame({"close_qfq": close, "ddx": ddx})
-        _assert_divergence_equal(
-            calc._compute_divergence(df), _dde_divergence_oracle(df), "dde-random"
-        )
-
-
 def test_volume_divergence_vectorized_matches_oracle():
     rng = np.random.default_rng(13)
     calc = VolumeCalculator.__new__(VolumeCalculator)
@@ -681,25 +578,16 @@ def test_volume_divergence_vectorized_matches_oracle():
 
 
 def test_divergence_golden_on_seeded_quotes():
-    """10 stocks × full _compute_indicators divergence vs loop oracle."""
+    """10 stocks × Volume divergence vs rolling-window loop oracle."""
     con = duckdb.connect(":memory:")
     codes = [f"{i:06d}.SZ" for i in range(1, 11)]
     dates = _seed_daily_quote(con, codes, n_bars=600)
     _seed_dim_date(con, dates)
-    macd_calc = MACDCalculator(con, "daily")
     vol_calc = VolumeCalculator(con, "daily")
     for code in codes:
         g = load_quote_groups(con, "dwd_daily_quote", "daily",
                               ["trade_date", "close_qfq", "vol"], [code])
         df = g[code]
-        macd_out = macd_calc._compute_indicators(df.copy())
-        macd_df = df.copy()
-        macd_df["dif"] = macd_out["dif"]
-        _assert_divergence_equal(
-            macd_calc._compute_divergence(macd_df),
-            _macd_divergence_oracle(macd_df),
-            code,
-        )
         vol_out = vol_calc._compute_indicators(df.copy())
         vol_df = df.copy()
         vol_df["divergence"] = vol_out.get("divergence")

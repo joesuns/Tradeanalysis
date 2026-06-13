@@ -12,6 +12,7 @@ from backend.etl.calc_fast_skip import (
     batch_load_dde_tails,
     preflight_stock_modes,
     preflight_stock_modes_v2,
+    preflight_stock_modes_with_fps,
     partition_preflight_modes,
     stock_can_fast_skip,
 )
@@ -47,8 +48,9 @@ def _seed_week_end(con, ts_code, dates, closes):
         )
         con.execute(
             "INSERT INTO dwd_weekly_quote "
-            "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, pct_chg) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, "
+            "pct_chg, active_days) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 5)",
             [ts_code, d, c, c + 0.1, c - 0.1, c, 2000.0 + i],
         )
 
@@ -81,19 +83,22 @@ def _minimal_db(con, n_daily=260):
 
 def _all_states_skip(con, ts_code, last_td, df_daily, df_weekly):
     state_map = {}
-    for indicator_name, freq, _, sig_cols, source in CALC_ROUTE_SPECS:
+    for indicator_name, freq, CalcCls, sig_cols, source in CALC_ROUTE_SPECS:
         if source == "quote":
             df = df_daily if freq == "daily" else df_weekly
         else:
             df = batch_load_dde_tails(con, [ts_code], freq).get(ts_code)
         fp = state_signature(df, last_td, sig_cols)
+        spec_ver = getattr(CalcCls, "SPEC_VERSION", "v1")
         upsert_calc_state(con, ts_code, freq, indicator_name,
-                          last_trade_date=last_td, history_fp=fp, calc_date="20260602")
+                          last_trade_date=last_td, history_fp=fp, calc_date="20260602",
+                          spec_version=spec_ver)
         state_map[(ts_code, freq, indicator_name)] = {
             "last_trade_date": last_td,
             "history_fp": fp,
             "quote_latest_adj": None,
             "updated_calc_date": "20260602",
+            "spec_version": spec_ver,
         }
     return state_map
 
@@ -117,9 +122,8 @@ def test_fallthrough_on_missing_stock():
 def test_fallthrough_on_empty_dde():
     con = duckdb.connect(":memory:")
     _minimal_db(con)
-    tail_cols = quote_tail_columns()
-    daily = batch_load_quote_tails(con, [TS], "daily", tail_cols)
-    weekly = batch_load_quote_tails(con, [TS], "weekly", tail_cols)
+    daily = batch_load_quote_tails(con, [TS], "daily", quote_tail_columns("daily"))
+    weekly = batch_load_quote_tails(con, [TS], "weekly", quote_tail_columns("weekly"))
     state_map = {}
     modes = preflight_stock_modes(TS, state_map, daily.get(TS), weekly.get(TS),
                                   None, None)
@@ -127,13 +131,33 @@ def test_fallthrough_on_empty_dde():
     con.close()
 
 
+def test_preflight_stock_modes_v2_returns_fp_cache_on_skip():
+    """All-SKIP preflight must cache fingerprints for skip_refresh reuse."""
+    con = duckdb.connect(":memory:")
+    _minimal_db(con)
+    daily = batch_load_quote_tails(con, [TS], "daily", quote_tail_columns("daily"))
+    weekly = batch_load_quote_tails(con, [TS], "weekly", quote_tail_columns("weekly"))
+    dde_d = batch_load_dde_tails(con, [TS], "daily")
+    dde_w = batch_load_dde_tails(con, [TS], "weekly")
+    last_td = daily[TS]["trade_date"].max()
+    state_map = _all_states_skip(con, TS, last_td, daily[TS], weekly.get(TS))
+
+    modes, fp_cache = preflight_stock_modes_with_fps(
+        TS, state_map, daily[TS], weekly.get(TS), dde_d.get(TS), dde_w.get(TS),
+    )
+    assert modes is not None
+    assert all(m == "SKIP" for m, _ in modes.values())
+    assert ("macd", "daily") in fp_cache
+    assert len(fp_cache[("macd", "daily")]) == 16
+    con.close()
+
+
 def test_fast_skip_state_ahead_of_calc_date():
     """last_td > calc_date: tail load must not cap at calc_date."""
     con = duckdb.connect(":memory:")
     _minimal_db(con, n_daily=270)
-    tail_cols = quote_tail_columns()
-    daily = batch_load_quote_tails(con, [TS], "daily", tail_cols)
-    weekly = batch_load_quote_tails(con, [TS], "weekly", tail_cols)
+    daily = batch_load_quote_tails(con, [TS], "daily", quote_tail_columns("daily"))
+    weekly = batch_load_quote_tails(con, [TS], "weekly", quote_tail_columns("weekly"))
     dde_d = batch_load_dde_tails(con, [TS], "daily")
     dde_w = batch_load_dde_tails(con, [TS], "weekly")
     last_td = daily[TS]["trade_date"].max()
@@ -149,7 +173,7 @@ def test_fast_skip_state_ahead_of_calc_date():
 def test_batch_quote_tails_tail_matches_slow_path():
     con = duckdb.connect(":memory:")
     _minimal_db(con)
-    tail_cols = quote_tail_columns()
+    tail_cols = quote_tail_columns("daily")
     tails = batch_load_quote_tails(con, [TS], "daily", tail_cols)
     slow = load_quote_groups(con, "dwd_daily_quote", "daily", tail_cols, [TS])
     slow_tail = slow[TS].tail(SIG_WINDOW).reset_index(drop=True)
@@ -167,12 +191,32 @@ def test_dde_weekly_tail_matches_load_weekly_batch():
     con.close()
 
 
+def test_dde_daily_tail_matches_load_daily_batch():
+    con = duckdb.connect(":memory:")
+    _minimal_db(con)
+    tails = batch_load_dde_tails(con, [TS], "daily")
+    calc = DDECalculator(con, "daily")
+    slow = calc._load_daily_batch([TS])[TS].tail(SIG_WINDOW).reset_index(drop=True)
+    pd.testing.assert_frame_equal(tails[TS], slow)
+    con.close()
+
+
+def test_load_daily_batch_tail_window_limits_rows():
+    con = duckdb.connect(":memory:")
+    _minimal_db(con)
+    calc = DDECalculator(con, "daily")
+    full = calc._load_daily_batch([TS], tail_window=None)[TS]
+    tailed = calc._load_daily_batch([TS], tail_window=SIG_WINDOW)[TS]
+    assert len(tailed) <= SIG_WINDOW
+    pd.testing.assert_frame_equal(tailed, full.tail(SIG_WINDOW).reset_index(drop=True))
+    con.close()
+
+
 def test_fast_skip_unsafe_on_dwd_change():
     con = duckdb.connect(":memory:")
     _minimal_db(con)
-    tail_cols = quote_tail_columns()
-    daily = batch_load_quote_tails(con, [TS], "daily", tail_cols)
-    weekly = batch_load_quote_tails(con, [TS], "weekly", tail_cols)
+    daily = batch_load_quote_tails(con, [TS], "daily", quote_tail_columns("daily"))
+    weekly = batch_load_quote_tails(con, [TS], "weekly", quote_tail_columns("weekly"))
     dde_d = batch_load_dde_tails(con, [TS], "daily")
     dde_w = batch_load_dde_tails(con, [TS], "weekly")
     last_td = daily[TS]["trade_date"].max()
@@ -183,7 +227,7 @@ def test_fast_skip_unsafe_on_dwd_change():
         "UPDATE dwd_daily_quote SET close_qfq = close_qfq + 1 WHERE ts_code = ?",
         [TS],
     )
-    daily2 = batch_load_quote_tails(con, [TS], "daily", tail_cols)
+    daily2 = batch_load_quote_tails(con, [TS], "daily", quote_tail_columns("daily"))
     modes = preflight_stock_modes(
         TS, state_map, daily2[TS], weekly.get(TS), dde_d.get(TS), dde_w.get(TS),
     )
@@ -204,9 +248,8 @@ def test_fast_skip_equivalent_to_slow_path_skip():
     calc_stock_pipeline(con, TS, calc_date, daily_recalc=calc_date, weekly_recalc=None)
 
     state_map = load_calc_state_batch(con, [TS])
-    tail_cols = quote_tail_columns()
-    daily = batch_load_quote_tails(con, [TS], "daily", tail_cols)
-    weekly = batch_load_quote_tails(con, [TS], "weekly", tail_cols)
+    daily = batch_load_quote_tails(con, [TS], "daily", quote_tail_columns("daily"))
+    weekly = batch_load_quote_tails(con, [TS], "weekly", quote_tail_columns("weekly"))
     dde_d = batch_load_dde_tails(con, [TS], "daily")
     dde_w = batch_load_dde_tails(con, [TS], "weekly")
 
@@ -257,25 +300,27 @@ def test_preflight_bse_empty_dde_treated_as_skip_not_fallthrough():
     week_dates = dates[::5][:6]
     _seed_week_end(con, bj, week_dates, close[: len(week_dates)])
 
-    tail_cols = quote_tail_columns()
-    daily = batch_load_quote_tails(con, [bj], "daily", tail_cols)
-    weekly = batch_load_quote_tails(con, [bj], "weekly", tail_cols)
+    daily = batch_load_quote_tails(con, [bj], "daily", quote_tail_columns("daily"))
+    weekly = batch_load_quote_tails(con, [bj], "weekly", quote_tail_columns("weekly"))
     last_td = daily[bj]["trade_date"].max()
     state_map = {}
-    for indicator_name, freq, _, sig_cols, source in CALC_ROUTE_SPECS:
+    for indicator_name, freq, CalcCls, sig_cols, source in CALC_ROUTE_SPECS:
         if source != "quote":
             continue
         df = daily[bj] if freq == "daily" else weekly.get(bj)
         if df is None or df.empty:
             continue
         fp = state_signature(df, last_td, sig_cols)
+        spec_ver = getattr(CalcCls, "SPEC_VERSION", "v1")
         upsert_calc_state(con, bj, freq, indicator_name,
-                          last_trade_date=last_td, history_fp=fp, calc_date="20260602")
+                          last_trade_date=last_td, history_fp=fp, calc_date="20260602",
+                          spec_version=spec_ver)
         state_map[(bj, freq, indicator_name)] = {
             "last_trade_date": last_td,
             "history_fp": fp,
             "quote_latest_adj": None,
             "updated_calc_date": "20260602",
+            "spec_version": spec_ver,
         }
 
     modes = preflight_stock_modes_v2(

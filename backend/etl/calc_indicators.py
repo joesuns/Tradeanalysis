@@ -19,11 +19,11 @@ CALC_ROUTE_SPECS = [
     ("ma", "daily", MACalculator, ["close_qfq"], "quote"),
     ("ma", "weekly", MACalculator, ["close_qfq"], "quote"),
     ("kpattern", "daily", KPatternCalculator,
-     ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol"], "quote"),
+     ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol", "pct_chg"], "quote"),
     ("kpattern", "weekly", KPatternCalculator,
-     ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol"], "quote"),
+     ["open_qfq", "high_qfq", "low_qfq", "close_qfq", "vol", "pct_chg"], "quote"),
     ("volume", "daily", VolumeCalculator, ["close_qfq", "vol"], "quote"),
-    ("volume", "weekly", VolumeCalculator, ["close_qfq", "vol"], "quote"),
+    ("volume", "weekly", VolumeCalculator, ["close_qfq", "vol", "active_days"], "quote"),
     ("priceposition", "daily", PricePositionCalculator, ["close_qfq"], "quote"),
     ("priceposition", "weekly", PricePositionCalculator, ["close_qfq"], "quote"),
     ("dde", "daily", DDECalculator, DDE_SIG_COLS, "dde"),
@@ -32,14 +32,30 @@ CALC_ROUTE_SPECS = [
 
 
 def quote_sig_col_union() -> list:
-    """Union of SIGNATURE_COLS for quote-sourced indicators (excludes trade_date)."""
+    """Union of SIGNATURE_COLS for quote-sourced indicators (diagnostics only).
+
+    Batch tail loading uses quote_pipeline_columns(), not this union.
+    """
     cols = set()
     for _, _, _, sig_cols, source in CALC_ROUTE_SPECS:
         if source == "quote":
             cols.update(sig_cols)
+    # active_days exists only on dwd_weekly_quote — never SELECT on daily loads
+    cols.discard("active_days")
     return sorted(cols)
 
 
-def quote_tail_columns() -> list:
-    """Columns for batch_load_quote_tails including trade_date."""
-    return ["trade_date"] + quote_sig_col_union()
+def quote_pipeline_columns(freq: str) -> list:
+    """Canonical quote compute-input columns (per-stock pipeline + batch tails)."""
+    cols = [
+        "trade_date", "open_qfq", "high_qfq", "low_qfq",
+        "close_qfq", "vol", "pct_chg",
+    ]
+    if freq == "weekly":
+        cols.append("active_days")
+    return cols
+
+
+def quote_tail_columns(freq: str = "daily") -> list:
+    """Columns for batch_load_quote_tails — same as per-stock pipeline quote load."""
+    return quote_pipeline_columns(freq)

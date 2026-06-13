@@ -63,8 +63,20 @@ def test_fetch_stocks_incremental_skips_when_complete():
     """When data is already complete, only trade_cal is called — no data APIs."""
     con = duckdb.connect(":memory:")
     con.execute("CREATE TABLE ods_daily (ts_code TEXT, trade_date TEXT)")
+    con.execute(
+        "CREATE TABLE ods_daily_basic (ts_code TEXT, trade_date TEXT, circ_mv REAL)",
+    )
+    con.execute(
+        "CREATE TABLE ods_moneyflow (ts_code TEXT, trade_date TEXT, net_amount_dc REAL)",
+    )
     for d in ["20260101", "20260102", "20260103"]:
         con.execute("INSERT INTO ods_daily VALUES ('FULL.SZ', ?)", (d,))
+        con.execute(
+            "INSERT INTO ods_daily_basic VALUES ('FULL.SZ', ?, 1.0)", (d,),
+        )
+        con.execute(
+            "INSERT INTO ods_moneyflow VALUES ('FULL.SZ', ?, 1.0)", (d,),
+        )
 
     api_calls = []
 
@@ -448,3 +460,43 @@ def test_fetch_stocks_incremental_bulk_inserts_all_layers(db_with_schema):
     assert nb == 2
     nm = con.execute("SELECT COUNT(*) FROM ods_moneyflow").fetchone()[0]
     assert nm == 2
+
+
+def test_fetch_stocks_incremental_backfills_net_amount_dc_only(db_with_schema):
+    """已有 moneyflow 行但 net_amount_dc 为空时，仅补拉 moneyflow_dc。"""
+    from backend.fetch.ods_daily import fetch_stocks_incremental
+
+    con = db_with_schema
+    con.execute("""
+        INSERT INTO ods_daily VALUES
+        ('DC.SZ','20240102',10,12,9,11,100,1000,0,1.0,now())
+    """)
+    con.execute("""
+        INSERT INTO ods_moneyflow
+        (ts_code, trade_date, net_mf_amount, net_amount_dc, fetched_at)
+        VALUES ('DC.SZ','20240102',999.0,NULL,now())
+    """)
+
+    calls = []
+
+    class FakeClient:
+        def call(self, api, **kwargs):
+            calls.append((api, kwargs))
+            if api == "trade_cal":
+                return [{"cal_date": "20240102"}]
+            if api == "moneyflow_dc":
+                return [{"trade_date": "20240102", "net_amount": -1088.0}]
+            return []
+
+    n = fetch_stocks_incremental(
+        FakeClient(), con, ["DC.SZ"], start="20240102", end="20240102",
+    )
+    assert n == 1
+    assert ("moneyflow_dc", {"ts_code": "DC.SZ", "start_date": "20240102",
+                             "end_date": "20240102"}) in calls
+    assert not any(c[0] == "daily" for c in calls)
+    assert not any(c[0] == "moneyflow" for c in calls)
+    dc = con.execute(
+        "SELECT net_amount_dc FROM ods_moneyflow WHERE ts_code='DC.SZ'"
+    ).fetchone()[0]
+    assert dc == pytest.approx(-1088.0)

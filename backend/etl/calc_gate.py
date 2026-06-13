@@ -1,10 +1,20 @@
 """Calc date validation against ODS tail — prevents phantom calc runs."""
-from typing import Optional
+import json
+from typing import Any, Dict, Optional
 import logging
 
 import duckdb
 
 logger = logging.getLogger(__name__)
+
+_MUTATING_ETL_STEPS = (
+    "cli_fetch",
+    "fetch_market_data",
+    "run_fetch",
+    "build_dwd",
+    "run_rebuild_dwd",
+    "run_refresh_state",
+)
 
 
 def get_ods_max_trade_date(con) -> Optional[str]:
@@ -40,3 +50,66 @@ def assert_calc_date_ready(con, calc_date: str, strict: bool = True) -> None:
         if strict:
             raise ValueError(msg)
         logger.warning(msg)
+
+
+def _parse_calc_completeness(raw: Optional[str]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def get_last_calc_log(con, calc_date: str) -> Optional[Dict[str, Any]]:
+    """Latest successful calc_dws log row for calc_date, or None."""
+    row = con.execute("""
+        SELECT started_at, data_completeness
+        FROM ods_etl_log
+        WHERE step_name = 'calc_dws' AND status = 'success'
+          AND data_completeness IS NOT NULL AND data_completeness != ''
+          AND (
+            json_extract_string(data_completeness, '$.calc_date') = ?
+            OR data_completeness LIKE ?
+          )
+        ORDER BY started_at DESC LIMIT 1
+    """, [calc_date, f'%"calc_date": "{calc_date}"%']).fetchone()
+    if not row:
+        return None
+    comp = _parse_calc_completeness(row[1])
+    if comp.get("calc_date") != calc_date:
+        return None
+    return {
+        "started_at": row[0],
+        "data_completeness": comp,
+    }
+
+
+def has_prior_calc_snapshot(con, calc_date: str) -> bool:
+    """True when calc_date has a prior successful ETL log or mature DWS snapshot."""
+    if get_last_calc_log(con, calc_date):
+        return True
+    n = con.execute(
+        "SELECT COUNT(DISTINCT ts_code) FROM dws_macd_daily WHERE calc_date = ?",
+        [calc_date],
+    ).fetchone()[0]
+    return n >= 4000
+
+
+def data_mutated_since_last_calc(con, calc_date: str) -> bool:
+    """True when ODS tail or fetch/rebuild ran after the last calc for calc_date."""
+    last = get_last_calc_log(con, calc_date)
+    if not last:
+        return True
+    prior_ods = last["data_completeness"].get("ods_max")
+    current_ods = get_ods_max_trade_date(con)
+    if prior_ods and current_ods and prior_ods != current_ods:
+        return True
+    started_at = last["started_at"]
+    placeholders = ",".join(["?"] * len(_MUTATING_ETL_STEPS))
+    n = con.execute(f"""
+        SELECT COUNT(*) FROM ods_etl_log
+        WHERE started_at > ? AND status = 'success'
+          AND step_name IN ({placeholders})
+    """, [started_at, *_MUTATING_ETL_STEPS]).fetchone()[0]
+    return n > 0

@@ -28,22 +28,41 @@ def state_signature(df: "pd.DataFrame", last_td: str, sig_cols: List[str],
     return compute_history_signature(hist, sig_cols)
 
 
+def classify_calc_mode_detail(
+    df: "pd.DataFrame",
+    state: Optional[dict],
+    sig_cols: List[str],
+    sig_window: int = SIG_WINDOW,
+    expected_spec_version: Optional[str] = None,
+) -> Tuple[str, List[str], Optional[str]]:
+    """Like classify_calc_mode but also returns cur_fp (or None if not computed)."""
+    if state is None:
+        return "FULL", [], None
+    if expected_spec_version is not None:
+        stored = state.get("spec_version") or "v1"
+        if stored != expected_spec_version:
+            return "FULL", [], None
+    last_td = state["last_trade_date"]
+    cur_fp = state_signature(df, last_td, sig_cols, sig_window)
+    if cur_fp != state["history_fp"]:
+        return "FULL", [], cur_fp
+    new_bars = df[df["trade_date"] > last_td]["trade_date"].astype(str).tolist()
+    if not new_bars:
+        return "SKIP", [], cur_fp
+    return "APPEND", new_bars, cur_fp
+
+
 def classify_calc_mode(df: "pd.DataFrame", state: Optional[dict],
                        sig_cols: List[str],
-                       sig_window: int = SIG_WINDOW) -> Tuple[str, List[str]]:
+                       sig_window: int = SIG_WINDOW,
+                       expected_spec_version: Optional[str] = None) -> Tuple[str, List[str]]:
     """Decide calc mode for one stock given its loaded tail-window df and state.
 
     Returns (mode, new_bars) where mode in {"SKIP","APPEND","FULL"} and
     new_bars is the list of trade_dates strictly after state.last_trade_date.
     Signature domain = the fixed trailing window ending at state.last_trade_date.
     """
-    if state is None:
-        return "FULL", []
-    last_td = state["last_trade_date"]
-    cur_fp = state_signature(df, last_td, sig_cols, sig_window)
-    if cur_fp != state["history_fp"]:
-        return "FULL", []
-    new_bars = df[df["trade_date"] > last_td]["trade_date"].astype(str).tolist()
-    if not new_bars:
-        return "SKIP", []
-    return "APPEND", new_bars
+    mode, bars, _ = classify_calc_mode_detail(
+        df, state, sig_cols, sig_window, expected_spec_version,
+    )
+    return mode, bars

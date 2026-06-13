@@ -36,3 +36,29 @@ def test_group_by_indicator():
     })
     groups = group_by_indicator(q.append_items)
     assert groups[("macd", "daily")] == ["A.SZ", "B.SZ"]
+
+
+def test_group_by_indicator_splits_weekly_full_by_indicator():
+    """macd weekly FULL and kpattern weekly FULL land in separate groups."""
+    q = build_work_queue({
+        "A.SZ": {
+            ("macd", "weekly"): ("FULL", []),
+            ("kpattern", "weekly"): ("FULL", []),
+        },
+    })
+    groups = group_by_indicator(q.full_items)
+    assert set(groups.keys()) == {("macd", "weekly"), ("kpattern", "weekly")}
+    assert groups[("macd", "weekly")] == ["A.SZ"]
+    assert groups[("kpattern", "weekly")] == ["A.SZ"]
+
+
+def test_full_items_count_vs_unique_stocks():
+    """One stock with two FULL indicators → two work items, one stock."""
+    q = build_work_queue({
+        "A.SZ": {
+            ("macd", "weekly"): ("FULL", []),
+            ("kpattern", "weekly"): ("FULL", []),
+        },
+    })
+    assert len(q.full_items) == 2
+    assert len(q.full_stocks) == 1

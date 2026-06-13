@@ -172,11 +172,11 @@ def compute_price_signal_divergence(
         close, signal, window: int = 60, dedup: int = 5,
         require_finite_signal_window: bool = False,
         spike_filter_top: bool = False) -> list:
-    """Price-signal top/bottom divergence with rolling window + dedup.
+    """Rolling-window price-signal divergence. Volume only; MACD/DDE use divergence_structure.
 
-    Used by MACD (DIF), DDE (DDX), and Volume (vol). Vectorized rolling
-    extrema; only the dedup pass is sequential (5-bar lookback).
+    Vectorized rolling extrema; only the dedup pass is sequential (5-bar lookback).
     """
+    import warnings
     from numpy.lib.stride_tricks import sliding_window_view
 
     close = np.asarray(close, dtype=float)
@@ -190,10 +190,15 @@ def compute_price_signal_divergence(
     close_w = sliding_window_view(close, window)
     signal_w = sliding_window_view(signal, window)
 
-    c_hi = np.nanmax(close_w, axis=1)
-    c_lo = np.nanmin(close_w, axis=1)
-    d_hi = np.nanmax(signal_w, axis=1)
-    d_lo = np.nanmin(signal_w, axis=1)
+    # Early bars may have all-NaN windows; nanmax/nanmin return NaN (handled by valid).
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="All-NaN slice encountered", category=RuntimeWarning,
+        )
+        c_hi = np.nanmax(close_w, axis=1)
+        c_lo = np.nanmin(close_w, axis=1)
+        d_hi = np.nanmax(signal_w, axis=1)
+        d_lo = np.nanmin(signal_w, axis=1)
     sig_peak_iloc = np.argmax(signal_w, axis=1)
     sig_valley_iloc = np.argmin(signal_w, axis=1)
     c_lo_iloc = np.argmin(close_w, axis=1)
@@ -512,9 +517,32 @@ def load_latest_fingerprints(con, dws_table: str,
     return {r[0]: r[1] for r in rows}
 
 
+def load_latest_spec_versions(con, dws_table: str,
+                              ts_codes: list[str]) -> dict:
+    """Batch-load the latest spec_version per stock (same row as latest fingerprint)."""
+    if not ts_codes:
+        return {}
+    placeholders = ",".join(["?" for _ in ts_codes])
+    try:
+        rows = con.execute(f"""
+            SELECT ts_code, spec_version FROM (
+                SELECT ts_code, spec_version,
+                       ROW_NUMBER() OVER (PARTITION BY ts_code
+                                          ORDER BY calc_date DESC, trade_date DESC) AS rn
+                FROM {dws_table}
+                WHERE ts_code IN ({placeholders})
+            ) WHERE rn = 1
+        """, ts_codes).fetchall()
+    except duckdb.CatalogException:
+        return {}
+    return {r[0]: (r[1] or "v1") for r in rows}
+
+
 def check_dwd_unchanged(con, dws_table: str, ts_code: str,
                         df: "pd.DataFrame", latest_fps: dict = None,
-                        recalc_start: "Optional[str]" = None) -> bool:
+                        recalc_start: "Optional[str]" = None,
+                        expected_spec_version: "Optional[str]" = None,
+                        latest_specs: dict = None) -> bool:
     """Check if DWD input data is unchanged since last calculation.
 
     Uses strategy-A ``compute_input_fingerprint`` (last_td + window subset).
@@ -524,17 +552,35 @@ def check_dwd_unchanged(con, dws_table: str, ts_code: str,
     issuing a per-stock SQL query — this avoids the N+1 round-trip. When None,
     falls back to a single per-stock query (backward compatible).
 
+    When ``expected_spec_version`` is set, the stored DWS ``spec_version`` must
+    also match (algo bump invalidates fingerprint-only skip).
+
     Returns True if unchanged (calculation can be skipped).
     """
     new_fp = compute_input_fingerprint(df, recalc_start=recalc_start)
     if latest_fps is not None:
-        return latest_fps.get(ts_code) == new_fp
-    row = con.execute(f"""
-        SELECT input_fingerprint FROM {dws_table}
-        WHERE ts_code = ? AND input_fingerprint IS NOT NULL
-        ORDER BY calc_date DESC LIMIT 1
-    """, (ts_code,)).fetchone()
-    return row is not None and row[0] == new_fp
+        fp_match = latest_fps.get(ts_code) == new_fp
+    else:
+        row = con.execute(f"""
+            SELECT input_fingerprint FROM {dws_table}
+            WHERE ts_code = ? AND input_fingerprint IS NOT NULL
+            ORDER BY calc_date DESC LIMIT 1
+        """, (ts_code,)).fetchone()
+        fp_match = row is not None and row[0] == new_fp
+    if not fp_match:
+        return False
+    if expected_spec_version is None:
+        return True
+    if latest_specs is not None:
+        stored = latest_specs.get(ts_code, "v1")
+    else:
+        row = con.execute(f"""
+            SELECT spec_version FROM {dws_table}
+            WHERE ts_code = ?
+            ORDER BY calc_date DESC, trade_date DESC LIMIT 1
+        """, (ts_code,)).fetchone()
+        stored = (row[0] if row else None) or "v1"
+    return stored == expected_spec_version
 
 
 def insert_dws_batch(con, table: str, df: "pd.DataFrame", ts_code: str,
@@ -582,3 +628,62 @@ def insert_dws_batch(con, table: str, df: "pd.DataFrame", ts_code: str,
     )
     con.unregister("_batch")
     return len(batch)
+
+
+def insert_dws_batch_multi(
+    con,
+    table: str,
+    stock_rows: list,
+    calc_date: str,
+    dws_cols: list,
+    float_cols: list,
+    spec_version: str = "v1",
+) -> int:
+    """Batch narrow-write multiple stocks in one DuckDB INSERT.
+
+    ``stock_rows`` is a list of tuples:
+        (ts_code, df, input_fingerprint, write_start, write_end)
+
+    Returns total rows inserted. Empty after range filter → 0.
+    """
+    import pandas as pd
+
+    if not stock_rows:
+        return 0
+
+    data_cols = [c for c in dws_cols if c != "ts_code"]
+    parts = []
+    for ts_code, df, input_fingerprint, write_start, write_end in stock_rows:
+        if df is None or df.empty:
+            continue
+        batch = df[[c for c in data_cols if c in df.columns]].copy()
+        for c in data_cols:
+            if c not in batch.columns:
+                batch[c] = None
+        if write_start is not None:
+            batch = batch[batch["trade_date"] >= write_start]
+        if write_end is not None:
+            batch = batch[batch["trade_date"] <= write_end]
+        if batch.empty:
+            continue
+        batch["ts_code"] = ts_code
+        for c in float_cols:
+            if c in batch.columns:
+                batch[c] = batch[c].apply(to_float_safe)
+        batch["calc_date"] = calc_date
+        batch["spec_version"] = spec_version
+        batch["input_fingerprint"] = input_fingerprint or compute_fingerprint(df, float_cols)
+        parts.append(batch)
+
+    if not parts:
+        return 0
+
+    big = pd.concat(parts, ignore_index=True)
+    con.register("_batch_multi", big)
+    cols_sql = ", ".join(dws_cols)
+    con.execute(
+        f"INSERT OR REPLACE INTO {table} ({cols_sql}) "
+        f"SELECT {cols_sql} FROM _batch_multi"
+    )
+    con.unregister("_batch_multi")
+    return len(big)

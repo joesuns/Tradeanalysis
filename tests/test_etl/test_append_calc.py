@@ -224,20 +224,20 @@ def test_macd_append_ema_matches_full():
 
 
 def test_macd_append_divergence_matches_full():
-    """Tail-window (80 bars) with seeded EMA: last bar divergence == FULL(200 bars).
+    """Tail-window (300 bars) with seeded EMA: last bar divergence == FULL history.
 
-    tail_window >= 60+5 guarantees dedup context is fully within the window,
-    making divergence at the last bar identical to the full-history computation.
+    tail_window >= 250 + 3 cross cycles + dedup guarantees structure divergence
+    at the last bar is identical to the full-history computation.
     """
-    df_full = _make_df(200)
+    df_full = _make_df(350)
     calc = MACDCalculator(None, "daily")
 
-    # FULL on all 200 bars
+    # FULL on all bars (>= 301 so seed bar at -301 exists)
     full_df = calc._compute_indicators(df_full.copy())
 
-    # APPEND: last 80 bars as tail window, seeds from bar just before tail[0]
-    tail = df_full.iloc[-80:].reset_index(drop=True)
-    s_row = full_df.iloc[-81]   # index 119, immediately before tail[0]=index 120
+    # APPEND: last 300 bars as tail window, seeds from bar just before tail[0]
+    tail = df_full.iloc[-300:].reset_index(drop=True)
+    s_row = full_df.iloc[-301]   # immediately before tail[0]
     seeds = {
         "ema_12": float(s_row["ema_12"]),
         "ema_26": float(s_row["ema_26"]),
@@ -274,18 +274,17 @@ def test_dde_append_matches_full():
 
     ddx is causal (no EMA), so it matches by construction.
     ddx2 = EMA(ddx, 5) with seed from bar before tail[0] gives exact match.
-    Divergence uses ddx (causal) in a 60-bar window; tail >= 65 bars ensures
-    dedup context is fully contained, so last bar divergence matches FULL.
+    tail >= 250 + 3 cross cycles + dedup ensures last bar divergence matches FULL.
     """
-    df_full = _make_moneyflow_df(200)
+    df_full = _make_moneyflow_df(350)
     calc = DDECalculator(None, "daily")
 
-    # FULL on all 200 bars
+    # FULL on all bars (>= 301 so seed bar at -301 exists)
     full_df = calc._compute_indicators(df_full.copy())
 
-    # APPEND: last 80 bars + seed for ddx2 from bar just before tail[0]
-    tail = df_full.iloc[-80:].reset_index(drop=True)
-    s_row = full_df.iloc[-81]   # index 119, immediately before tail[0]=index 120
+    # APPEND: last 300 bars + seed for ddx2 from bar just before tail[0]
+    tail = df_full.iloc[-300:].reset_index(drop=True)
+    s_row = full_df.iloc[-301]   # immediately before tail[0]
     seeds = {"ddx2": float(s_row["ddx2"])}
     app_df = calc._compute_indicators(tail.copy(), ema_seeds=seeds)
 
@@ -341,7 +340,9 @@ def test_volume_append_matches_full_on_new_bar():
     # Tail: last 140 bars; zone seed = FULL's zone at the bar before tail[0]
     tail = df.iloc[-140:].reset_index(drop=True)
     zone_seed = full_df.iloc[-141]["zone"]   # global index 159, before tail start
-    append_df = calc._compute_indicators_append(tail.copy(), zone_seed=zone_seed)
+    append_df = calc._compute_indicators_append(
+        tail.copy(), [last_date], zone_seed=zone_seed,
+    )
 
     app_row = append_df[append_df["trade_date"] == last_date].iloc[0]
     full_row = full_df[full_df["trade_date"] == last_date].iloc[0]
@@ -406,3 +407,115 @@ def test_volume_append_zone_hysteresis_at_new_bar():
     assert zone_seeded[-1] == "explosive", (
         f"Seeded: expected 'explosive', got {zone_seeded[-1]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Weekly APPEND ≡ FULL (same atol contract as daily)
+# ---------------------------------------------------------------------------
+
+def test_pp_append_matches_full_on_new_bar_weekly():
+    df = _make_df(300)
+    calc = PricePositionCalculator(None, "weekly")
+    full_df = calc._compute_positions(df.copy())
+    last_date = df.iloc[-1]["trade_date"]
+    append_df = calc._compute_positions_append(df.copy(), new_bars=[last_date])
+    app_row = append_df[append_df["trade_date"] == last_date].iloc[0]
+    full_row = full_df[full_df["trade_date"] == last_date].iloc[0]
+    for w in (60, 120, 250):
+        col = f"price_position_{w}d"
+        a, b = app_row[col], full_row[col]
+        if pd.isna(b):
+            assert pd.isna(a), f"{col}: expected NaN, got {a}"
+        else:
+            assert abs(a - b) < 1e-9, f"{col}: |{a} - {b}| >= 1e-9"
+
+
+def test_ma_append_matches_full_on_new_bar_weekly():
+    df = _make_df(300)
+    calc = MACalculator(None, "weekly")
+    full_df = calc._compute_indicators(df.copy())
+    last_date = df.iloc[-1]["trade_date"]
+    append_df = calc._compute_indicators_append(df.copy(), new_bars=[last_date])
+    app_row = append_df[append_df["trade_date"] == last_date].iloc[0]
+    full_row = full_df[full_df["trade_date"] == last_date].iloc[0]
+    for col in ("ma_5", "ma_10", "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope"):
+        a, b = app_row[col], full_row[col]
+        if pd.isna(b):
+            assert pd.isna(a), f"{col}: expected NaN, got {a}"
+        else:
+            assert abs(a - b) < 1e-9, f"{col}: |{a} - {b}| >= 1e-9"
+    for col in ("alignment", "turning_point"):
+        assert app_row[col] == full_row[col]
+
+
+def test_kpattern_append_matches_full_on_new_bar_weekly():
+    df = _make_ohlcv_df(300)
+    calc = KPatternCalculator(None, "weekly")
+    full_df = calc._compute_patterns(df.copy(), is_st=False)
+    last_date = df.iloc[-1]["trade_date"]
+    append_df = calc._compute_patterns_append(df.copy(), new_bars=[last_date], is_st=False)
+    app_row = append_df[append_df["trade_date"] == last_date].iloc[0]
+    full_row = full_df[full_df["trade_date"] == last_date].iloc[0]
+    for col in (
+        "yang_bao_yin", "yang_ke_yin", "mu_bei_xian", "bi_lei_zhen",
+        "gao_kai_chang_yin", "yin_bao_yang", "yin_ke_yang",
+    ):
+        assert app_row[col] == full_row[col]
+    a_str, b_str = app_row["strength"], full_row["strength"]
+    if pd.isna(b_str):
+        assert pd.isna(a_str)
+    else:
+        assert abs(float(a_str) - float(b_str)) < 1e-9
+
+
+def test_macd_append_ema_matches_full_weekly():
+    df = _make_df(80)
+    calc = MACDCalculator(None, "weekly")
+    full_df = calc._compute_indicators(df.copy())
+    last_date = df.iloc[-1]["trade_date"]
+    tail = df.iloc[-40:].reset_index(drop=True)
+    s_row = full_df.iloc[-41]
+    seeds = {
+        "ema_12": float(s_row["ema_12"]),
+        "ema_26": float(s_row["ema_26"]),
+        "dea": float(s_row["dea"]),
+    }
+    app_df = calc._compute_indicators(tail.copy(), ema_seeds=seeds)
+    for col in ("ema_12", "ema_26", "dif", "dea", "macd_bar"):
+        a, b = app_df.iloc[-1][col], full_df.iloc[-1][col]
+        if pd.isna(b):
+            assert pd.isna(a)
+        else:
+            assert abs(a - b) < 1e-9
+
+
+def test_dde_append_ddx2_matches_full_weekly():
+    df_full = _make_moneyflow_df(301)
+    calc = DDECalculator(None, "weekly")
+    full_df = calc._compute_indicators(df_full.copy())
+    tail = df_full.iloc[-300:].reset_index(drop=True)
+    s_row = full_df.iloc[-301]
+    seeds = {"ddx2": float(s_row["ddx2"])}
+    app_df = calc._compute_indicators(tail.copy(), ema_seeds=seeds)
+    for col in ("ddx", "ddx2"):
+        a, b = app_df.iloc[-1][col], full_df.iloc[-1][col]
+        if pd.isna(b):
+            assert pd.isna(a)
+        else:
+            assert abs(a - b) < 1e-9
+
+
+def test_volume_append_matches_full_on_new_bar_weekly():
+    df = _make_vol_df(300)
+    calc = VolumeCalculator(None, "weekly")
+    full_df = calc._compute_indicators(df.copy())
+    last_date = df.iloc[-1]["trade_date"]
+    tail = df.iloc[-140:].reset_index(drop=True)
+    zone_seed = full_df.iloc[-141]["zone"]
+    append_df = calc._compute_indicators_append(
+        tail.copy(), [last_date], zone_seed=zone_seed,
+    )
+    app_row = append_df[append_df["trade_date"] == last_date].iloc[0]
+    full_row = full_df[full_df["trade_date"] == last_date].iloc[0]
+    for col in ("zone", "trend", "divergence"):
+        assert app_row[col] == full_row[col]

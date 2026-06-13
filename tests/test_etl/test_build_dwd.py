@@ -4,6 +4,12 @@ from backend.etl.build_dwd import (
     build_dwd_daily_quote,
     build_dwd_weekly_quote,
     build_dwd_daily_moneyflow,
+    rebuild_dwd_incremental,
+    rebuild_dwd_for_stale,
+    find_adj_changed_codes,
+    find_stocks_needing_full_daily_rebuild,
+    find_qfq_drift_codes,
+    _find_dwd_gap_stocks,
 )
 
 
@@ -193,6 +199,255 @@ def test_weekly_aggregation_cross_year_week(temp_db):
     assert abs(row[2] - 9.0) < 0.01    # low = 全周最低
     assert abs(row[3] - 12.5) < 0.01   # close = 周五收盘
     assert row[4] == 5                 # 整周 5 个交易日聚合进同一 bar
+
+
+def test_suspension_fill_skipped_when_dwd_already_complete(temp_db):
+    """Second full rebuild must not re-detect ODS gaps — only DWD calendar gaps."""
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) "
+        "VALUES ('20260101',1),('20260102',1),('20260103',1)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor) "
+        "VALUES ('TEST.SZ','20260101',10.0,1.0),('TEST.SZ','20260103',10.5,1.0)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+    assert len(_find_dwd_gap_stocks(temp_db, ["TEST.SZ"])) == 0
+
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+    rows = temp_db.execute(
+        "SELECT trade_date, is_suspended FROM dwd_daily_quote "
+        "WHERE ts_code='TEST.SZ' ORDER BY trade_date"
+    ).fetchall()
+    assert len(rows) == 3
+    assert rows[1][1] == 1
+
+
+def test_incremental_daily_inserts_single_day(temp_db):
+    """Tail rebuild adds one day without wiping prior DWD rows."""
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) "
+        "VALUES ('20260101',1),('20260102',1),('20260103',1)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES "
+        "('TEST.SZ','20260101',10.0,1.0,10.0,10.5,9.5,100,1000,0.01),"
+        "('TEST.SZ','20260102',10.2,1.0,10.1,10.3,10.0,110,1100,0.02)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES ('TEST.SZ','20260101',1000),('TEST.SZ','20260102',1020)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES ('TEST.SZ','20260103',10.5,1.0,10.2,10.6,10.1,120,1200,0.03)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES ('TEST.SZ','20260103',1050)"
+    )
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"], incremental_trade_date="20260103")
+
+    rows = temp_db.execute(
+        "SELECT trade_date, close_qfq FROM dwd_daily_quote "
+        "WHERE ts_code='TEST.SZ' ORDER BY trade_date"
+    ).fetchall()
+    assert len(rows) == 3
+    assert rows[-1] == ("20260103", 10.5)
+
+
+def test_rebuild_dwd_incremental_tail_path(temp_db):
+    """rebuild_dwd_incremental uses tail INSERT when adj is stable."""
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) VALUES ('20260101',1),('20260102',1)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES ('TEST.SZ','20260101',10.0,1.0,10.0,10.5,9.5,100,1000,0.01)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES ('TEST.SZ','20260101',1000)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES ('TEST.SZ','20260102',10.2,1.0,10.1,10.3,10.0,110,1100,0.02)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES ('TEST.SZ','20260102',1020)"
+    )
+    res = rebuild_dwd_incremental(temp_db, ["TEST.SZ"], "20260102")
+    assert res["daily_quote"] == 1
+    n = temp_db.execute(
+        "SELECT COUNT(*) FROM dwd_daily_quote WHERE ts_code='TEST.SZ'"
+    ).fetchone()[0]
+    assert n == 2
+
+
+def test_incremental_daily_returns_tail_row_count(temp_db):
+    """Tail INSERT return value is rows on trade_date, not total history."""
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) "
+        "VALUES ('20260101',1),('20260102',1),('20260103',1)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES "
+        "('TEST.SZ','20260101',10.0,1.0,10.0,10.5,9.5,100,1000,0.01),"
+        "('TEST.SZ','20260102',10.2,1.0,10.1,10.3,10.0,110,1100,0.02)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES ('TEST.SZ','20260101',1000),('TEST.SZ','20260102',1020)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES ('TEST.SZ','20260103',10.5,1.0,10.2,10.6,10.1,120,1200,0.03)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES ('TEST.SZ','20260103',1050)"
+    )
+    n = build_dwd_daily_quote(temp_db, ["TEST.SZ"], incremental_trade_date="20260103")
+    assert n == 1
+
+
+def test_find_adj_changed_codes_on_latest_day(temp_db):
+    """Latest-day adj change triggers full rebuild list."""
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,adj_factor) "
+        "VALUES ('TEST.SZ','20260101',1.0),('TEST.SZ','20260102',2.0)"
+    )
+    changed = find_adj_changed_codes(temp_db, ["TEST.SZ"], "20260102")
+    assert changed == ["TEST.SZ"]
+
+
+def test_find_qfq_drift_detects_historical_adj_correction(temp_db):
+    """Historical adj backfill without latest-day change → qfq drift → full rebuild."""
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) "
+        "VALUES ('20260101',1),('20260102',1),('20260103',1)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES "
+        "('TEST.SZ','20260101',10.0,1.0,10.0,10.5,9.5,100,1000,0.01),"
+        "('TEST.SZ','20260102',10.2,1.0,10.1,10.3,10.0,110,1100,0.02),"
+        "('TEST.SZ','20260103',10.5,1.0,10.2,10.6,10.1,120,1200,0.03)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES ('TEST.SZ','20260101',1000),('TEST.SZ','20260102',1020),('TEST.SZ','20260103',1050)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+
+    temp_db.execute(
+        "UPDATE ods_daily SET adj_factor=2.0 WHERE ts_code='TEST.SZ' AND trade_date='20260101'"
+    )
+    assert find_adj_changed_codes(temp_db, ["TEST.SZ"], "20260103") == []
+    assert find_qfq_drift_codes(temp_db, ["TEST.SZ"]) == ["TEST.SZ"]
+    assert find_stocks_needing_full_daily_rebuild(temp_db, ["TEST.SZ"], "20260103") == ["TEST.SZ"]
+
+
+def test_rebuild_dwd_for_stale_uses_incremental_by_default(temp_db, monkeypatch):
+    """rebuild_dwd_for_stale routes to incremental when DWD_INCREMENTAL=1."""
+    calls = []
+    monkeypatch.setattr(
+        "backend.etl.build_dwd.rebuild_dwd_incremental",
+        lambda con, codes, d: calls.append(("incr", list(codes), d)) or {"daily_quote": 1},
+    )
+    monkeypatch.setattr("backend.config.DWD_INCREMENTAL", True)
+    rebuild_dwd_for_stale(temp_db, ["A.SZ"], "20260102")
+    assert calls == [("incr", ["A.SZ"], "20260102")]
+
+
+def test_rebuild_dwd_for_stale_uses_full_when_disabled(temp_db, monkeypatch):
+    """rebuild_dwd_for_stale routes to rebuild_all_dwd when DWD_INCREMENTAL=0."""
+    calls = []
+    monkeypatch.setattr(
+        "backend.etl.build_dwd.rebuild_all_dwd",
+        lambda con, codes: calls.append(list(codes)) or {"daily_quote": 1},
+    )
+    monkeypatch.setattr("backend.config.DWD_INCREMENTAL", False)
+    rebuild_dwd_for_stale(temp_db, ["A.SZ"], "20260102")
+    assert calls == [["A.SZ"]]
+
+
+def test_rebuild_dwd_incremental_full_path_on_adj_drift(temp_db, caplog):
+    """rebuild_dwd_incremental qfq UPDATE fixes drift without daily DELETE."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) VALUES ('20260101',1),('20260102',1)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES "
+        "('TEST.SZ','20260101',10.0,1.0,10.0,10.5,9.5,100,1000,0.01),"
+        "('TEST.SZ','20260102',10.2,1.0,10.1,10.3,10.0,110,1100,0.02)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES ('TEST.SZ','20260101',1000),('TEST.SZ','20260102',1020)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+    temp_db.execute(
+        "UPDATE ods_daily SET adj_factor=2.0 WHERE ts_code='TEST.SZ' AND trade_date='20260101'"
+    )
+
+    rebuild_dwd_incremental(temp_db, ["TEST.SZ"], "20260102")
+    close_qfq = temp_db.execute(
+        "SELECT close_qfq FROM dwd_daily_quote "
+        "WHERE ts_code='TEST.SZ' AND trade_date='20260101'"
+    ).fetchone()[0]
+    assert abs(close_qfq - 20.0) < 1e-6
+    assert any("dwd.qfq_update" in r.message for r in caplog.records)
 
 
 def test_moneyflow_mapping(temp_db):

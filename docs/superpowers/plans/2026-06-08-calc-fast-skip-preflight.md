@@ -83,7 +83,7 @@ new_bars = df[df["trade_date"] > last_td]...
 | weekly quote | `dwd_weekly_quote` + `JOIN dim_date is_week_end=1` |
 | DDE daily | 复用 `_load_daily_batch` 同源 JOIN，再对每股 `tail(245)` |
 | DDE weekly | **必须**复用 `_load_weekly_batch` 的 CTE 聚合结果，再对每股 `tail(245)`；禁止对日线表简单 ROW_NUMBER 替代 |
-| 列集 | quote 用各指标 `SIGNATURE_COLS` 并集；DDE 用其 7 列 |
+| 列集 | quote 用 `quote_pipeline_columns`（canonical 计算输入列，含 `pct_chg`）；DDE 用其 7 列 |
 
 ### Fallthrough 条件（与慢路径 `_route_calc` 对齐）
 
@@ -146,7 +146,7 @@ CALC_ROUTE_SPECS = [
 ]
 
 def quote_sig_col_union() -> list[str]:
-    """SIGNATURE_COLS 并集，供 batch_load_quote_tails 选列。"""
+    """SIGNATURE_COLS 并集（诊断用）。batch 加载见 quote_tail_columns → quote_pipeline_columns。"""
 ```
 
 指标名与 orchestrator 一致（`priceposition` 无下划线）。

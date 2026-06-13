@@ -1,7 +1,7 @@
 import logging
 import time
 
-from backend.etl.progress import StageProgress
+from backend.etl.progress import StageProgress, log_timed_step
 
 
 def _lines(caplog, stage: str):
@@ -55,3 +55,24 @@ def test_stage_progress_thread_safe(caplog):
 
     lines = _lines(caplog, "thread.stage")
     assert any("200/200 (100%)" in ln for ln in lines)
+
+
+def test_stage_progress_heartbeat_before_first_tick(caplog):
+    p = StageProgress("wait.stage", total=100, count_step=50, heartbeat_sec=0.05)
+    with caplog.at_level(logging.INFO, logger="backend.etl.progress"):
+        p.log_start()
+        time.sleep(0.08)
+        p.heartbeat()
+        p.log_done()
+
+    lines = _lines(caplog, "wait.stage")
+    assert any("still running | 0/100" in ln for ln in lines)
+
+
+def test_log_timed_step(caplog):
+    with caplog.at_level(logging.INFO, logger="backend.etl.progress"):
+        out = log_timed_step("test.timed", "step_a", lambda: 42, stocks=3)
+    assert out == 42
+    lines = _lines(caplog, "test.timed")
+    assert any("加载step_a" in ln for ln in lines)
+    assert any("step_a 完成" in ln for ln in lines)

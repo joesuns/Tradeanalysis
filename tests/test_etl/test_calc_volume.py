@@ -1,40 +1,16 @@
 import pandas as pd
 import numpy as np
-from backend.etl.calc_volume import VolumeCalculator
+from backend.etl.calc_volume import (
+    VolumeCalculator,
+    VOLUME_TREND_V2_DAILY,
+    VOLUME_TREND_V2_WEEKLY,
+    compute_volume_trend_series,
+    trend_from_v2_label,
+    volume_trend_v2,
+)
 
 
-# ── B2 golden-master: frozen pre-vectorization oracles (compacted log-vol) ──
-
-def _oracle_vol_trend(vol_series, window=10):
-    n = len(vol_series)
-    result = [None] * n
-    decay = 0.20
-    for i in range(n):
-        if i < window - 1:
-            continue
-        segment = vol_series[i - window + 1:i + 1]
-        valid = segment[~np.isnan(segment)]
-        valid_pos = valid[valid > 0]
-        if len(valid_pos) < 5:
-            continue
-        log_segment = np.log(valid_pos)
-        m = len(log_segment)
-        x = np.arange(m, dtype=float)
-        weights = np.exp(x * decay)
-        try:
-            slope = float(np.polyfit(x, log_segment, 1, w=weights)[0])
-        except (np.linalg.LinAlgError, ValueError, TypeError):
-            continue
-        if not np.isfinite(slope):
-            continue
-        if slope > 0.008:
-            result[i] = "expanding"
-        elif slope < -0.008:
-            result[i] = "shrinking"
-        else:
-            result[i] = "flat"
-    return result
-
+# ── B2 golden-master: trend_strength still uses ln(vol) weighted regression ──
 
 def _oracle_vol_strength(vol_series, window=10):
     n = len(vol_series)
@@ -75,12 +51,38 @@ def _rand_vol(rng):
     return vol
 
 
-def test_vol_trend_matches_oracle_random():
-    calc = VolumeCalculator.__new__(VolumeCalculator)
+def test_vol_trend_matches_v2_last_bar_daily():
+    calc = VolumeCalculator(None, "daily")
     rng = np.random.default_rng(41)
-    for _ in range(60):
-        vol = _rand_vol(rng)
-        assert calc._compute_trend(vol, 10) == _oracle_vol_trend(vol, 10)
+    kw = dict(VOLUME_TREND_V2_DAILY)
+    anchor = kw.pop("anchor_bars")
+    for _ in range(40):
+        vol = rng.lognormal(mean=11.0, sigma=0.5, size=rng.integers(anchor, anchor + 40))
+        series = calc._compute_trend(vol, 10)
+        _, label = volume_trend_v2(vol, anchor_bars=anchor, **kw)
+        assert series[-1] == trend_from_v2_label(label)
+
+
+def test_vol_trend_matches_v2_last_bar_weekly():
+    calc = VolumeCalculator(None, "weekly")
+    rng = np.random.default_rng(42)
+    kw = dict(VOLUME_TREND_V2_WEEKLY)
+    anchor = kw.pop("anchor_bars")
+    for _ in range(40):
+        vol = rng.lognormal(mean=11.0, sigma=0.5, size=rng.integers(anchor, anchor + 30))
+        series = calc._compute_trend(vol, 10)
+        _, label = volume_trend_v2(vol, anchor_bars=anchor, **kw)
+        assert series[-1] == trend_from_v2_label(label)
+
+
+def test_compute_volume_trend_series_prefix_consistency():
+    vol = np.array([1e6 + i * 1e4 for i in range(80)], dtype=float)
+    series = compute_volume_trend_series(vol, VOLUME_TREND_V2_DAILY)
+    kw = dict(VOLUME_TREND_V2_DAILY)
+    anchor = kw.pop("anchor_bars")
+    for i in range(59, len(vol)):
+        _, label = volume_trend_v2(vol[: i + 1], anchor_bars=anchor, **kw)
+        assert series[i] == trend_from_v2_label(label)
 
 
 def test_vol_trend_strength_matches_oracle_random():
@@ -95,12 +97,11 @@ def test_vol_trend_strength_matches_oracle_random():
         np.testing.assert_allclose(got[m], exp[m], rtol=0, atol=1e-9)
 
 
-def test_vol_all_positive_full_window_matches_oracle():
-    """Common case: no NaN, all positive → fast path must equal oracle."""
+def test_vol_all_positive_full_window_strength_matches_oracle():
+    """Common case: no NaN, all positive → trend_strength fast path equals oracle."""
     calc = VolumeCalculator.__new__(VolumeCalculator)
     rng = np.random.default_rng(45)
     vol = rng.lognormal(11.0, 0.4, size=80)
-    assert calc._compute_trend(vol, 10) == _oracle_vol_trend(vol, 10)
     got = calc._compute_trend_strength(vol, window=10)
     exp = _oracle_vol_strength(vol, 10)
     np.testing.assert_allclose(got[~np.isnan(exp)], exp[~np.isnan(exp)], atol=1e-9)
@@ -165,43 +166,41 @@ def test_zone_normal():
 
 
 def test_trend_flat():
-    """Flat volume should yield flat trend."""
-    calc = VolumeCalculator.__new__(VolumeCalculator)
-
-    n = 30
+    """Constant volume → v2 direction 平量 (needs >=60 bars)."""
+    calc = VolumeCalculator(None, "daily")
+    n = 70
     dates = [f"202601{i:02d}" for i in range(1, n + 1)]
     vols = [1000000.0] * n
     df = pd.DataFrame({"trade_date": dates, "vol": vols})
     result = calc._compute_indicators(df)
-
-    # After 20 data points, trend should be "flat" (slope near 0)
     valid_trends = result["trend"].dropna()
     flat_count = (valid_trends == "flat").sum()
     assert flat_count > 0, f"Expected flat trend for constant volume, got: {valid_trends.unique()}"
 
 
 def test_trend_uses_raw_vol():
-    """趋势直接使用原始成交量，10-bar 窗口即可检出 expanding。"""
-    calc = VolumeCalculator.__new__(VolumeCalculator)
-    n = 30
+    """v2 方向用末 5 根原始量斜率；持续上升 → expanding。"""
+    calc = VolumeCalculator(None, "daily")
+    n = 70
     dates = [f"d{i}" for i in range(n)]
-    vols = [1000000.0 + i * 100000 for i in range(n)]  # 每日 +10%
+    vols = [1000000.0 + i * 100000 for i in range(n)]
     df = pd.DataFrame({"trade_date": dates, "vol": vols})
     result = calc._compute_indicators(df)
-    t = result["trend"].iloc[15]
+    t = result["trend"].iloc[-1]
     assert t == "expanding", f"raw vol 持续上升应为 expanding，实际 {t}"
 
 
-def test_trend_threshold_0008():
-    """阈值 0.008——弱趋势判为 flat。"""
-    calc = VolumeCalculator.__new__(VolumeCalculator)
-    n = 20
+def test_trend_v2_flat_eps():
+    """v2 vol_flat_eps=0.001——弱斜率判为 flat。"""
+    calc = VolumeCalculator(None, "daily")
+    n = 70
     dates = [f"d{i}" for i in range(n)]
-    vols = [1000000.0 + i * 5000 for i in range(n)]  # 每日 +0.5%
+    base = 1_000_000.0
+    vols = [base + i * 200 for i in range(n)]  # 极弱上升
     df = pd.DataFrame({"trade_date": dates, "vol": vols})
     result = calc._compute_indicators(df)
-    t = result["trend"].iloc[15]
-    assert t == "flat", f"弱趋势(斜率<0.008)应为 flat，实际 {t}"
+    t = result["trend"].iloc[-1]
+    assert t == "flat", f"弱趋势应为 flat，实际 {t}"
 
 
 def test_integration_volume(db_with_schema):
@@ -349,6 +348,27 @@ def test_volume_divergence_dedup():
                 gap = top_indices[j] - top_indices[j - 1]
                 assert gap >= 5, \
                     f"Dedup failed: top_divergence repeated after {gap} days"
+
+
+def test_weekly_trend_denormalizes_vol_with_active_days():
+    """B4 weekly vol_trend uses raw week sum (vol * active_days / 5), not normalized vol."""
+    calc = VolumeCalculator(None, "weekly")
+    n = 40
+    dates = [f"w{i}" for i in range(n)]
+    norm_vol = np.full(n, 1_000_000.0)
+    active = np.full(n, 5.0)
+    # Same normalized vol; rising active_days → rising raw week sum → expanding
+    active[-5:] = [1.0, 2.0, 3.0, 4.0, 5.0]
+    raw_sum = norm_vol * active / 5.0
+    df_week = pd.DataFrame({
+        "trade_date": dates, "vol": norm_vol, "active_days": active, "close_qfq": 10.0,
+    })
+    t_norm = calc._compute_trend(norm_vol, 10)[-1]
+    t_raw = calc._compute_trend(raw_sum, 10)[-1]
+    t_week = calc._compute_indicators(df_week)["trend"].iloc[-1]
+    assert t_norm == "flat"
+    assert t_raw == "expanding"
+    assert t_week == t_raw
 
 
 def test_weekly_pct_vol_rank_with_130_week_end_bars():

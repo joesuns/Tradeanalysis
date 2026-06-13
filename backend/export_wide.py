@@ -166,6 +166,8 @@ def export_wide_to_excel(
     daily = _format_numbers(daily)
 
     # ---- Weekly data: use latest week-end ≤ trade_date ----
+    t_weekly = time.monotonic()
+    logger.info("progress export: loading weekly | date=%s", trade_date)
     week_end = con.execute(
         "SELECT MAX(trade_date) FROM dim_date "
         "WHERE trade_date <= ? AND is_week_end = 1",
@@ -176,6 +178,10 @@ def export_wide_to_excel(
         + (" AND is_st = 0" if filter_st else ""),
         [week_end]
     ).df() if week_end else pd.DataFrame()
+    logger.info(
+        "progress export: weekly query done | week_end=%s rows=%d | %.0fs",
+        week_end or "-", len(weekly), time.monotonic() - t_weekly,
+    )
     if ts_codes:
         weekly = weekly[weekly["ts_code"].isin(ts_codes)]
     weekly = _format_numbers(weekly)
@@ -213,6 +219,8 @@ def export_wide_to_excel(
     logger.info("progress export: weekly merge done | %.0fs", time.monotonic() - t0)
 
     # ---- Write to Excel ----
+    t_sheets = time.monotonic()
+    logger.info("progress export: building sheets | rows=%d", len(merged))
     wb = Workbook()
     wb.remove(wb.active)
     # ---- Signal-only analysis sheet (first sheet) ----
@@ -241,6 +249,7 @@ def export_wide_to_excel(
             _write_sheet_merged(wb, "上证指数", idx_daily, list(idx_daily.columns), [])
 
     con.close()
+    logger.info("progress export: sheets built | %.0fs", time.monotonic() - t_sheets)
 
     import os
     if not output_path or output_path == "analysis.xlsx":
@@ -249,8 +258,10 @@ def export_wide_to_excel(
     if parent:
         os.makedirs(parent, exist_ok=True)
 
+    t_save = time.monotonic()
     logger.info("progress export: writing xlsx | path=%s", output_path)
     wb.save(output_path)
+    logger.info("progress export: xlsx saved | %.0fs", time.monotonic() - t_save)
     logger.info(
         "progress export: done | rows=%d | %.0fs",
         len(merged), time.monotonic() - t0,

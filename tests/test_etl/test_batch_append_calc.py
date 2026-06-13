@@ -722,6 +722,166 @@ def test_batch_append_dde_matches_per_stock_append():
     con.close()
 
 
+def _insert_weekly_quote(con, code, trade_date, close):
+    con.execute(
+        "INSERT OR REPLACE INTO dwd_weekly_quote "
+        "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, amount, "
+        "pct_chg, total_mv, pe_ttm, turnover_rate, volume_ratio, active_days) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            code, trade_date, close, close + 0.1, close - 0.1, close,
+            1000.0, 100.0, 0.0, 2e6, None, None, None, 5,
+        ],
+    )
+
+
+def _setup_dde_weekly_with_dc(con, codes, n_days=400):
+    """Daily history with net_amount_dc/circ_mv + week-end markers (real calendar dates)."""
+    import numpy as np
+    import pandas as pd
+
+    from backend.db.schema import create_all_tables
+    from backend.etl.calc_dde import DDECalculator
+
+    create_all_tables(con)
+    dates = pd.date_range("2023-09-11", periods=n_days, freq="B").strftime("%Y%m%d").tolist()
+    week_ends = []
+    q_rows, m_rows = [], []
+    for j, code in enumerate(codes):
+        rng = np.random.default_rng(400 + j)
+        close = 10.0 + np.cumsum(rng.normal(0, 0.2, len(dates)))
+        for i, d in enumerate(dates):
+            c = float(close[i])
+            tv = float(rng.uniform(10000, 50000))
+            buy_lg = tv * 0.3
+            sell_lg = tv * 0.25
+            buy_elg = tv * 0.1
+            sell_elg = tv * 0.08
+            net_mf = buy_lg + buy_elg - sell_lg - sell_elg
+            is_we = 1 if (i + 1) % 5 == 0 else 0
+            con.execute(
+                "INSERT INTO dim_date (trade_date, is_trade_day, is_week_end) "
+                "VALUES (?, 1, ?)",
+                [d, is_we],
+            )
+            q_rows.append((code, d, c, c + 0.1, c - 0.1, c, 1000.0 + i, 2e6, 1e6, 0))
+            m_rows.append(
+                (code, d, buy_lg, sell_lg, buy_elg, sell_elg, tv, net_mf, net_mf * 0.01),
+            )
+            if is_we:
+                week_ends.append(d)
+                _insert_weekly_quote(con, code, d, c)
+    con.executemany(
+        "INSERT INTO dwd_daily_quote "
+        "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, "
+        "total_mv, circ_mv, is_suspended) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        q_rows,
+    )
+    con.executemany(
+        "INSERT INTO dwd_daily_moneyflow "
+        "(ts_code, trade_date, buy_lg_vol, sell_lg_vol, buy_elg_vol, "
+        "sell_elg_vol, total_vol, net_mf_amount, net_amount_dc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        m_rows,
+    )
+    calc = DDECalculator(con, "weekly")
+    baseline_date = week_ends[-2]
+    calc.calculate(codes, baseline_date, recalc_start=week_ends[0])
+    return dates, week_ends
+
+
+def test_batch_append_dde_weekly_matches_per_stock_append():
+    """Weekly batch APPEND must use _weekly_trend_from_daily (daily_for_trend)."""
+    import duckdb
+    import pandas as pd
+
+    from backend.etl.calc_batch_append import batch_append_dde
+    from backend.etl.calc_dde import DDECalculator
+
+    codes = ["DDEw.SZ"]
+    con = duckdb.connect(":memory:")
+    dates, week_ends = _setup_dde_weekly_with_dc(con, codes, n_days=400)
+    calc = DDECalculator(con, "weekly")
+    dde_groups = calc._load_weekly_batch(codes)
+    dde_tails = {
+        c: dde_groups[c][dde_groups[c]["trade_date"] >= week_ends[-80]].reset_index(
+            drop=True,
+        )
+        for c in codes
+    }
+
+    # New week: 5 business days + week-end (continue calendar after baseline)
+    import pandas as pd
+
+    last = pd.Timestamp(dates[-1])
+    new_days = pd.date_range(last + pd.Timedelta(days=1), periods=5, freq="B")
+    new_days = [d.strftime("%Y%m%d") for d in new_days]
+    new_we = new_days[-1]
+    for i, d in enumerate(new_days):
+        is_we = 1 if i == 4 else 0
+        con.execute(
+            "INSERT INTO dim_date (trade_date, is_trade_day, is_week_end) "
+            "VALUES (?, 1, ?)",
+            [d, is_we],
+        )
+        c = 12.0 + i * 0.1
+        tv = 40000.0 + i * 100
+        net_mf = 500.0 + i
+        con.execute(
+            "INSERT INTO dwd_daily_quote "
+            "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, "
+            "total_mv, circ_mv, is_suspended) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            [codes[0], d, c, c + 0.1, c - 0.1, c, 9000.0, 2e6, 1e6],
+        )
+        con.execute(
+            "INSERT INTO dwd_daily_moneyflow "
+            "(ts_code, trade_date, buy_lg_vol, sell_lg_vol, buy_elg_vol, "
+            "sell_elg_vol, total_vol, net_mf_amount, net_amount_dc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [codes[0], d, 10000, 8000, 3000, 2000, tv, net_mf, net_mf * 0.01],
+        )
+    _insert_weekly_quote(con, codes[0], new_we, 12.4)
+
+    dde_groups = calc._load_weekly_batch(codes)
+    dde_tails = {
+        c: dde_groups[c][dde_groups[c]["trade_date"] >= week_ends[-80]].reset_index(
+            drop=True,
+        )
+        for c in codes
+    }
+    tail = dde_tails[codes[0]]
+    calc_date = new_we
+    per_stock = {}
+    for code in codes:
+        calc.append_calculate(
+            code, tail, [new_we], calc_date,
+            {"last_trade_date": week_ends[-1]},
+        )
+        row = con.execute(
+            "SELECT trend FROM dws_dde_weekly "
+            "WHERE ts_code = ? AND trade_date = ? AND calc_date = ?",
+            [code, new_we, calc_date],
+        ).fetchone()
+        per_stock[code] = row[0]
+
+    con.execute(
+        "DELETE FROM dws_dde_weekly WHERE trade_date = ? AND calc_date = ?",
+        [new_we, calc_date],
+    )
+    batch_append_dde(
+        con, "weekly", codes, calc_date, dde_tails, {c: [new_we] for c in codes},
+    )
+    for code in codes:
+        got = con.execute(
+            "SELECT trend FROM dws_dde_weekly "
+            "WHERE ts_code = ? AND trade_date = ? AND calc_date = ?",
+            [code, new_we, calc_date],
+        ).fetchone()[0]
+        assert got == per_stock[code]
+    con.close()
+
+
 def test_run_batch_append_phase_pure_append_empty_chunk(monkeypatch):
     """When all stocks are APPEND-only, chunk_codes should be empty."""
     import importlib

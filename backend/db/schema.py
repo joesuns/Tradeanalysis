@@ -51,6 +51,7 @@ _ODS_DDL = [
         ts_code        TEXT,
         trade_date     TEXT,
         total_mv       REAL,
+        circ_mv        REAL,
         pe_ttm         REAL,
         turnover_rate  REAL,
         volume_ratio   REAL,
@@ -80,6 +81,7 @@ _ODS_DDL = [
         sell_elg_amount REAL,
         net_mf_vol     REAL,
         net_mf_amount  REAL,
+        net_amount_dc  REAL,
         fetched_at     TEXT DEFAULT (now()),
         PRIMARY KEY (ts_code, trade_date)
     )""",
@@ -172,6 +174,20 @@ def _migrate_volume_new_columns(con):
                 pass  # column already exists
 
 
+def _migrate_dde_b4_inputs(con: duckdb.DuckDBPyConnection):
+    """Add circ_mv / net_amount_dc for 123-aligned DDE trend (B4 gate)."""
+    for table, col in [
+        ("ods_daily_basic", "circ_mv"),
+        ("ods_moneyflow", "net_amount_dc"),
+        ("dwd_daily_quote", "circ_mv"),
+        ("dwd_daily_moneyflow", "net_amount_dc"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL")
+        except Exception:
+            pass
+
+
 def _migrate_dws_fingerprint(con: duckdb.DuckDBPyConnection):
     """Add input_fingerprint and spec_version columns to all existing DWS tables."""
     for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
@@ -252,6 +268,7 @@ _DWD_DDL = [
         amount         REAL,
         pct_chg        REAL,
         total_mv       REAL,
+        circ_mv        REAL,
         pe_ttm         REAL,
         turnover_rate  REAL,
         volume_ratio   REAL,
@@ -289,6 +306,7 @@ _DWD_DDL = [
         buy_elg_vol    REAL,
         sell_elg_vol   REAL,
         total_vol      REAL,
+        net_amount_dc  REAL,
         PRIMARY KEY (ts_code, trade_date)
     )""",
 ]
@@ -933,6 +951,7 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # Migrations for existing databases
     _migrate_dde_trend_strength(con)
     _migrate_volume_new_columns(con)
+    _migrate_dde_b4_inputs(con)
     _migrate_dws_fingerprint(con)
 
     # Latest views (10)

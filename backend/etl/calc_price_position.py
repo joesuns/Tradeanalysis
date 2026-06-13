@@ -31,6 +31,13 @@ class PricePositionCalculator:
 
     WINDOWS = [60, 120, 250]
 
+    DWS_COLS = [
+        "ts_code", "trade_date",
+        "price_position_60d", "price_position_120d", "price_position_250d",
+        "calc_date", "input_fingerprint", "spec_version",
+    ]
+    FLOAT_COLS = ["price_position_60d", "price_position_120d", "price_position_250d"]
+
     def __init__(self, con, freq: str = "daily"):
         self.con = con
         self.freq = freq
@@ -120,11 +127,7 @@ class PricePositionCalculator:
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
                 input_fingerprint: str = None,
                 write_start: str = None, write_end: str = None):
-        pos_cols = [f"price_position_{w}d" for w in self.WINDOWS]
-        dws_cols = ["ts_code", "trade_date"] + pos_cols + [
-            "calc_date", "input_fingerprint", "spec_version"]
-        float_cols = pos_cols
         return insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                                dws_cols, float_cols,
+                                self.DWS_COLS, self.FLOAT_COLS,
                                 input_fingerprint=input_fingerprint,
                                 write_start=write_start, write_end=write_end)
