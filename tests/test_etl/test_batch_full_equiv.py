@@ -211,7 +211,7 @@ def test_run_batch_append_phase_clears_full_items_after_batch_full(monkeypatch):
     importlib.reload(cfg)
     monkeypatch.setattr(
         "backend.etl.calc_fast_skip.preflight_stock_modes_with_fps",
-        lambda ts_code, state_map, *tails: (modes[ts_code], {}),
+        lambda ts_code, state_map, *tails, **kwargs: (modes[ts_code], {}),
     )
     monkeypatch.setattr(
         "backend.etl.calc_state.load_calc_state_batch",

@@ -1,4 +1,6 @@
 """Registry of calc routing specs for append-only and fast-skip preflight."""
+from typing import Dict, Tuple
+
 from backend.etl.calc_macd import MACDCalculator
 from backend.etl.calc_ma import MACalculator
 from backend.etl.calc_kpattern import KPatternCalculator
@@ -29,6 +31,26 @@ CALC_ROUTE_SPECS = [
     ("dde", "daily", DDECalculator, DDE_SIG_COLS, "dde"),
     ("dde", "weekly", DDECalculator, DDE_SIG_COLS, "dde"),
 ]
+
+# Canonical expected spec_version per (indicator, freq) routing key.
+INDICATOR_SPEC_VERSIONS: Dict[Tuple[str, str], str] = {
+    (indicator_name, freq): getattr(CalcCls, "SPEC_VERSION", "v1")
+    for indicator_name, freq, CalcCls, _, _ in CALC_ROUTE_SPECS
+}
+
+# Route indicator name → DWS table/view prefix (priceposition → price_position).
+INDICATOR_DWS_PREFIX = {
+    "priceposition": "price_position",
+}
+
+
+def expected_spec_version(indicator: str, freq: str) -> str:
+    return INDICATOR_SPEC_VERSIONS.get((indicator, freq), "v1")
+
+
+def dws_latest_view(indicator: str, freq: str) -> str:
+    prefix = INDICATOR_DWS_PREFIX.get(indicator, indicator)
+    return f"v_dws_{prefix}_{freq}_latest"
 
 
 def quote_sig_col_union() -> list:
