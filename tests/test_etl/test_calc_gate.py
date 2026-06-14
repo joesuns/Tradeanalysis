@@ -89,8 +89,11 @@ def test_try_force_same_day_batch_shortcut_skips_tail_loads(monkeypatch):
     codes = ["A.SZ", "B.SZ"]
     from backend.etl.calc_indicators import CALC_ROUTE_SPECS
     for ts in codes:
-        for indicator_name, freq, _cls, _sig, _src in CALC_ROUTE_SPECS:
-            upsert_calc_state(con, ts, freq, indicator_name, "20260608", "fp", "20260608")
+        for indicator_name, freq, CalcCls, _sig, _src in CALC_ROUTE_SPECS:
+            upsert_calc_state(
+                con, ts, freq, indicator_name, "20260608", "fp", "20260608",
+                spec_version=getattr(CalcCls, "SPEC_VERSION", "v1"),
+            )
 
     tail_called = {"n": 0}
 
