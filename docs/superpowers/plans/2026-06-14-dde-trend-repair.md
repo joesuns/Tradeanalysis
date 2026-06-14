@@ -1,6 +1,6 @@
 # DDE Trend 数据质量修复 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]` / `- [x]`) syntax for tracking.
 >
 > **关联 plan：** [2026-06-14-calc-spec-version-governance.md](./2026-06-14-calc-spec-version-governance.md)；[2026-06-14-ma-alignment-fallback-fix.md](./2026-06-14-ma-alignment-fallback-fix.md)
 >
@@ -128,14 +128,14 @@ flowchart LR
 
 ### Task M0-1: 策略侧熔断
 
-- [ ] **Step 1:** 文档记录：combo / screening 中含 `dde_trend` 的配置清单（grep `dde_trend` in `backend/backtest/`, scripts）
-- [ ] **Step 2:** 临时移除或注释 `dde_trend: up/down` 硬过滤（配置/文档层，不改算法）
-- [ ] **Step 3:** 标记含 `dde_trend` 的回测结果为 **INVALID pending M6**
+- [x] **Step 1:** 文档记录：combo / screening 中含 `dde_trend` 的配置清单（grep `dde_trend` in `backend/backtest/`, scripts）
+- [x] **Step 2:** 临时移除或注释 `dde_trend: up/down` 硬过滤（配置/文档层，不改算法）
+- [x] **Step 3:** 标记含 `dde_trend` 的回测结果为 **INVALID pending M6**
 
 ### Task M0-2: 团队通知
 
-- [ ] **Step 1:** 在 runbook 或 incident 记录：Excel「DDE趋势」日线 **Tier-0 不可信** 至 M4 Gate 通过
-- [ ] **Step 2:** 临时替代信号：`ddx`/`ddx2`/`dde_alert`（与 `trend` 算法解耦，spec §12.17.1）
+- [x] **Step 1:** 在 runbook 或 incident 记录：Excel「DDE趋势」日线 **Tier-0 不可信** 至 M4 Gate 通过
+- [x] **Step 2:** 临时替代信号：`ddx`/`ddx2`/`dde_alert`（与 `trend` 算法解耦，spec §12.17.1）
 
 ---
 
@@ -159,7 +159,7 @@ flowchart LR
 - Create: `scripts/audit_dde_trend_oracle.py`
 - Create: `tests/test_scripts/test_audit_dde_trend_oracle.py`
 
-- [ ] **Step 1: 写失败单测（synthetic，不依赖实库）**
+- [x] **Step 1: 写失败单测（synthetic，不依赖实库）**
 
 ```python
 # tests/test_scripts/test_audit_dde_trend_oracle.py
@@ -200,12 +200,12 @@ def test_recompute_daily_trend_last_bar():
     assert got == "up"
 ```
 
-- [ ] **Step 2: 跑测试确认 FAIL**
+- [x] **Step 2: 跑测试确认 FAIL**
 
 Run: `pytest tests/test_scripts/test_audit_dde_trend_oracle.py::test_recompute_daily_trend_last_bar -v`  
 Expected: FAIL `ModuleNotFoundError` or `ImportError`
 
-- [ ] **Step 3: 实现 minimal oracle 模块**
+- [x] **Step 3: 实现 minimal oracle 模块**
 
 ```python
 # scripts/audit_dde_trend_oracle.py（核心片段）
@@ -322,12 +322,12 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 4: 跑测试 PASS**
+- [x] **Step 4: 跑测试 PASS**
 
 Run: `pytest tests/test_scripts/test_audit_dde_trend_oracle.py -v`  
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/audit_dde_trend_oracle.py tests/test_scripts/test_audit_dde_trend_oracle.py
@@ -362,7 +362,7 @@ python scripts/audit_dde_trend_oracle.py --date 20260612 --freq daily \
 - Modify: `backend/etl/backfill_dde_recalc.py`
 - Modify: `tests/test_etl/test_backfill_dde_recalc.py`
 
-- [ ] **Step 1: 写失败测试（镜像 weekly 测试）**
+- [x] **Step 1: 写失败测试（镜像 weekly 测试）**
 
 ```python
 def test_invalidate_dde_daily_snapshots_calc_date_only(db_with_schema):
@@ -385,9 +385,9 @@ def test_invalidate_dde_daily_snapshots_calc_date_only(db_with_schema):
     assert con.execute("SELECT COUNT(*) FROM dws_dde_daily").fetchone()[0] == 1
 ```
 
-- [ ] **Step 2: RUN FAIL** — `pytest tests/test_etl/test_backfill_dde_recalc.py::test_invalidate_dde_daily_snapshots_calc_date_only -v`
+- [x] **Step 2: RUN FAIL** — `pytest tests/test_etl/test_backfill_dde_recalc.py::test_invalidate_dde_daily_snapshots_calc_date_only -v`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 ```python
 def invalidate_dde_daily_snapshots(con, calc_date: str, ts_codes=None) -> int:
@@ -482,9 +482,9 @@ def prepare_dde_daily_recalc(con, calc_date, ts_codes=None, dry_run=False) -> di
     return stats
 ```
 
-- [ ] **Step 4: 补 `test_prepare_dde_daily_recalc_dry_run`**（mirror weekly dry_run 测试）
-- [ ] **Step 5: RUN PASS** — `pytest tests/test_etl/test_backfill_dde_recalc.py -v`
-- [ ] **Step 6: Commit** — `git commit -m "feat: dde daily invalidate for trend repair"`
+- [x] **Step 4: 补 `test_prepare_dde_daily_recalc_dry_run`**（mirror weekly dry_run 测试）
+- [x] **Step 5: RUN PASS** — `pytest tests/test_etl/test_backfill_dde_recalc.py -v`
+- [x] **Step 6: Commit** — `git commit -m "feat: dde daily invalidate for trend repair"`
 
 ### Task M2-2: CLI `repair-dde-trend`
 
@@ -492,7 +492,7 @@ def prepare_dde_daily_recalc(con, calc_date, ts_codes=None, dry_run=False) -> di
 - Modify: `backend/cli.py`
 - Create: `tests/test_cli_repair_dde_trend.py`
 
-- [ ] **Step 1: CLI 实现**
+- [x] **Step 1: CLI 实现**
 
 ```python
 def cmd_repair_dde_trend(args):
@@ -534,7 +534,7 @@ def cmd_repair_dde_trend(args):
 
 > **实现注：** `log_etl_end` 在 subprocess 后须 reopen 连接或使用 prepare 阶段已写 log；实现时 mirror `backfill-dde-meta --recalc` 模式（`cli.py:627-640`）。
 
-- [ ] **Step 2: argparse**
+- [x] **Step 2: argparse**
 
 ```python
 rdt = sp.add_parser("repair-dde-trend",
@@ -545,7 +545,7 @@ rdt.add_argument("--ts-code", nargs="+")
 rdt.add_argument("--dry-run", action="store_true")
 ```
 
-- [ ] **Step 3: dry-run 集成测**
+- [x] **Step 3: dry-run 集成测**
 
 ```python
 def test_repair_dde_trend_dry_run(db_with_schema, capsys):
@@ -560,7 +560,7 @@ def test_repair_dde_trend_dry_run(db_with_schema, capsys):
     assert "dry_run" in out or "True" in out
 ```
 
-- [ ] **Step 4: Commit** — `git commit -m "feat: cli repair-dde-trend for DDE trend content refresh"`
+- [x] **Step 4: Commit** — `git commit -m "feat: cli repair-dde-trend for DDE trend content refresh"`
 
 ---
 
@@ -578,7 +578,7 @@ def test_repair_dde_trend_dry_run(db_with_schema, capsys):
 
 ### Task M3-1: 执行 repair（六股）
 
-- [ ] **Step 1: dry-run**
+- [x] **Step 1: dry-run**
 
 ```bash
 python -m backend.cli repair-dde-trend --date 20260612 --freq daily --dry-run \
@@ -587,14 +587,14 @@ python -m backend.cli repair-dde-trend --date 20260612 --freq daily --dry-run \
 
 Expected: 打印 `dde_daily_state_deleted` / `dde_daily_rows_deleted` 计数（dry_run 时为 0）
 
-- [ ] **Step 2: 实跑（确认无并行 run）**
+- [x] **Step 2: 实跑（确认无并行 run）**
 
 ```bash
 python -m backend.cli repair-dde-trend --date 20260612 --freq daily \
   --ts-code 600831.SH 000691.SZ 300400.SZ 601696.SH 601188.SH 300888.SZ
 ```
 
-- [ ] **Step 3: Oracle 验收**
+- [x] **Step 3: Oracle 验收**
 
 ```bash
 python scripts/audit_dde_trend_oracle.py --date 20260612 --freq daily \
@@ -603,7 +603,7 @@ python scripts/audit_dde_trend_oracle.py --date 20260612 --freq daily \
 
 Expected: `mismatched=0`, exit 0
 
-- [ ] **Step 4: 600831 DDX3 斜率人工核对**
+- [x] **Step 4: 600831 DDX3 斜率人工核对**
 
 ```bash
 python -c "
@@ -641,14 +641,14 @@ Expected: `down`
 
 ### Task M4-1: 全市场执行
 
-- [ ] **Step 1:** 确认 DuckDB 无并行写
-- [ ] **Step 2:**
+- [x] **Step 1:** 确认 DuckDB 无并行写
+- [x] **Step 2:**
 
 ```bash
 python -m backend.cli repair-dde-trend --date 20260612 --freq daily
 ```
 
-- [ ] **Step 3: 抽样 oracle**
+- [x] **Step 3: 抽样 oracle**
 
 ```bash
 python scripts/audit_dde_trend_oracle.py --date 20260612 --freq daily --sample 500
@@ -656,7 +656,7 @@ python scripts/audit_dde_trend_oracle.py --date 20260612 --freq daily --sample 5
 
 Expected: `mismatched / 500 < 0.001`（即 < 1 只）
 
-- [ ] **Step 4: export 抽检**
+- [x] **Step 4: export 抽检**
 
 ```bash
 python -m backend.cli export --date 20260612 --ts-code 600831.SH 000691.SZ
@@ -690,9 +690,9 @@ GROUP BY 1 ORDER BY 2 DESC;
 
 **Files:** 只读 / 临时诊断脚本（不提交或提交到 `scripts/` 均可）
 
-- [ ] **Step 1:** 在实库对 600831 跑 APPEND 模拟（tail255 + vector path），记录 `batch_append_dde` 输出 trend vs stored
-- [ ] **Step 2:** 对比 calc_date=20260612 当日 `ods_etl_log.calc_dws` 中 `full_by_indicator` / `batch_append` 路径
-- [ ] **Step 3:** 书面假设写入 Gate 失败记录模板（一条）
+- [x] **Step 1:** 在实库对 600831 跑 APPEND 模拟（tail255 + vector path），记录 `batch_append_dde` 输出 trend vs stored
+- [x] **Step 2:** 对比 calc_date=20260612 当日 `ods_etl_log.calc_dws` 中 `full_by_indicator` / `batch_append` 路径
+- [x] **Step 3:** 书面假设写入 Gate 失败记录模板（一条）
 
 **候选假设（按优先级，须证据确认）：**
 
@@ -704,7 +704,7 @@ GROUP BY 1 ORDER BY 2 DESC;
 
 **Files:** `tests/test_etl/test_calc_dde.py`, `tests/test_etl/test_batch_append_calc.py`
 
-- [ ] **Step 1: 新增测试**
+- [x] **Step 1: 新增测试**
 
 ```python
 def test_moneyflow_trend_declining_ddx3_is_down():
@@ -727,12 +727,12 @@ def test_moneyflow_trend_declining_ddx3_is_down():
     assert trend[-1] == "down"
 ```
 
-- [ ] **Step 2:** 若 APPEND 路径有 bug，补 `test_batch_append_dde_daily_trend_matches_full`（参考现有 weekly trend 测试 `test_batch_append_calc.py:794`）
+- [x] **Step 2:** 若 APPEND 路径有 bug，补 `test_batch_append_dde_daily_trend_matches_full`（参考现有 weekly trend 测试 `test_batch_append_calc.py:794`）
 
 ### Task M5-3: 最小 fix + 绿
 
-- [ ] **Step 1:** 仅修改根因文件（单一 commit）
-- [ ] **Step 2:**
+- [x] **Step 1:** 仅修改根因文件（单一 commit）
+- [x] **Step 2:**
 
 ```bash
 pytest tests/test_etl/test_calc_dde.py tests/test_etl/test_batch_append_calc.py -v
@@ -741,7 +741,7 @@ pytest tests/ -v
 
 ### Task M5-4: 新 bar smoke（可选，有新交易日时）
 
-- [ ] 对新交易日跑 `cli run` 或 `calc`，oracle sample 50 **mismatch=0**
+- [x] 对新交易日跑 `cli run` 或 `calc`，oracle sample 50 **mismatch=0**
 
 ---
 
@@ -761,7 +761,7 @@ pytest tests/ -v
 
 **Files:** `scripts/health_check.py`, `tests/test_scripts/test_health_check_dde_trend.py`（若需）
 
-- [ ] **Step 1: 在 Section J 之后新增 Section K**
+- [x] **Step 1: 在 Section J 之后新增 Section K**
 
 ```python
     print("=== K. DDE trend content oracle（日线最新 bar） ===")
@@ -775,19 +775,19 @@ pytest tests/ -v
         c.warn(f"dde_trend oracle mismatch rate {rate:.2%} > 0.1%")
 ```
 
-- [ ] **Step 2:** `pytest` + `python scripts/health_check.py`
+- [x] **Step 2:** `pytest` + `python scripts/health_check.py`
 
 ### Task M6-2: 文档
 
-- [ ] **Step 1:** 更新 `CLAUDE.md` — `repair-dde-trend` 命令、Tier-0 DQ 说明
-- [ ] **Step 2:** 更新 `docs/superpowers/plans/2026-06-09-daily-runbook.md` — 事故 SOP
-- [ ] **Step 3:** 更新 `calc-spec-version-governance.md` — DDE trend 实例
+- [x] **Step 1:** 更新 `CLAUDE.md` — `repair-dde-trend` 命令、Tier-0 DQ 说明
+- [x] **Step 2:** 更新 `docs/superpowers/plans/2026-06-09-daily-runbook.md` — 事故 SOP
+- [x] **Step 3:** 更新 `calc-spec-version-governance.md` — DDE trend 实例
 
 ### Task M6-3: 消费恢复（量化主导）
 
-- [ ] **Step 1:** 恢复 combo `dde_trend` 过滤
-- [ ] **Step 2:** 重跑标记为 INVALID 的回测
-- [ ] **Step 3:** 记录 repair 前后 `dde_trend=up` 池规模变化
+- [x] **Step 1:** 恢复 combo `dde_trend` 过滤
+- [x] **Step 2:** 重跑标记为 INVALID 的回测
+- [x] **Step 3:** 记录 repair 前后 `dde_trend=up` 池规模变化
 
 ---
 
@@ -821,3 +821,26 @@ pytest tests/ -v
 2. **Inline Execution** — 本会话按 M0→M6 顺序执行，每里程碑末输出 Gate 检查表
 
 **请选择执行方式，并确认 M0 熔断是否已完成。**
+
+---
+
+## 完成记录（2026-06-14 实库验收）
+
+**Commits:** `3c8aa14`（repair-dde-trend + oracle + health_check Section K）、`525200e`（combo batch COUNT 重跑）
+
+| 里程碑 | 验收证据 |
+|--------|----------|
+| **M3** | 六股 pilot oracle 6/6；600831 等全 `down` |
+| **M4** | 全市场 `repair-dde-trend --date 20260612` ~19min；oracle sample 500 mismatch=0 |
+| **M5** | 根因=stale DWS（非 APPEND bug）；`test_moneyflow_trend_declining_ddx3_is_down` + batch_append 等价测 |
+| **M6** | health_check Section K 200/200 PASS；combo 重跑（阳克阴+DDE up = 52,460） |
+
+**repair 前后池规模（20260612 截面）：**
+
+| 指标 | repair 前 | repair 后 |
+|------|-----------|-----------|
+| 全市场 `dde_trend=up` | 2,747 | 2,843 |
+| 全市场 `dde_trend=down` | 2,273 | 2,177 |
+| 阳克阴 + `dde_trend=up` | — | 112 |
+
+**PR:** [#5](https://github.com/joesuns/Tradeanalysis/pull/5)（含 DDE repair + combo 优化）
