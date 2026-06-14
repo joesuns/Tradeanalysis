@@ -1151,6 +1151,12 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
 
         logger.info("progress calc.chunk: started | stocks=%d", len(chunk))
 
+        dwd_fp_cache = None
+        if fast_on:
+            from backend.etl.calc_dwd_fp_gate import build_dwd_fp_cache
+
+            dwd_fp_cache = build_dwd_fp_cache(con, chunk, calc_date)
+
         stock_modes = {}
         fp_cache_by_stock = {}
         for ts_code in chunk:
@@ -1160,6 +1166,8 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                     ts_code, state_map,
                     daily_tails.get(ts_code), weekly_tails.get(ts_code),
                     dde_daily.get(ts_code), dde_weekly.get(ts_code),
+                    con=con,
+                    dwd_fp_cache=dwd_fp_cache,
                 )
                 if modes is not None:
                     stock_modes[ts_code] = modes
@@ -1298,6 +1306,9 @@ def _should_skip_calc_idempotent(
     # --force same-day reuse trusts prior calc; stale tail stocks are a subset
     # handled on the next fetch/calc cycle and must not block the whole market.
     if force:
+        from backend.etl.calc_spec_gate import has_spec_stale_indicators
+        if has_spec_stale_indicators(con):
+            return False
         return True
 
     if not skip_stale_fetch:
@@ -1775,6 +1786,8 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 "WHERE calc_date='%s' GROUP BY reason", calc_date)
     from backend.etl.calc_gate import get_ods_max_trade_date
 
+    from backend.etl.calc_spec_gate import count_spec_stale_by_indicator
+
     chunk_stock_count = len({ts for ts, _ in full_items}) + len(fallthrough_codes)
     batch_obs = {}
     if batch_ctx:
@@ -1782,6 +1795,8 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
             "preflight_source": batch_ctx.get("preflight_source", "cold"),
             "tails_load_skipped": batch_ctx.get("tails_load_skipped", False),
             "preflight_elapsed_sec": batch_ctx.get("preflight_elapsed_sec", 0.0),
+            "cold_merge_stocks": batch_ctx.get("cold_merge_stocks", 0),
+            "cold_merge_elapsed_sec": batch_ctx.get("cold_merge_elapsed_sec", 0.0),
             "state_upsert_mode": batch_ctx.get("state_upsert_mode", "per_stock"),
         }
     log_etl_end(
@@ -1799,6 +1814,7 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
             "full_by_indicator": (
                 batch_ctx.get("full_by_indicator", {}) if batch_ctx else {}
             ),
+            "spec_stale_counts": count_spec_stale_by_indicator(con),
             **batch_obs,
         },
     )

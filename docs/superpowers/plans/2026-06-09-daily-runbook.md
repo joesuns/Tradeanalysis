@@ -89,6 +89,27 @@ python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date YYYYM
 
 **禁止：** backfill / `--recalc` 期间并行 `run` 或 `calc`（DuckDB 单写进程）。
 
+### DDE trend 内容修复（2026-06-14 事故）
+
+**症状：** 日线 `dde_trend`（Excel「DDE趋势」）与 B4 moneyflow 算法不一致；`calc --refresh-spec dde` **无效**（state 已是 v2）。
+
+**消费熔断（repair 前）：** combo/screening **勿用** `dde_trend` 硬过滤；见 plan `2026-06-14-dde-trend-repair.md` M0。
+
+| 步骤 | 命令 | 验收 |
+|------|------|------|
+| 1 Oracle 基线 | `python3 scripts/audit_dde_trend_oracle.py --date YYYYMMDD --freq daily --sample 500` | 记录 mismatch（repair 前） |
+| 2 六股 pilot | `python3 -m backend.cli repair-dde-trend --date YYYYMMDD --freq daily --ts-code 600831.SH ...` | oracle 6/6 |
+| 3 全市场 daily | `python3 -m backend.cli repair-dde-trend --date YYYYMMDD --freq daily` | sample 500 mismatch < 0.1% |
+| 4 验收 | `python3 scripts/audit_dde_trend_oracle.py --date YYYYMMDD --freq daily --sample 500` | exit 0 |
+
+**禁止：** `rebuild_all_dwd`、12 指标无差别 `--force`、repair 期间并行 `run`。
+
+**反面教材：** 仅 `calc --refresh-spec dde` 无法修复（`find_spec_stale_codes` 返回 0）。
+
+**2026-06-14 实库 repair 已完成（calc_date=20260612）：** oracle sample 500 mismatch=0；health_check Section K PASS。
+
+---
+
 **验收：** 成熟股最新 week-end 截面 `v_dws_dde_weekly_latest.trend` NULL ≤20%；Excel 周线 DDE趋势 N/A 应显著低于补洞前（~90%）。
 
 ### refresh-state vs backfill-state

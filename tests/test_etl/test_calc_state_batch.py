@@ -46,6 +46,7 @@ def test_skip_batch_append_collects_state_records(monkeypatch):
     import pandas as pd
 
     import backend.config as cfg
+    from backend.db.schema import create_all_tables, ensure_calc_state_table
     from backend.etl.calc_batch_append import run_batch_append_phase
     from backend.etl.calc_ma import MACalculator
     from backend.etl.calc_macd import MACDCalculator
@@ -66,17 +67,28 @@ def test_skip_batch_append_collects_state_records(monkeypatch):
     fp = state_signature(tail_df, last_td, sig_cols)
 
     con = duckdb.connect(":memory:")
+    create_all_tables(con)
     ensure_calc_state_table(con)
+    for d in dates[-5:]:
+        con.execute(
+            "INSERT OR IGNORE INTO dim_date (trade_date, is_trade_day, is_week_end) VALUES (?, 1, 0)",
+            [d],
+        )
     for code in codes:
         for indicator in ("macd", "ma"):
+            spec = "v2" if indicator == "ma" else getattr(
+                MACDCalculator if indicator == "macd" else MACalculator,
+                "SPEC_VERSION",
+                "v1",
+            )
             con.execute("""
                 INSERT INTO dws_calc_state
                     (ts_code, freq, indicator, last_trade_date, history_fp,
                      quote_latest_adj, spec_version, updated_calc_date)
-                VALUES (?, 'daily', ?, ?, ?, NULL, 'v1', '20260608')
-            """, [code, indicator, last_td, fp])
+                VALUES (?, 'daily', ?, ?, ?, NULL, ?, '20260608')
+            """, [code, indicator, last_td, fp, spec])
 
-    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde, specs=None):
+    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde, specs=None, **kwargs):
         modes = {
             ("macd", "daily"): ("SKIP", []),
             ("ma", "daily"): ("SKIP", []),

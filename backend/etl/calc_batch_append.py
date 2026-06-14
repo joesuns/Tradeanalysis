@@ -11,6 +11,17 @@ logger = logging.getLogger(__name__)
 
 ModeMap = Dict[str, Dict[Tuple[str, str], str]]
 
+
+def _compute_chunk_codes(
+    codes: List[str],
+    stock_modes: dict,
+    full_items: list,
+) -> List[str]:
+    """Stocks needing chunk worker: preflight failed entirely or remaining FULL work."""
+    fallthrough = {ts for ts in codes if ts not in stock_modes}
+    full_stocks = {ts for ts, _ in full_items}
+    return sorted(fallthrough | full_stocks)
+
 BATCH_INDICATOR_ZH = {
     ("macd", "daily"): "MACD日线",
     ("macd", "weekly"): "MACD周线",
@@ -102,6 +113,7 @@ def _batch_append_loop(
     )
     n = insert_dws_batch_multi(
         calc.con, calc.dws_table, stock_rows, calc_date, dws_cols, float_cols,
+        spec_version=getattr(calc, "SPEC_VERSION", "v1"),
     )
     agg.calculated = n
     prog.log_done(写入行=n)
@@ -520,6 +532,9 @@ def _batch_full_loop(
     latest_fps: Optional[dict] = None,
     latest_specs: Optional[dict] = None,
     check_spec: bool = False,
+    state_map: Optional[dict] = None,
+    indicator_name: Optional[str] = None,
+    sig_cols: Optional[List[str]] = None,
 ):
     """Shared batch FULL: per-stock compute, one insert_dws_batch_multi narrow write."""
     from backend.etl.base import (
@@ -529,6 +544,8 @@ def _batch_full_loop(
         load_latest_fingerprints,
         load_latest_spec_versions,
     )
+    from backend.etl.calc_router import state_signature
+    from backend.etl.calc_state import upsert_calc_state_batch
     from backend.etl.progress import stock_progress
 
     if latest_fps is None:
@@ -541,6 +558,7 @@ def _batch_full_loop(
 
     stock_rows = []
     agg = CalcResult()
+    align_state_records = []
     write_end = calc_date if recalc_start else None
 
     for ts_code in ts_codes:
@@ -567,6 +585,19 @@ def _batch_full_loop(
 
         if check_dwd_unchanged(calc.con, calc.dws_table, ts_code, df, **unchanged_kwargs):
             agg.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code, "DWD fingerprint match")
+            if (
+                state_map is not None
+                and sig_cols
+                and indicator_name
+            ):
+                st = state_map.get((ts_code, calc.freq, indicator_name))
+                if st is not None:
+                    last_td = st["last_trade_date"]
+                    hist_fp = state_signature(df, last_td, sig_cols)
+                    align_state_records.append((
+                        ts_code, calc.freq, indicator_name, last_td, hist_fp,
+                        calc_date, None, spec_version,
+                    ))
             prog.tick()
             continue
 
@@ -591,6 +622,8 @@ def _batch_full_loop(
         prog.log_done(写入行=n)
     else:
         prog.log_done(写入行=0)
+    if align_state_records:
+        upsert_calc_state_batch(calc.con, align_state_records)
     return agg, stock_rows
 
 
@@ -642,6 +675,9 @@ def batch_full_macd(
         spec_version=MACDCalculator.SPEC_VERSION, check_spec=True,
         latest_fps=load_latest_fingerprints(con, calc.dws_table, ts_codes),
         latest_specs=load_latest_spec_versions(con, calc.dws_table, ts_codes),
+        state_map=state_map,
+        indicator_name="macd",
+        sig_cols=MACDCalculator.SIGNATURE_COLS,
     )
 
 
@@ -654,6 +690,7 @@ def batch_full_ma(
     quote_groups: dict,
     state_map: Optional[dict] = None,
 ):
+    from backend.etl.base import load_latest_fingerprints, load_latest_spec_versions
     from backend.etl.calc_ma import MACalculator
 
     calc = MACalculator(con, freq)
@@ -662,6 +699,13 @@ def batch_full_ma(
         lambda c, _code, df: c._compute_indicators(df),
         MACalculator.DWS_COLS, MACalculator.FLOAT_COLS,
         _batch_label_zh("ma", freq), min_rows=11,
+        spec_version=MACalculator.SPEC_VERSION,
+        check_spec=True,
+        latest_fps=load_latest_fingerprints(con, calc.dws_table, ts_codes),
+        latest_specs=load_latest_spec_versions(con, calc.dws_table, ts_codes),
+        state_map=state_map,
+        indicator_name="ma",
+        sig_cols=MACalculator.SIGNATURE_COLS,
     )
 
 
@@ -688,6 +732,9 @@ def batch_full_kpattern(
         calc, ts_codes, calc_date, recalc_start, quote_groups, _compute,
         KPatternCalculator.DWS_COLS, KPatternCalculator.FLOAT_COLS,
         _batch_label_zh("kpattern", freq), min_rows=min_rows,
+        state_map=state_map,
+        indicator_name="kpattern",
+        sig_cols=KPatternCalculator.SIGNATURE_COLS,
     )
 
 
@@ -700,6 +747,7 @@ def batch_full_volume(
     quote_groups: dict,
     state_map: Optional[dict] = None,
 ):
+    from backend.etl.base import load_latest_fingerprints, load_latest_spec_versions
     from backend.etl.calc_volume import VolumeCalculator
 
     calc = VolumeCalculator(con, freq)
@@ -709,6 +757,12 @@ def batch_full_volume(
         VolumeCalculator.DWS_COLS, VolumeCalculator.FLOAT_COLS,
         _batch_label_zh("volume", freq), min_rows=5,
         spec_version=VolumeCalculator.SPEC_VERSION,
+        check_spec=True,
+        latest_fps=load_latest_fingerprints(con, calc.dws_table, ts_codes),
+        latest_specs=load_latest_spec_versions(con, calc.dws_table, ts_codes),
+        state_map=state_map,
+        indicator_name="volume",
+        sig_cols=calc.SIGNATURE_COLS,
     )
 
 
@@ -729,6 +783,9 @@ def batch_full_priceposition(
         lambda c, _code, df: c._compute_positions(df),
         PricePositionCalculator.DWS_COLS, PricePositionCalculator.FLOAT_COLS,
         _batch_label_zh("priceposition", freq), min_rows=2,
+        state_map=state_map,
+        indicator_name="priceposition",
+        sig_cols=PricePositionCalculator.SIGNATURE_COLS,
     )
 
 
@@ -787,6 +844,9 @@ def batch_full_dde(
         spec_version=DDECalculator.SPEC_VERSION, check_spec=True,
         latest_fps=load_latest_fingerprints(con, calc.dws_table, filtered_codes),
         latest_specs=load_latest_spec_versions(con, calc.dws_table, filtered_codes),
+        state_map=state_map,
+        indicator_name="dde",
+        sig_cols=DDECalculator.SIGNATURE_COLS,
     )
     for ts_code in ts_codes:
         if ts_code.endswith(".BJ"):
@@ -920,9 +980,13 @@ def _modes_from_state_only(
     ts_code: str,
     state_map: dict,
     calc_date: str,
+    spec_versions: Optional[dict] = None,
 ) -> Optional[Dict[Tuple[str, str], Tuple[str, list]]]:
     """Build all-SKIP modes from dws_calc_state when state was refreshed on calc_date."""
-    from backend.etl.calc_indicators import CALC_ROUTE_SPECS
+    from backend.etl.calc_indicators import CALC_ROUTE_SPECS, INDICATOR_SPEC_VERSIONS
+
+    if spec_versions is None:
+        spec_versions = INDICATOR_SPEC_VERSIONS
 
     modes: Dict[Tuple[str, str], Tuple[str, list]] = {}
     for indicator_name, freq, _, _sig_cols, source in CALC_ROUTE_SPECS:
@@ -930,6 +994,10 @@ def _modes_from_state_only(
         if st is None:
             return None
         if st.get("updated_calc_date") != calc_date:
+            return None
+        expected = spec_versions.get((indicator_name, freq), "v1")
+        stored = st.get("spec_version") or "v1"
+        if stored != expected:
             return None
         modes[(indicator_name, freq)] = ("SKIP", [])
     return modes
@@ -961,14 +1029,12 @@ def try_force_same_day_batch_shortcut(
     state_map = load_calc_state_batch(con, codes)
 
     stock_modes: Dict[str, Dict[Tuple[str, str], Tuple[str, list]]] = {}
-    chunk_codes: Set[str] = set()
     completed_keys: Set[Tuple[str, str, str]] = set()
     agg_by_key = defaultdict(CalcResult)
 
     for ts_code in codes:
         modes = _modes_from_state_only(ts_code, state_map, calc_date)
         if modes is None:
-            chunk_codes.add(ts_code)
             continue
         stock_modes[ts_code] = modes
         for (indicator_name, freq), _ in modes.items():
@@ -981,8 +1047,7 @@ def try_force_same_day_batch_shortcut(
     from backend.etl.calc_executor import build_work_queue
 
     wq = build_work_queue(stock_modes, completed_keys)
-    chunk_codes |= {ts for ts, _ in wq.full_items}
-    chunk_codes = sorted(chunk_codes)
+    chunk_codes = _compute_chunk_codes(codes, stock_modes, wq.full_items)
 
     logger.info(
         "progress calc.batch_append: done | %.0fs | chunk=%d batch_only=%d | force_shortcut",
@@ -1017,7 +1082,8 @@ def _merge_cold_tails_and_preflight(
     dde_weekly: dict,
     stock_modes: dict,
     fp_cache_by_stock: dict,
-    chunk_codes: Set[str],
+    calc_date: str,
+    dwd_fp_cache: Optional[dict],
 ) -> None:
     """Cold-load tails + preflight for codes missing from refresh context."""
     from backend.etl.calc_indicators import quote_tail_columns
@@ -1031,26 +1097,55 @@ def _merge_cold_tails_and_preflight(
     if not missing:
         return
 
-    daily_tails.update(batch_load_quote_tails(
-        con, missing, "daily", quote_tail_columns("daily"),
-    ))
-    weekly_tails.update(batch_load_quote_tails(
-        con, missing, "weekly", quote_tail_columns("weekly"),
-    ))
-    dde_daily.update(batch_load_dde_tails(con, missing, "daily"))
-    dde_weekly.update(batch_load_dde_tails(con, missing, "weekly"))
+    from backend.etl.progress import log_timed_step, stock_progress
 
+    daily_tails.update(log_timed_step(
+        "calc.batch_tails", "quote_daily",
+        lambda: batch_load_quote_tails(
+            con, missing, "daily", quote_tail_columns("daily"),
+        ),
+        stocks=len(missing),
+        step_zh=BATCH_TAIL_ZH["quote_daily"],
+    ))
+    weekly_tails.update(log_timed_step(
+        "calc.batch_tails", "quote_weekly",
+        lambda: batch_load_quote_tails(
+            con, missing, "weekly", quote_tail_columns("weekly"),
+        ),
+        stocks=len(missing),
+        step_zh=BATCH_TAIL_ZH["quote_weekly"],
+    ))
+    dde_daily.update(log_timed_step(
+        "calc.batch_tails", "dde_daily",
+        lambda: batch_load_dde_tails(con, missing, "daily"),
+        stocks=len(missing),
+        step_zh=BATCH_TAIL_ZH["dde_daily"],
+    ))
+    dde_weekly.update(log_timed_step(
+        "calc.batch_tails", "dde_weekly",
+        lambda: batch_load_dde_tails(con, missing, "weekly"),
+        stocks=len(missing),
+        step_zh=BATCH_TAIL_ZH["dde_weekly"],
+    ))
+
+    preflight = stock_progress(
+        "calc.batch_preflight", len(missing), detail="热路径冷合并预检",
+    )
+    preflight.log_start()
     for ts_code in missing:
         modes, fps = preflight_stock_modes_with_fps(
             ts_code, state_map,
             daily_tails.get(ts_code), weekly_tails.get(ts_code),
             dde_daily.get(ts_code), dde_weekly.get(ts_code),
+            con=con, dwd_fp_cache=dwd_fp_cache,
         )
         if modes is None:
-            chunk_codes.add(ts_code)
+            preflight.tick()
             continue
         stock_modes[ts_code] = modes
         fp_cache_by_stock[ts_code] = fps
+        preflight.tick()
+    preflight.log_done()
 
 
 def run_batch_append_phase(
@@ -1105,17 +1200,19 @@ def run_batch_append_phase(
     t_preflight = time.monotonic()
 
     from backend.config import CALC_REUSE_REFRESH_CTX
+    from backend.etl.calc_dwd_fp_gate import build_dwd_fp_cache
     from backend.etl.calc_preflight_context import slice_context_for_codes
     from backend.etl.progress import log_timed_step
 
     n = len(codes)
     preflight_source = "cold"
     tails_load_skipped = False
-    chunk_codes: Set[str] = set()
     completed_keys: Set[Tuple[str, str, str]] = set()
     agg_by_key = defaultdict(CalcResult)
     stock_modes: Dict[str, Dict[Tuple[str, str], Tuple[str, list]]] = {}
     fp_cache_by_stock: Dict[str, Dict[Tuple[str, str], str]] = {}
+    cold_merge_stocks = 0
+    cold_merge_elapsed_sec = 0.0
 
     use_hot = (
         CALC_REUSE_REFRESH_CTX
@@ -1137,19 +1234,23 @@ def run_batch_append_phase(
         dde_weekly = dict(sliced.dde_weekly)
         stock_modes = dict(sliced.stock_modes)
         fp_cache_by_stock = dict(sliced.fp_cache_by_stock)
-        chunk_codes = {c for c in codes if c not in stock_modes}
         preflight_source = "refresh"
         tails_load_skipped = True
+        dwd_fp_cache = build_dwd_fp_cache(con, codes, calc_date)
         logger.info(
             "progress calc.batch_append: 热路径 | preflight_source=refresh | %d股",
             len(codes),
         )
+        t_cold = time.monotonic()
+        cold_merge_stocks = sum(1 for c in codes if c not in stock_modes)
         _merge_cold_tails_and_preflight(
             con, codes, state_map,
             daily_tails, weekly_tails, dde_daily, dde_weekly,
-            stock_modes, fp_cache_by_stock, chunk_codes,
+            stock_modes, fp_cache_by_stock, calc_date, dwd_fp_cache,
         )
-        if chunk_codes:
+        if cold_merge_stocks:
+            cold_merge_elapsed_sec = round(time.monotonic() - t_cold, 2)
+        if any(c not in stock_modes for c in codes):
             tails_load_skipped = False
     else:
         logger.info(
@@ -1161,6 +1262,7 @@ def run_batch_append_phase(
             lambda: load_calc_state_batch(con, codes), stocks=n,
             step_zh=BATCH_TAIL_ZH["state"],
         )
+        dwd_fp_cache = build_dwd_fp_cache(con, codes, calc_date)
         daily_tails = log_timed_step(
             "calc.batch_tails", "quote_daily",
             lambda: batch_load_quote_tails(
@@ -1198,9 +1300,9 @@ def run_batch_append_phase(
                 ts_code, state_map,
                 daily_tails.get(ts_code), weekly_tails.get(ts_code),
                 dde_daily.get(ts_code), dde_weekly.get(ts_code),
+                con=con, dwd_fp_cache=dwd_fp_cache,
             )
             if modes is None:
-                chunk_codes.add(ts_code)
                 preflight.tick()
                 continue
             stock_modes[ts_code] = modes
@@ -1305,8 +1407,7 @@ def run_batch_append_phase(
                     agg_by_key[key].add_skip(reason, code, detail)
         wq = build_work_queue(stock_modes, completed_keys)
 
-    chunk_codes |= {ts for ts, _ in wq.full_items}
-    chunk_codes = sorted(chunk_codes)
+    chunk_codes = _compute_chunk_codes(codes, stock_modes, wq.full_items)
 
     logger.info(
         "progress calc.batch_append: 完成 | %.0fs | chunk=%d batch_only=%d | batch_full=%d",
@@ -1332,5 +1433,7 @@ def run_batch_append_phase(
         "preflight_source": preflight_source,
         "tails_load_skipped": tails_load_skipped,
         "preflight_elapsed_sec": preflight_elapsed_sec,
+        "cold_merge_stocks": cold_merge_stocks,
+        "cold_merge_elapsed_sec": cold_merge_elapsed_sec,
         "state_upsert_mode": "batch",
     }

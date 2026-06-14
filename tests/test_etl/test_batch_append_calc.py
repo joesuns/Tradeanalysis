@@ -722,6 +722,153 @@ def test_batch_append_dde_matches_per_stock_append():
     con.close()
 
 
+def _setup_dde_baseline_with_dc(con, codes, n=200):
+    """DDE baseline with net_amount_dc/circ_mv; dc net declines (600831-class trend down)."""
+    import numpy as np
+
+    from backend.db.schema import create_all_tables
+    from backend.etl.calc_dde import DDECalculator
+
+    create_all_tables(con)
+    dates = [f"44{i:06d}" for i in range(n)]
+    con.executemany(
+        "INSERT INTO dim_date (trade_date, is_trade_day, is_week_end) VALUES (?, 1, 0)",
+        [(d,) for d in dates],
+    )
+    net_decline = np.linspace(5000, -5000, n)
+    mv = np.full(n, 1e9)
+    q_rows, m_rows = [], []
+    for j, code in enumerate(codes):
+        rng = np.random.default_rng(301 + j)
+        close = 10.0 + np.cumsum(rng.normal(0, 0.2, n))
+        for i, d in enumerate(dates):
+            c = float(close[i])
+            tv = float(rng.uniform(10000, 50000))
+            buy_lg = tv * 0.3
+            sell_lg = tv * 0.25
+            buy_elg = tv * 0.1
+            sell_elg = tv * 0.08
+            net_mf = buy_lg + buy_elg - sell_lg - sell_elg
+            q_rows.append((code, d, c, c + 0.1, c - 0.1, c, 1000.0 + i, mv[i], mv[i], 0))
+            m_rows.append((
+                code, d, buy_lg, sell_lg, buy_elg, sell_elg, tv, net_mf,
+                float(net_decline[i]),
+            ))
+    con.executemany(
+        "INSERT INTO dwd_daily_quote "
+        "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, "
+        "total_mv, circ_mv, is_suspended) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        q_rows,
+    )
+    con.executemany(
+        "INSERT INTO dwd_daily_moneyflow "
+        "(ts_code, trade_date, buy_lg_vol, sell_lg_vol, buy_elg_vol, "
+        "sell_elg_vol, total_vol, net_mf_amount, net_amount_dc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        m_rows,
+    )
+    baseline_date = dates[-2]
+    calc = DDECalculator(con, "daily")
+    for code in codes:
+        calc.calculate([code], baseline_date, recalc_start=dates[0])
+    return dates
+
+
+def test_batch_append_dde_daily_trend_matches_full(monkeypatch):
+    """Daily batch APPEND trend must match per-stock append (vector path, dc+circ B4).
+
+    M5 investigation: batch_append_dde vector path preserves net_amount_dc/circ_mv from
+    tail load and calls the same _compute_dde_derived as non-vector. On declining-dc
+    fixtures both write trend=down, not the stale up seen pre-repair on 20260612.
+    """
+    import duckdb
+    import pandas as pd
+
+    monkeypatch.setenv("CALC_VECTOR_APPEND", "1")
+
+    from backend.etl.calc_batch_append import batch_append_dde
+    from backend.etl.calc_dde import DDECalculator
+
+    codes = ["DDEd.SZ"]
+    con = duckdb.connect(":memory:")
+    dates = _setup_dde_baseline_with_dc(con, codes, n=200)
+    calc = DDECalculator(con, "daily")
+    dde_groups = calc._load_daily_batch(codes)
+    dde_tails = {
+        c: dde_groups[c][dde_groups[c]["trade_date"] >= dates[-80]].reset_index(drop=True)
+        for c in codes
+    }
+    new_td = f"45{len(dates):06d}"
+    con.execute(
+        "INSERT INTO dim_date (trade_date, is_trade_day, is_week_end) VALUES (?, 1, 0)",
+        [new_td],
+    )
+    rng_close = float(dde_tails[codes[0]].iloc[-1]["close_qfq"]) + 0.05
+    tv = 45000.0
+    new_dc = -5500.0
+    con.execute(
+        "INSERT INTO dwd_daily_quote "
+        "(ts_code, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, vol, "
+        "total_mv, circ_mv, is_suspended) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        [codes[0], new_td, rng_close, rng_close + 0.1, rng_close - 0.1, rng_close,
+         9000.0, 1e9, 1e9],
+    )
+    con.execute(
+        "INSERT INTO dwd_daily_moneyflow "
+        "(ts_code, trade_date, buy_lg_vol, sell_lg_vol, buy_elg_vol, "
+        "sell_elg_vol, total_vol, net_mf_amount, net_amount_dc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [codes[0], new_td, 10000, 8000, 3000, 2000, tv, 3000.0, new_dc],
+    )
+    dde_tails[codes[0]] = pd.concat([
+        dde_tails[codes[0]],
+        pd.DataFrame({
+            "trade_date": [new_td],
+            "buy_lg_vol": [10000.0], "sell_lg_vol": [8000.0],
+            "buy_elg_vol": [3000.0], "sell_elg_vol": [2000.0],
+            "total_vol": [tv], "net_mf_amount": [3000.0],
+            "net_amount_dc": [new_dc],
+            "close_qfq": [rng_close],
+            "total_mv": [1e9], "circ_mv": [1e9],
+        }),
+    ], ignore_index=True)
+
+    calc_date = new_td
+    per_stock = {}
+    for code in codes:
+        calc.append_calculate(
+            code, dde_tails[code], [new_td], calc_date,
+            {"last_trade_date": dates[-1]},
+        )
+        row = con.execute(
+            "SELECT trend FROM dws_dde_daily "
+            "WHERE ts_code = ? AND trade_date = ? AND calc_date = ?",
+            [code, new_td, calc_date],
+        ).fetchone()
+        per_stock[code] = row[0]
+        assert row[0] == "down", f"append_calculate trend should be down, got {row[0]}"
+
+    con.execute(
+        "DELETE FROM dws_dde_daily WHERE trade_date = ? AND calc_date = ?",
+        [new_td, calc_date],
+    )
+    batch_append_dde(
+        con, "daily", codes, calc_date, dde_tails, {c: [new_td] for c in codes},
+    )
+    for code in codes:
+        got = con.execute(
+            "SELECT trend FROM dws_dde_daily "
+            "WHERE ts_code = ? AND trade_date = ? AND calc_date = ?",
+            [code, new_td, calc_date],
+        ).fetchone()[0]
+        assert got == per_stock[code], (
+            f"batch_append_dde trend {got!r} != append {per_stock[code]!r}"
+        )
+        assert got == "down"
+    con.close()
+
+
 def _insert_weekly_quote(con, code, trade_date, close):
     con.execute(
         "INSERT OR REPLACE INTO dwd_weekly_quote "
@@ -901,7 +1048,7 @@ def test_run_batch_append_phase_pure_append_empty_chunk(monkeypatch):
     dates = _setup_macd_batch_stocks(con, codes, n=260)
     new_td = f"41{260:06d}"
 
-    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde):
+    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde, **kwargs):
         return {("macd", "daily"): ("APPEND", [new_td])}, {}
 
     batch_calls = []

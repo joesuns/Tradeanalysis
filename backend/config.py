@@ -47,6 +47,8 @@ CALC_STRICT_DATE = os.getenv("CALC_STRICT_DATE", "1").strip() != "0"
 CALC_FORCE_HARD = os.getenv("CALC_FORCE_HARD", "0").strip() == "1"
 # CALC_FORCE_BATCH_REUSE: when on (default), --force on unchanged data skips batch tail SQL.
 CALC_FORCE_BATCH_REUSE = os.getenv("CALC_FORCE_BATCH_REUSE", "1").strip() != "0"
+# CALC_DWD_FP_GATE: downgrade spurious FULL when history_fp stale but DWS input unchanged.
+CALC_DWD_FP_GATE = os.getenv("CALC_DWD_FP_GATE", "1").strip() != "0"
 # DWD_INCREMENTAL: daily run rebuilds only stale stocks + tail-day INSERT (no full-history DELETE).
 DWD_INCREMENTAL = os.getenv("DWD_INCREMENTAL", "1").strip() != "0"
 # DWD_REBUILD_REFRESH_STATE: after DWD rebuild, realign dws_calc_state history_fp

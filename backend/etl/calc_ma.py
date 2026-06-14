@@ -5,7 +5,7 @@ import pandas as pd
 from backend.etl.base import (
     sma, to_float_safe, linear_regression_slope, weighted_window_slopes,
     insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
-    load_latest_fingerprints, load_quote_groups, compute_history_signature,
+    load_latest_fingerprints, load_latest_spec_versions, load_quote_groups, compute_history_signature,
     SkipReason, CalcResult,
 )
 from backend.etl.recalc_spec import RecalcSpec
@@ -35,6 +35,8 @@ class MACalculator:
     alignment (10 DWS enums + single-slope fallback), and turning points (golden/dead cross).
     Works for both daily and weekly frequencies."""
 
+    SPEC_VERSION = "v2"
+
     RECALC_SPEC_DAILY = RecalcSpec(lookback=10, seed=10, event_tail=5, min_rows=11)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=10, seed=10, event_tail=5, min_rows=11)
 
@@ -59,6 +61,7 @@ class MACalculator:
                   quote_groups: dict = None) -> CalcResult:
         result = CalcResult()
         latest_fps = load_latest_fingerprints(self.con, self.dws_table, ts_codes)
+        latest_specs = load_latest_spec_versions(self.con, self.dws_table, ts_codes)
         if quote_groups is None:
             load_start = None
             if recalc_start:
@@ -83,7 +86,9 @@ class MACalculator:
                 continue
 
             if check_dwd_unchanged(self.con, self.dws_table, ts_code, df,
-                                   latest_fps=latest_fps, recalc_start=recalc_start):
+                                   latest_fps=latest_fps, recalc_start=recalc_start,
+                                   expected_spec_version=self.SPEC_VERSION,
+                                   latest_specs=latest_specs):
                 result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
                                 "DWD fingerprint match")
                 continue

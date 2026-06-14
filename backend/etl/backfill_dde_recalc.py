@@ -10,6 +10,88 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 
+def invalidate_dde_daily_snapshots(
+    con,
+    calc_date: str,
+    ts_codes: Optional[List[str]] = None,
+) -> int:
+    """Remove DDE daily DWS rows for calc_date so daily trend is recomputed.
+
+    Narrow scope: one calc_date batch only (not full-table DELETE).
+    """
+    if ts_codes:
+        ph = ",".join(["?"] * len(ts_codes))
+        before = con.execute(
+            f"""
+            SELECT COUNT(*) FROM dws_dde_daily
+            WHERE calc_date = ? AND ts_code IN ({ph})
+            """,
+            [calc_date] + list(ts_codes),
+        ).fetchone()[0]
+        if before:
+            con.execute(
+                f"""
+                DELETE FROM dws_dde_daily
+                WHERE calc_date = ? AND ts_code IN ({ph})
+                """,
+                [calc_date] + list(ts_codes),
+            )
+        return int(before)
+
+    before = con.execute(
+        "SELECT COUNT(*) FROM dws_dde_daily WHERE calc_date = ?",
+        [calc_date],
+    ).fetchone()[0]
+    if before:
+        con.execute(
+            "DELETE FROM dws_dde_daily WHERE calc_date = ?",
+            [calc_date],
+        )
+    return int(before)
+
+
+def invalidate_dde_daily_calc_state(
+    con,
+    ts_codes: Optional[List[str]] = None,
+) -> int:
+    """Drop dde/daily calc routing state so chunk path can FULL if needed."""
+    if ts_codes:
+        ph = ",".join(["?"] * len(ts_codes))
+        before = con.execute(
+            f"""
+            SELECT COUNT(*) FROM dws_calc_state
+            WHERE indicator = 'dde' AND freq = 'daily'
+              AND ts_code IN ({ph})
+            """,
+            list(ts_codes),
+        ).fetchone()[0]
+        if before:
+            con.execute(
+                f"""
+                DELETE FROM dws_calc_state
+                WHERE indicator = 'dde' AND freq = 'daily'
+                  AND ts_code IN ({ph})
+                """,
+                list(ts_codes),
+            )
+        return int(before)
+
+    before = con.execute(
+        """
+        SELECT COUNT(*) FROM dws_calc_state
+        WHERE indicator = 'dde' AND freq = 'daily'
+        """
+    ).fetchone()[0]
+    if before:
+        con.execute(
+            """
+            DELETE FROM dws_calc_state
+            WHERE indicator = 'dde' AND freq = 'daily'
+            """
+        )
+    return int(before)
+
+
 def invalidate_dde_weekly_snapshots(
     con,
     calc_date: str,
@@ -90,6 +172,46 @@ def invalidate_dde_weekly_calc_state(
             """
         )
     return int(before)
+
+
+def prepare_dde_daily_recalc(
+    con,
+    calc_date: str,
+    ts_codes: Optional[List[str]] = None,
+    dry_run: bool = False,
+) -> dict:
+    """Invalidate dde daily DWS/state (in-process, before calc subprocess)."""
+    from backend.etl.calc_gate import assert_calc_date_ready, resolve_effective_calc_date
+    from backend.config import CALC_STRICT_DATE
+    from backend.db.schema import ensure_calc_state_table
+    from backend.fetch.ods_daily import get_all_active_codes
+
+    ensure_calc_state_table(con)
+    if CALC_STRICT_DATE:
+        assert_calc_date_ready(con, calc_date, strict=True)
+    else:
+        calc_date = resolve_effective_calc_date(con, calc_date, cap_to_ods=True)
+
+    universe = ts_codes if ts_codes else get_all_active_codes(con)
+    logger.info(
+        "repair_dde_trend: daily prepare stocks=%d calc_date=%s dry_run=%s",
+        len(universe), calc_date, dry_run,
+    )
+    stats = {
+        "calc_date": calc_date,
+        "stocks": len(universe),
+        "dry_run": dry_run,
+        "dde_daily_rows_deleted": 0,
+        "dde_daily_state_deleted": 0,
+    }
+    if not dry_run:
+        stats["dde_daily_rows_deleted"] = invalidate_dde_daily_snapshots(
+            con, calc_date, ts_codes=ts_codes,
+        )
+        stats["dde_daily_state_deleted"] = invalidate_dde_daily_calc_state(
+            con, ts_codes=ts_codes,
+        )
+    return stats
 
 
 def prepare_dde_weekly_recalc(

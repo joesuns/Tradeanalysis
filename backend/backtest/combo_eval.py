@@ -104,6 +104,75 @@ def find_combo_signals(db_path: str, trade_date: str, **kwargs) -> list[dict]:
         con.close()
 
 
+def count_combo_signals(
+    db_path: str,
+    start_date: str,
+    end_date: str,
+    **kwargs,
+) -> int:
+    """Count resonance signals across a trade-date range (one scan, not per-day)."""
+    con = duckdb.connect(db_path, read_only=True)
+    try:
+        joins = [f"FROM {VIEW_MAP['kpattern']} k"]
+        conditions = ["k.trade_date >= ?", "k.trade_date <= ?"]
+        params = [start_date, end_date]
+
+        patterns = kwargs.get("patterns", [])
+        kp_cols = ["yang_bao_yin", "yang_ke_yin", "mu_bei_xian", "bi_lei_zhen",
+                    "gao_kai_chang_yin", "yin_bao_yang", "yin_ke_yang"]
+        for p in patterns:
+            if p in kp_cols:
+                conditions.append(f"k.{p} = 1")
+
+        macd_cols = ["divergence", "turning_point", "zone"]
+        if any(kwargs.get(f"macd_{c}") for c in macd_cols):
+            joins.append(
+                f"JOIN {VIEW_MAP['macd']} m "
+                "ON k.ts_code = m.ts_code AND k.trade_date = m.trade_date"
+            )
+            for c in macd_cols:
+                val = kwargs.get(f"macd_{c}")
+                if val:
+                    conditions.append(f"m.{c} = ?")
+                    params.append(val)
+
+        dde_cols = ["divergence", "trend"]
+        if any(kwargs.get(f"dde_{c}") for c in dde_cols):
+            joins.append(
+                f"JOIN {VIEW_MAP['dde']} d "
+                "ON k.ts_code = d.ts_code AND k.trade_date = d.trade_date"
+            )
+            for c in dde_cols:
+                val = kwargs.get(f"dde_{c}")
+                if val:
+                    conditions.append(f"d.{c} = ?")
+                    params.append(val)
+
+        if kwargs.get("ma_alignment"):
+            joins.append(
+                f"JOIN {VIEW_MAP['ma']} a "
+                "ON k.ts_code = a.ts_code AND k.trade_date = a.trade_date"
+            )
+            conditions.append("a.alignment = ?")
+            params.append(kwargs["ma_alignment"])
+
+        if kwargs.get("vol_zone"):
+            joins.append(
+                f"JOIN {VIEW_MAP['volume']} v "
+                "ON k.ts_code = v.ts_code AND k.trade_date = v.trade_date"
+            )
+            conditions.append("v.zone = ?")
+            params.append(kwargs["vol_zone"])
+
+        sql = (
+            f"SELECT COUNT(*) FROM (SELECT DISTINCT k.ts_code, k.trade_date "
+            f"{' '.join(joins)} WHERE {' AND '.join(conditions)}) sub"
+        )
+        return int(con.execute(sql, params).fetchone()[0] or 0)
+    finally:
+        con.close()
+
+
 if __name__ == "__main__":
     import sys
     db_path = sys.argv[1] if len(sys.argv) > 1 else "data/tradeanalysis.duckdb"
@@ -128,29 +197,28 @@ if __name__ == "__main__":
     ]
 
     con = duckdb.connect(db_path, read_only=True)
-    dates = [r[0] for r in con.execute(
-        "SELECT DISTINCT trade_date FROM dim_date WHERE is_trade_day = 1 "
-        "AND trade_date >= '20150101' AND trade_date <= '20260602' "
-        "ORDER BY trade_date"
-    ).fetchall()]
+    end_date = con.execute(
+        "SELECT MAX(trade_date) FROM v_dws_kpattern_daily_latest"
+    ).fetchone()[0] or "20260612"
     con.close()
+    start_date = "20150101"
 
     import time
-    print(f"{'Strategy':40s} {'Signals':>8s} {'Remark'}")
-    print("-" * 60)
+    print(f"Combo scan: {start_date} .. {end_date} (batch COUNT)", flush=True)
+    print(f"{'Strategy':40s} {'Signals':>8s} {'Sec':>6s} {'Remark'}", flush=True)
+    print("-" * 70, flush=True)
     for s in strategies:
         t0 = time.time()
-        total = 0
-        for d in dates:
-            signals = find_combo_signals(db_path, d,
-                                         patterns=s["patterns"],
-                                         macd_turning_point=s.get("macd_turning_point"),
-                                         macd_divergence=s.get("macd_divergence"),
-                                         dde_divergence=s.get("dde_divergence"),
-                                         dde_trend=s.get("dde_trend"))
-            total += len(signals)
+        print(f"  scanning: {s['label']}...", flush=True)
+        kw = {
+            "patterns": s["patterns"],
+            "macd_turning_point": s.get("macd_turning_point"),
+            "macd_divergence": s.get("macd_divergence"),
+            "dde_divergence": s.get("dde_divergence"),
+            "dde_trend": s.get("dde_trend"),
+        }
+        kw = {k: v for k, v in kw.items() if v is not None}
+        total = count_combo_signals(db_path, start_date, end_date, **kw)
         elapsed = time.time() - t0
-        remark = ""
-        if total < 100:
-            remark = "insufficient data"
-        print(f"{s['label']:40s} {total:>8d}  {remark}")
+        remark = "insufficient data" if total < 100 else ""
+        print(f"{s['label']:40s} {total:>8d} {elapsed:>6.1f}  {remark}", flush=True)

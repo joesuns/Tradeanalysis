@@ -661,3 +661,24 @@ def test_weekly_trend_nan_ddx3_tail_is_flat():
         daily, [daily["trade_date"].iloc[-1].strftime("%Y%m%d")],
     )
     assert trend[-1] == "flat"
+
+
+def test_moneyflow_trend_declining_ddx3_is_down():
+    """B4: monotonic declining DDX3 tail → down (600831 class).
+
+    M5 root-cause note: stored=up / recompute=down on 20260612 was traced to
+    stale DWS rows written before B4 moneyflow trend (net_amount_dc+circ_mv).
+    Current _compute_moneyflow_trend and APPEND paths agree on this fixture;
+    vector batch_append_dde is covered by test_batch_append_dde_daily_trend_matches_full.
+    """
+    calc = DDECalculator.__new__(DDECalculator)
+    calc.freq = "daily"
+    n = 80
+    dates = [f"202601{i:02d}" for i in range(1, n + 1)]
+    net = np.linspace(5000, -5000, n)
+    mv = np.full(n, 1e9)
+    trend = calc._compute_moneyflow_trend(
+        net.astype(float), mv.astype(float),
+        net_amount_dc=net.astype(float), circ_mv=mv.astype(float),
+    )
+    assert trend[-1] == "down"
