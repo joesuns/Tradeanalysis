@@ -622,6 +622,63 @@ def cmd_backfill_dde_meta(args):
         print("DDE recalc calc: subprocess ok")
 
 
+# ── repair-dde-trend ──
+
+def cmd_repair_dde_trend(args):
+    """Invalidate DDE trend routing+DWS and CALC_FORCE_HARD recalc (ops)."""
+    from backend.db.connection import get_connection, run_checkpoint
+    from backend.etl.backfill_dde_recalc import (
+        prepare_dde_daily_recalc,
+        prepare_dde_weekly_recalc,
+        run_calc_force_hard_subprocess,
+    )
+    from backend.etl.error_handler import log_etl_end, log_etl_start
+
+    calc_date = args.date
+    con = get_connection()
+    lid, t0 = log_etl_start(con, "repair_dde_trend")
+    stats = {"freq": args.freq}
+    try:
+        if args.freq in ("daily", "both"):
+            stats["daily"] = prepare_dde_daily_recalc(
+                con, calc_date, ts_codes=args.ts_code, dry_run=args.dry_run,
+            )
+        if args.freq in ("weekly", "both"):
+            stats["weekly"] = prepare_dde_weekly_recalc(
+                con, calc_date, ts_codes=args.ts_code, dry_run=args.dry_run,
+            )
+        if args.dry_run:
+            log_etl_end(
+                con, lid, "repair_dde_trend", t0, "success",
+                data_completeness={**stats, "dry_run": True},
+            )
+            print(stats)
+            return
+        run_checkpoint(con)
+    except Exception:
+        log_etl_end(con, lid, "repair_dde_trend", t0, "failed")
+        raise
+    finally:
+        con.close()
+
+    if args.freq in ("daily", "both"):
+        effective_date = stats["daily"]["calc_date"]
+    else:
+        effective_date = stats["weekly"]["calc_date"]
+
+    run_calc_force_hard_subprocess(effective_date, ts_codes=args.ts_code)
+
+    con = get_connection()
+    try:
+        log_etl_end(
+            con, lid, "repair_dde_trend", t0, "success",
+            data_completeness=stats,
+        )
+    finally:
+        con.close()
+    print("repair-dde-trend: calc subprocess ok")
+
+
 # ── repair-weekly ──
 
 def cmd_repair_weekly(args):
@@ -797,6 +854,16 @@ def main():
     bdm.add_argument("--recalc-only", action="store_true",
                      help="Skip ODS API; only run DDE weekly recalc closure (refresh+invalidate+calc)")
 
+    # repair-dde-trend
+    rdt = sp.add_parser(
+        "repair-dde-trend",
+        help="Invalidate DDE trend routing+DWS and CALC_FORCE_HARD recalc",
+    )
+    rdt.add_argument("--date", required=True, help="Calc date YYYYMMDD")
+    rdt.add_argument("--freq", choices=["daily", "weekly", "both"], default="daily")
+    rdt.add_argument("--ts-code", nargs="+")
+    rdt.add_argument("--dry-run", action="store_true")
+
     # prune
     pp = sp.add_parser("prune", help="Prune superseded DWS snapshots (keep last N runs)")
     pp.add_argument("--keep", type=int, default=5,
@@ -834,6 +901,7 @@ def main():
         "run": cmd_run,
         "backfill-state": cmd_backfill_state,
         "backfill-dde-meta": cmd_backfill_dde_meta,
+        "repair-dde-trend": cmd_repair_dde_trend,
         "refresh-state": cmd_refresh_state,
         "prune": cmd_prune,
         "repair-weekly": cmd_repair_weekly,

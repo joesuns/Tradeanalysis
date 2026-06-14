@@ -128,6 +128,34 @@ class Checker:
             self.failures += 1
         print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {v:,} (min {minimum:,})")
 
+    def warn(self, msg: str):
+        print(f"  [WARN] {msg}")
+
+    def fail(self, msg: str):
+        print(f"  [FAIL] {msg}")
+        self.failures += 1
+
+
+def dde_trend_oracle_gate(
+    c: Checker,
+    matched: int,
+    mismatched: int,
+    sample: int = 200,
+    trade_date: str = "",
+) -> None:
+    """Section K: stored vs recompute mismatch rate thresholds."""
+    total = matched + mismatched
+    rate = mismatched / max(total, 1)
+    td_suffix = f" @ {trade_date}" if trade_date else ""
+    print(
+        f"  [info] dde_trend oracle sample={sample}{td_suffix}: "
+        f"matched={matched:,} mismatched={mismatched:,} rate={rate:.4%}"
+    )
+    if rate > 0.01:
+        c.fail(f"dde_trend oracle mismatch rate {rate:.2%} > 1%")
+    elif rate > 0.001:
+        c.warn(f"dde_trend oracle mismatch rate {rate:.2%} > 0.1%")
+
 
 def run(con) -> int:
     c = Checker(con)
@@ -253,6 +281,24 @@ def run(con) -> int:
         mature_volume_weekly_fill_sql("zone"),
         minimum=fill_minimum,
     )
+
+    print("=== K. DDE trend content oracle（日线最新 bar） ===")
+    from scripts.audit_dde_trend_oracle import audit_oracle
+
+    try:
+        calc_date = c._scalar(
+            "SELECT MAX(trade_date) FROM v_dws_dde_daily_latest WHERE trend IS NOT NULL"
+        ) or ""
+        if not calc_date:
+            c.warn("dde_trend oracle skipped: no stored daily trend rows")
+        else:
+            matched, mismatched, _ = audit_oracle(
+                con, calc_date, freq="daily", sample=200,
+            )
+            dde_trend_oracle_gate(c, matched, mismatched, sample=200, trade_date=calc_date)
+    except Exception as e:
+        print(f"  [ERR ] dde_trend oracle: {e}")
+        c.failures += 1
 
     print()
     if c.failures == 0:
