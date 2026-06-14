@@ -195,13 +195,17 @@ def cmd_export(args):
     Reads DWS data directly from the database. No recalculation.
     Use 'calc' then 'export' separately if fresh data is needed.
     """
-    from backend.export_wide import default_export_path, export_wide_to_excel
+    from backend.export_wide import (
+        build_export_data_completeness,
+        default_export_path,
+        export_wide_to_excel,
+    )
 
     args.output = default_export_path(args.date, args.output)
 
     ts_codes = args.ts_code if args.ts_code else None
 
-    n = export_wide_to_excel(
+    result = export_wide_to_excel(
         args.db_path or "data/tradeanalysis.duckdb",
         args.date,
         args.output,
@@ -211,9 +215,9 @@ def cmd_export(args):
     )
     _warn_export_coverage(
         args.db_path or "data/tradeanalysis.duckdb",
-        args.date, n, filter_st=not args.include_st, ts_codes=ts_codes,
+        args.date, result.row_count, filter_st=not args.include_st, ts_codes=ts_codes,
     )
-    print(f"Exported {n} rows -> {args.output}")
+    print(f"Exported {result.row_count} rows -> {args.output}")
 
 
 # ── run ──
@@ -265,7 +269,11 @@ def cmd_run(args):
     """
     from backend.db.connection import get_connection
     from backend.etl.error_handler import log_etl_end, log_etl_start
-    from backend.export_wide import default_export_path, export_wide_to_excel
+    from backend.export_wide import (
+        build_export_data_completeness,
+        default_export_path,
+        export_wide_to_excel,
+    )
     from backend.fetch.client import TushareClient
     from backend.fetch.ods_daily import (
         fetch_by_date_range_parallel,
@@ -373,7 +381,7 @@ def cmd_run(args):
         con = get_connection()
         try:
             lid, t0 = log_etl_start(con, "run_export")
-            n = export_wide_to_excel(
+            result = export_wide_to_excel(
                 db_path,
                 date,
                 args.output,
@@ -382,16 +390,18 @@ def cmd_run(args):
                 ts_codes=ts_codes,
             )
             log_etl_end(
-                con, lid, "run_export", t0, "success", row_count=n,
-                data_completeness={"analysis_date": date},
+                con, lid, "run_export", t0, "success", row_count=result.row_count,
+                data_completeness=build_export_data_completeness(
+                    date, result.tradable_enrich,
+                ),
             )
         finally:
             con.close()
 
         _warn_export_coverage(
-            db_path, date, n, filter_st=not args.include_st, ts_codes=ts_codes,
+            db_path, date, result.row_count, filter_st=not args.include_st, ts_codes=ts_codes,
         )
-        print(f"Exported {n} rows -> {args.output}")
+        print(f"Exported {result.row_count} rows -> {args.output}")
     else:
         logger.info("Skipping export (--skip-export)")
     logger.info("Done.")
