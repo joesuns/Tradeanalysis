@@ -3,9 +3,53 @@ import numpy as np
 from backend.etl.calc_macd import MACDCalculator
 
 
+# ── B2 golden-master: frozen pre-vectorization oracles ──
+
+def _oracle_macd_trend_strength(bar, window=5):
+    result = np.full(len(bar), np.nan)
+    for i in range(window - 1, len(bar)):
+        segment = bar[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        if len(valid) < window:
+            continue
+        x = np.arange(window, dtype=float)
+        weights = np.exp(x * 0.15)
+        try:
+            slope = float(np.polyfit(x, valid, 1, w=weights)[0])
+        except (np.linalg.LinAlgError, ValueError, TypeError):
+            continue
+        scale = np.mean(np.abs(valid))
+        if scale < 1e-6:
+            result[i] = 0.0
+        elif np.isfinite(slope):
+            result[i] = float(slope) / scale
+    return result
+
+
+def test_macd_trend_strength_matches_oracle_random():
+    calc = MACDCalculator.__new__(MACDCalculator)
+    rng = np.random.default_rng(13)
+    for _ in range(40):
+        bar = rng.normal(0, 0.05, size=rng.integers(5, 90))
+        if rng.random() < 0.5:
+            idx = rng.integers(0, len(bar), size=max(1, len(bar) // 6))
+            bar[idx] = np.nan
+        got = calc._compute_trend_strength(bar)
+        exp = _oracle_macd_trend_strength(bar)
+        np.testing.assert_array_equal(np.isnan(got), np.isnan(exp))
+        m = ~np.isnan(exp)
+        np.testing.assert_allclose(got[m], exp[m], rtol=0, atol=1e-9)
+
+
+def _daily_calc():
+    calc = MACDCalculator.__new__(MACDCalculator)
+    calc.freq = "daily"
+    return calc
+
+
 def test_macd_ema_seed():
     """Verify EMA12 seed = SMA of first 12 close values."""
-    calc = MACDCalculator.__new__(MACDCalculator)
+    calc = _daily_calc()
     dates = [f"202601{i:02d}" for i in range(1, 31)]
     # Constant price -> EMA = price everywhere
     df = pd.DataFrame({"trade_date": dates, "close_qfq": [10.0] * 30})
@@ -16,7 +60,7 @@ def test_macd_ema_seed():
 
 def test_macd_bar_formula():
     """MACD bar = 2 * (DIF - DEA)"""
-    calc = MACDCalculator.__new__(MACDCalculator)
+    calc = _daily_calc()
     dates = [f"202601{i:02d}" for i in range(1, 35)]
     df = pd.DataFrame({"trade_date": dates, "close_qfq": [10.0 + i * 0.1 for i in range(34)]})
     result = calc._compute_indicators(df)
@@ -27,7 +71,7 @@ def test_macd_bar_formula():
 
 def test_macd_zone_bull_bear():
     """MACD bar > 0 -> bull, < 0 -> bear"""
-    calc = MACDCalculator.__new__(MACDCalculator)
+    calc = _daily_calc()
     dates = [f"202601{i:02d}" for i in range(1, 35)]
     df = pd.DataFrame({"trade_date": dates, "close_qfq": [10.0] * 34})
     result = calc._compute_indicators(df)
@@ -35,38 +79,6 @@ def test_macd_zone_bull_bear():
     valid_zones = result["zone"].dropna()
     # bar is 0.0 -> not bull (>0) and not bear (<0)
     assert len(valid_zones) == 0 or all(z is None for z in valid_zones)
-
-
-def test_macd_trend_weighted_up():
-    """5-bar 加权回归 + 阈值 0.001：上升趋势触发 up。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.0, 0.0, 0.0, 0.0, 0.01, 0.03, 0.06, 0.10, 0.15])
-    result = calc._compute_trend(bar, window=5)
-    assert result[8] == "up", f"加权上升趋势应为 up，实际 {result[8]}"
-
-
-def test_macd_trend_weighted_down():
-    """5-bar 加权回归 + 阈值 0.001：下降趋势触发 down。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.15, 0.10, 0.06, 0.03, 0.01, 0.0, 0.0, 0.0, 0.0])
-    result = calc._compute_trend(bar, window=5)
-    assert result[5] == "down", f"加权下降趋势应为 down，实际 {result[5]}"
-
-
-def test_macd_trend_flat():
-    """5-bar 加权回归：zigzag 数据判为 flat（加权斜率 < 0.001）。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.0, 0.0, 0.0, 0.0, 0.01, 0.009, 0.011, 0.009, 0.01])
-    result = calc._compute_trend(bar, window=5)
-    assert result[8] == "flat", f"zigzag 应为 flat，实际 {result[8]}"
-
-
-def test_macd_trend_insufficient_window():
-    """数据不足 5 根 → None。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    bar = np.array([0.01, 0.02, 0.03, 0.04])
-    result = calc._compute_trend(bar, window=5)
-    assert all(r is None for r in result), f"应全为 None，实际 {result}"
 
 
 def test_macd_trend_strength_positive():
@@ -114,307 +126,51 @@ def test_macd_trend_strength_insufficient():
     assert all(np.isnan(r) for r in result), f"应全为 NaN，实际 {result}"
 
 
-def test_macd_near_golden_3day_regression():
-    """3 日回归斜率检测收敛——gap 快速缩小，est<3。"""
+def test_macd_hist_turn_alert_via_calculator():
+    """123 3-bar inflection: h[-1] > h[-2] < h[-3] → downturn_reverse."""
     calc = MACDCalculator.__new__(MACDCalculator)
-    df = pd.DataFrame({
-        "trade_date": ["d0", "d1", "d2", "d3"],
-        "close_qfq": [10.0, 10.0, 10.0, 10.0],
-        "dif":       [0.50, 0.48, 0.46, 0.44],
-        "dea":       [0.60, 0.55, 0.51, 0.48],
-        "macd_bar":  [-0.20, -0.14, -0.10, -0.08],
-    })
-    result = calc._compute_turning_points(df)
-    # gaps: 0.10, 0.07, 0.05, 0.04 → 3日回归[0.07,0.05,0.04] slope≈-0.015
-    # est_days = 0.04/0.015 ≈ 2.7 < 3 ✓, gap/|DEA| = 0.04/0.48 = 8.3% < 15% ✓
-    assert result[3] == "near_golden", f"est<3应触发 near_golden，实际 {result[3]}"
-
-
-def test_macd_near_golden():
-    """DIF < DEA, gap narrowing, |DIF-DEA|/|DEA| < 15% → near_golden."""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    # Day 0: DIF=0.20, DEA=0.25 → gap=0.05, DIF < DEA
-    # Day 1: DIF=0.21, DEA=0.24 → gap=0.03 (< 0.05, narrowing), 0.03/0.24=12.5% < 15%
-    n = 5
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": [10.0] * n,
-        "dif":       [0.20, 0.21, 0.19, 0.22, 0.23],
-        "dea":       [0.25, 0.24, 0.26, 0.25, 0.24],
-        "macd_bar":  [-0.10, -0.06, -0.14, -0.06, -0.02],  # = 2*(DIF-DEA)
-    })
-    result = calc._compute_turning_points(df)
-    # Day 4: gaps [0.03, 0.12, 0.04, 0.01], 3日回归[0.12,0.04,0.01] slope≈-0.055
-    # est_days = 0.01/0.055 ≈ 0.18 < 3 ✓, gap/|DEA| = 0.01/0.24 = 4.2% < 15% ✓
-    assert result[4] == "near_golden", f"Expected near_golden at [4], got {result[4]}"
-    # Day 4: gap 0.01 < 0.03 (narrowing), 0.01/0.24=4.2% < 15%, DIF < DEA → near_golden
-    assert result[4] == "near_golden", f"Expected near_golden at [4], got {result[4]}"
-
-
-def test_macd_near_dead():
-    """DIF > DEA, gap narrowing, |DIF-DEA|/|DEA| < 15% → near_dead."""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    n = 5
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": [10.0] * n,
-        "dif":       [0.25, 0.24, 0.26, 0.25, 0.24],
-        "dea":       [0.20, 0.21, 0.19, 0.22, 0.23],
-        "macd_bar":  [0.10, 0.06, 0.14, 0.06, 0.02],
-    })
-    result = calc._compute_turning_points(df)
-    assert result[4] == "near_dead", f"Expected near_dead at [4], got {result[4]}"
-
-
-def test_macd_near_golden_gap_not_narrowing():
-    """Gap widening → NOT near_golden, even if |DIF-DEA|/|DEA| < 15%."""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    df = pd.DataFrame({
-        "trade_date": ["d0", "d1"],
-        "close_qfq": [10.0, 10.0],
-        "dif":       [0.20, 0.18],
-        "dea":       [0.25, 0.26],
-        "macd_bar":  [-0.10, -0.16],
-    })
-    result = calc._compute_turning_points(df)
-    # gap widens: 0.05 → 0.08, DIF < DEA but NOT narrowing
-    assert result[1] is None, f"Expected None (gap not narrowing), got {result[1]}"
-
-
-def test_macd_near_zero_axis_absolute_threshold():
-    """DEA near zero: use |DIF-DEA| < close*0.01% instead of relative 15%.
-
-    MACD bar stays positive throughout → no golden/dead cross interference.
-    |DEA| = 0.0004 < close*0.1% = 0.01 → absolute threshold triggered.
-    """
-    calc = MACDCalculator.__new__(MACDCalculator)
-    close = 10.0
-    df = pd.DataFrame({
-        "trade_date": ["d0", "d1"],
-        "close_qfq": [close, close],
-        "dif":       [0.0015, 0.0010],
-        "dea":       [0.0008, 0.0004],
-        "macd_bar":  [0.0014, 0.0012],  # positive, no sign flip
-    })
-    result = calc._compute_turning_points(df)
-    # gap narrowing: 0.0007 → 0.0006; |DEA|=0.0004 << 0.01 → absolute
-    # gap=0.0006 < close*0.0001=0.001 ✓; DIF > DEA → near_dead
-    assert result[1] == "near_dead", f"Expected near_dead via abs threshold, got {result[1]}"
-
-
-def test_macd_near_small_gap_direct():
-    """DIF-DEA 间距 < 0.005 → 直通 near_golden。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    df = pd.DataFrame({
-        "trade_date": ["d0", "d1", "d2", "d3"],
-        "close_qfq": [10.0, 10.0, 10.0, 10.0],
-        "dif":       [0.30, 0.30, 0.30, 0.30],
-        "dea":       [0.30, 0.30, 0.30, 0.304],
-        "macd_bar":  [-0.02, -0.01, -0.01, -0.02],  # stays negative, no cross
-    })
-    result = calc._compute_turning_points(df)
-    # gap = |0.30-0.304| = 0.004 < 0.005 → 直通
-    assert result[3] == "near_golden", f"小间距应直通 near_golden，实际 {result[3]}"
-
-
-def test_macd_near_est_too_slow():
-    """收敛太慢 → est>3 → 不触发。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    df = pd.DataFrame({
-        "trade_date": ["d0", "d1", "d2", "d3"],
-        "close_qfq": [10.0, 10.0, 10.0, 10.0],
-        "dif":       [0.50, 0.51, 0.515, 0.52],
-        "dea":       [0.60, 0.60, 0.60, 0.60],
-        "macd_bar":  [-0.20, -0.18, -0.17, -0.16],
-    })
-    result = calc._compute_turning_points(df)
-    # gaps: 0.10, 0.09, 0.085, 0.08 → 收敛太慢 est>>3
-    assert result[3] is None, f"est>3 不应触发，实际 {result[3]}"
-
-
-def test_macd_upturn_flat_alert():
-    """Previous 2 consecutive rises, then |change|/|prev| <= 2% → upturn_flat."""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    # bar[i-3]=0.10, bar[i-2]=0.12, bar[i-1]=0.14 (2 consecutive rises)
-    # bar[i]=0.141 → change = 0.001, 0.001/0.14 ≈ 0.7% <= 2% → upturn_flat
-    bar = [0.08, 0.10, 0.12, 0.14, 0.141, 0.142]
-    df = pd.DataFrame({"macd_bar": bar, "trade_date": [f"d{i}" for i in range(6)]})
+    bar = [1.0, -1.0, 0.5]
+    df = pd.DataFrame({"macd_bar": bar, "trade_date": ["d0", "d1", "d2"]})
     result = calc._compute_alerts(df)
-    assert result[4] == "upturn_flat", f"Expected upturn_flat at [4], got {result[4]}"
-
-
-def test_macd_downturn_flat_alert():
-    """Previous 2 consecutive falls, then |change|/|prev| <= 2% → downturn_flat."""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    bar = [0.14, 0.12, 0.10, 0.08, 0.079, 0.078]
-    df = pd.DataFrame({"macd_bar": bar, "trade_date": [f"d{i}" for i in range(6)]})
-    result = calc._compute_alerts(df)
-    assert result[4] == "downturn_flat", f"Expected downturn_flat at [4], got {result[4]}"
+    assert result[2] == "downturn_reverse"
 
 
 def test_macd_upturn_reverse_alert():
-    """Previous 2 consecutive rises, then bar[i] < bar[i-1] → upturn_reverse."""
+    """123 3-bar peak: h[-1] < h[-2] > h[-3] → upturn_reverse."""
     calc = MACDCalculator.__new__(MACDCalculator)
-    bar = [0.08, 0.10, 0.12, 0.14, 0.11, 0.10]
+    bar = [1.0, 2.0, 1.0]
+    df = pd.DataFrame({"macd_bar": bar, "trade_date": ["d0", "d1", "d2"]})
+    result = calc._compute_alerts(df)
+    assert result[2] == "upturn_reverse"
+
+
+def test_macd_no_flat_alert_on_monotonic_rise():
+    """123 hist_turn has no flat variant; monotonic rise without V-shape → None."""
+    calc = MACDCalculator.__new__(MACDCalculator)
+    bar = [0.08, 0.10, 0.12, 0.14, 0.16, 0.18]
     df = pd.DataFrame({"macd_bar": bar, "trade_date": [f"d{i}" for i in range(6)]})
     result = calc._compute_alerts(df)
-    assert result[4] == "upturn_reverse", f"Expected upturn_reverse at [4], got {result[4]}"
+    assert result[4] is None
+    assert result[5] is None
 
 
-def test_macd_alert_reverse_overrides_flat():
-    """When bar[i] < bar[i-1], upturn_reverse takes priority over upturn_flat."""
+def test_macd_divergence_uses_structure_pipeline():
+    """_compute_divergence delegates to structure pipeline and returns a list."""
+    from tests.test_etl.test_divergence_structure import _synthetic_macd_top_scenario
+
     calc = MACDCalculator.__new__(MACDCalculator)
-    # prev_up is True, bar[i] < bar[i-1] AND |change| small → should be reverse, not flat
-    bar = [0.08, 0.10, 0.12, 0.14, 0.139, 0.14]  # small drop: 0.001/0.14 = 0.7% (<2%)
-    df = pd.DataFrame({"macd_bar": bar, "trade_date": [f"d{i}" for i in range(6)]})
-    result = calc._compute_alerts(df)
-    # bar[4]=0.139 < bar[3]=0.14 → this is a reversal (though tiny)
-    # Reverse takes priority over flat
-    assert result[4] == "upturn_reverse", f"Expected upturn_reverse (priority), got {result[4]}"
-
-
-def test_macd_divergence_confirmation_day():
-    """Divergence labeled on confirmation day, not at price peak."""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    # Build 65 days: price goes up to peak at day 60, DIF peaks earlier at day 58
-    # Day 63: DIF has clearly rolled over, price still near peak but not at peak
-    n = 68
-    close = np.full(n, 10.0)
-    dif = np.full(n, 1.0)
-    # Ramp up price to peak at day 60
-    for i in range(30, 61):
-        close[i] = 10.0 + (i - 30) * 0.1  # 10.0 → 13.0
-    # DIF rises then falls earlier than price
-    for i in range(30, 59):
-        dif[i] = 1.0 + (i - 30) * 0.05  # DIF peaks at day 58
-    for i in range(59, n):
-        dif[i] = dif[58] - (i - 58) * 0.05  # DIF declines after day 58
-    # Price stays near peak after day 60 (plateau)
-    for i in range(61, n):
-        close[i] = close[60] - (i - 60) * 0.01  # very slow decline
-
+    close, dif, dea, macd = _synthetic_macd_top_scenario()
     df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
+        "trade_date": [f"d{i}" for i in range(len(close))],
         "close_qfq": close,
         "dif": dif,
+        "dea": dea,
+        "macd_bar": macd,
     })
     result = calc._compute_divergence(df)
-    # Divergence should appear after DIF peak (day 58) but before price breakdown
-    # No divergence before DIF peak
-    for i in range(58):
-        assert result[i] is None, f"Before DIF peak, got {result[i]} at {i}"
-    # Some day after DIF peak should have divergence
-    any_after = any(result[i] == "top_divergence" for i in range(58, n))
-    assert any_after, "Expected top_divergence to appear on a confirmation day after peak"
-
-
-def test_macd_divergence_no_duplicate_within_5_days():
-    """Same divergence event should not repeat within 5 trading days."""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    # Flat price plateau after peak, DIF already rolled over
-    # This would trigger on multiple consecutive days without dedup
-    n = 75
-    close = np.full(n, 10.0)
-    dif = np.full(n, 1.0)
-    for i in range(30, 61):
-        close[i] = 10.0 + (i - 30) * 0.1
-    for i in range(30, 56):
-        dif[i] = 1.0 + (i - 30) * 0.05  # DIF peaks at day 55
-    for i in range(56, n):
-        dif[i] = dif[55] - (i - 55) * 0.02  # DIF declining
-    for i in range(61, n):
-        close[i] = close[60]  # price stays flat at peak
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close,
-        "dif": dif,
-    })
-    result = calc._compute_divergence(df)
-    # Find all top_divergence entries
-    div_indices = [i for i in range(n) if result[i] == "top_divergence"]
-    # Should have at least one
-    assert len(div_indices) > 0, "Expected at least one top_divergence"
-    # No two divergence events within 5 bars of each other
-    for j in range(1, len(div_indices)):
-        gap = div_indices[j] - div_indices[j - 1]
-        assert gap > 5, f"Divergence at {div_indices[j-1]} and {div_indices[j]} too close (gap={gap})"
-
-
-def test_macd_bottom_div_recovery_strong():
-    """DIF 回升 >10% + 价格低点 3 天前 → 底背离触发。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    n = 68
-    close = np.full(n, 10.0)
-    dif = np.full(n, 0.5)
-    for i in range(30, 58):
-        close[i] = 10.0 - (i - 30) * 0.1
-    for i in range(30, 56):
-        dif[i] = 0.5 - (i - 30) * 0.05
-    dif[55] = -0.75
-    for i in range(56, n):
-        dif[i] = dif[i-1] + 0.04
-        close[i] = close[57] * 1.001    # 极慢反弹, 距低点仍在 2% 内
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close, "dif": dif,
-    })
-    result = calc._compute_divergence(df)
-    # DIF 回升 >10% + 价格止跌 → 底背离触发（可能在5日去重窗口内附近）
-    any_bottom = any(r == "bottom_divergence" for r in result[58:63])
-    assert any_bottom, "DIF回升>10%+价格止跌应触发底背离"
-
-
-def test_macd_bottom_div_recovery_weak():
-    """DIF 回升 <10% → 不触发。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    n = 68
-    close = np.full(n, 10.0)
-    dif = np.full(n, 0.5)
-    for i in range(30, 58):
-        close[i] = 10.0 - (i - 30) * 0.1
-    for i in range(30, 56):
-        dif[i] = 0.5 - (i - 30) * 0.05
-    dif[55] = -0.75
-    for i in range(56, n):
-        dif[i] = dif[i-1] + 0.002      # 回升极慢
-        close[i] = close[57] * 1.005
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close, "dif": dif,
-    })
-    result = calc._compute_divergence(df)
-    for i in range(60, n):
-        assert result[i] != "bottom_divergence", (
-            f"DIF回升<10%不应触发，idx {i} 实际 {result[i]}"
-        )
-
-
-def test_macd_bottom_div_price_still_falling():
-    """价格仍在创新低 → 不触发。"""
-    calc = MACDCalculator.__new__(MACDCalculator)
-    n = 68
-    close = np.full(n, 10.0)
-    dif = np.full(n, 0.5)
-    for i in range(30, n):
-        close[i] = 10.0 - (i - 30) * 0.1     # 持续下跌
-    for i in range(30, 56):
-        dif[i] = 0.5 - (i - 30) * 0.05
-    dif[55] = -0.75
-    for i in range(56, n):
-        dif[i] = dif[i-1] + 0.03
-
-    df = pd.DataFrame({
-        "trade_date": [f"d{i}" for i in range(n)],
-        "close_qfq": close, "dif": dif,
-    })
-    result = calc._compute_divergence(df)
-    for i in range(60, n):
-        assert result[i] != "bottom_divergence", (
-            f"价格仍创新低不应触发，idx {i} 实际 {result[i]}"
-        )
+    assert isinstance(result, list)
+    assert len(result) == len(close)
+    assert any(v == "top_divergence" for v in result)
 
 
 def test_macd_golden_cross(db_with_schema):

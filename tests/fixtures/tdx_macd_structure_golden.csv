@@ -1,0 +1,3 @@
+ts_code,trade_date,freq,divergence,note
+000001.SZ,20240315,daily,top_divergence,tdx_structure_TG
+600519.SH,20240122,daily,bottom_divergence,tdx_structure_TG

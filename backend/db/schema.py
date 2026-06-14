@@ -51,6 +51,7 @@ _ODS_DDL = [
         ts_code        TEXT,
         trade_date     TEXT,
         total_mv       REAL,
+        circ_mv        REAL,
         pe_ttm         REAL,
         turnover_rate  REAL,
         volume_ratio   REAL,
@@ -80,6 +81,7 @@ _ODS_DDL = [
         sell_elg_amount REAL,
         net_mf_vol     REAL,
         net_mf_amount  REAL,
+        net_amount_dc  REAL,
         fetched_at     TEXT DEFAULT (now()),
         PRIMARY KEY (ts_code, trade_date)
     )""",
@@ -172,6 +174,20 @@ def _migrate_volume_new_columns(con):
                 pass  # column already exists
 
 
+def _migrate_dde_b4_inputs(con: duckdb.DuckDBPyConnection):
+    """Add circ_mv / net_amount_dc for 123-aligned DDE trend (B4 gate)."""
+    for table, col in [
+        ("ods_daily_basic", "circ_mv"),
+        ("ods_moneyflow", "net_amount_dc"),
+        ("dwd_daily_quote", "circ_mv"),
+        ("dwd_daily_moneyflow", "net_amount_dc"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL")
+        except Exception:
+            pass
+
+
 def _migrate_dws_fingerprint(con: duckdb.DuckDBPyConnection):
     """Add input_fingerprint and spec_version columns to all existing DWS tables."""
     for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
@@ -252,6 +268,7 @@ _DWD_DDL = [
         amount         REAL,
         pct_chg        REAL,
         total_mv       REAL,
+        circ_mv        REAL,
         pe_ttm         REAL,
         turnover_rate  REAL,
         volume_ratio   REAL,
@@ -289,6 +306,7 @@ _DWD_DDL = [
         buy_elg_vol    REAL,
         sell_elg_vol   REAL,
         total_vol      REAL,
+        net_amount_dc  REAL,
         PRIMARY KEY (ts_code, trade_date)
     )""",
 ]
@@ -480,14 +498,17 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
     for _freq in ["daily", "weekly"]:
         _table = f"dws_{_indicator}_{_freq}"
         _view = f"v_dws_{_indicator}_{_freq}_latest"
+        # Pick the newest snapshot per (ts_code, trade_date). QUALIFY +
+        # ROW_NUMBER() scans the table once, vs the old correlated subquery
+        # that re-ran MAX(calc_date) for every row (O(snapshots) per row).
         _LATEST_VIEW_DDL.append(f"""
             CREATE OR REPLACE VIEW {_view} AS
             SELECT *
-            FROM {_table} d
-            WHERE calc_date = (
-                SELECT MAX(calc_date) FROM {_table}
-                WHERE ts_code = d.ts_code AND trade_date = d.trade_date
-            )
+            FROM {_table}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY ts_code, trade_date
+                ORDER BY calc_date DESC
+            ) = 1
         """)
 
 _V_INDICATOR_AVAILABILITY_DDL = """
@@ -613,6 +634,7 @@ _ADS_WIDE_VIEWS_DDL = [
             WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
             WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
             WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'      THEN '均线走平 — 双斜率近零，方向待定'
             WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
             ELSE NULL
         END              AS ma_alignment,
@@ -713,6 +735,7 @@ _ADS_WIDE_VIEWS_DDL = [
             WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
             WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
             WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'      THEN '均线走平 — 双斜率近零，方向待定'
             WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
             ELSE NULL
         END              AS ma_alignment,
@@ -786,6 +809,7 @@ _ADS_WIDE_VIEWS_DDL = [
             WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
             WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
             WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'      THEN '均线走平 — 双斜率近零，方向待定'
             WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
             ELSE NULL
         END              AS ma_alignment,
@@ -851,6 +875,7 @@ _ADS_WIDE_VIEWS_DDL = [
             WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
             WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
             WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'      THEN '均线走平 — 双斜率近零，方向待定'
             WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
             ELSE NULL
         END              AS ma_alignment,
@@ -926,6 +951,7 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # Migrations for existing databases
     _migrate_dde_trend_strength(con)
     _migrate_volume_new_columns(con)
+    _migrate_dde_b4_inputs(con)
     _migrate_dws_fingerprint(con)
 
     # Latest views (10)
@@ -943,12 +969,37 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     con.execute(_V_DATA_FRESHNESS_DDL)
 
 
+_DWS_CALC_STATE_DDL = """
+    CREATE TABLE IF NOT EXISTS dws_calc_state (
+        ts_code           VARCHAR NOT NULL,
+        freq              VARCHAR NOT NULL,
+        indicator         VARCHAR NOT NULL,
+        last_trade_date   VARCHAR NOT NULL,
+        history_fp        VARCHAR NOT NULL,
+        quote_latest_adj  DOUBLE,
+        spec_version      VARCHAR DEFAULT 'v1',
+        updated_calc_date VARCHAR NOT NULL,
+        PRIMARY KEY (ts_code, freq, indicator)
+    )
+"""
+
+
+def ensure_calc_state_table(con: duckdb.DuckDBPyConnection):
+    """Idempotently create dws_calc_state (append-only calc routing state).
+
+    Called at calc startup so an existing DB created before this table was
+    added gets it without a manual schema re-init. CREATE TABLE IF NOT EXISTS.
+    """
+    con.execute(_DWS_CALC_STATE_DDL)
+
+
 def _create_dws(con: duckdb.DuckDBPyConnection):
-    """Create all 10 DWS tables from templates."""
+    """Create all 12 DWS tables from templates + the calc-state table."""
     for freq in ("daily", "weekly"):
         for name, ddl in _DWS_DDL.items():
             table = f"dws_{name}_{freq}"
             con.execute(ddl.format(table=table))
+    ensure_calc_state_table(con)
 
 
 def drop_all_tables(con: duckdb.DuckDBPyConnection):
@@ -972,6 +1023,7 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
         [f"dws_{ind}_{freq}"
          for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
          for freq in ["daily", "weekly"]]
+        + ["dws_calc_state"]
         # DWD (3)
         + ["dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
         # DIM (4) — FK tables first

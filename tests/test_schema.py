@@ -34,6 +34,34 @@ class TestSchemaCreation:
             for freq in ["daily", "weekly"]:
                 assert f"dws_{indicator}_{freq}" in tables
 
+    def test_latest_view_returns_only_newest_calc_date(self, db_with_schema):
+        """v_dws_*_latest must return exactly the newest calc_date per key."""
+        con = db_with_schema
+        # Two snapshots for the SAME (ts_code, trade_date): older + newer
+        con.execute(
+            "INSERT INTO dws_volume_daily "
+            "(ts_code, trade_date, ma_vol_5, calc_date) VALUES "
+            "('X.SZ','20260101', 100, '20260604')")
+        con.execute(
+            "INSERT INTO dws_volume_daily "
+            "(ts_code, trade_date, ma_vol_5, calc_date) VALUES "
+            "('X.SZ','20260101', 200, '20260605')")
+        # A different trade_date with a single snapshot
+        con.execute(
+            "INSERT INTO dws_volume_daily "
+            "(ts_code, trade_date, ma_vol_5, calc_date) VALUES "
+            "('X.SZ','20260102', 300, '20260604')")
+
+        rows = con.execute(
+            "SELECT trade_date, ma_vol_5, calc_date "
+            "FROM v_dws_volume_daily_latest "
+            "WHERE ts_code = 'X.SZ' ORDER BY trade_date"
+        ).fetchall()
+        assert rows == [
+            ("20260101", 200, "20260605"),  # newest snapshot wins
+            ("20260102", 300, "20260604"),
+        ]
+
     def test_latest_views_exist(self, db_with_schema):
         views = {r[0] for r in db_with_schema.execute(
             "SELECT name FROM sqlite_master WHERE type='view'").fetchall()}
@@ -263,3 +291,29 @@ class TestCheckConstraints:
             INSERT INTO dws_volume_daily (ts_code, trade_date, calc_date, pct_vol_rank, zone, trend)
             VALUES ('000001.SZ', '20260103', '20260103', 100, 'explosive', 'expanding')
         """)
+
+
+def test_wide_view_maps_sideways_alignment(db_with_schema):
+    """DWS alignment=sideways 必须在 ADS 宽表可见，不能 ELSE NULL。"""
+    from backend.db.schema import _ADS_WIDE_VIEWS_DDL
+
+    for sql in _ADS_WIDE_VIEWS_DDL:
+        db_with_schema.execute(sql)
+
+    db_with_schema.execute("""
+        INSERT INTO dwd_daily_quote (ts_code, trade_date, close_qfq, is_suspended)
+        VALUES ('000001.SZ', '20260102', 10.0, 0)
+    """)
+    db_with_schema.execute("""
+        INSERT INTO dws_ma_daily (ts_code, trade_date, calc_date, alignment)
+        VALUES ('000001.SZ', '20260102', '20260102', 'sideways')
+    """)
+
+    row = db_with_schema.execute("""
+        SELECT ma_alignment FROM v_ads_analysis_wide_daily
+        WHERE ts_code = '000001.SZ' AND trade_date = '20260102'
+    """).fetchone()
+
+    assert row is not None
+    assert row[0] is not None
+    assert "走平" in row[0]

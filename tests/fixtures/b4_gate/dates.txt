@@ -1,0 +1,5 @@
+# B4 golden representative dates (fill after mismatch≈0 per date)
+# 20260609  week_end=20260609 (周一分析日)
+20260609
+20260605
+20260529

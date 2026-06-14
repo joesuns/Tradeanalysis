@@ -3,10 +3,12 @@ import logging
 import numpy as np
 import pandas as pd
 from backend.etl.base import (
-    sma, to_float_safe, linear_regression_slope,
-    insert_dws_batch, compute_fingerprint, check_dwd_unchanged,
+    sma, to_float_safe, linear_regression_slope, weighted_window_slopes,
+    insert_dws_batch, compute_input_fingerprint, check_dwd_unchanged,
+    load_latest_fingerprints, load_quote_groups, compute_history_signature,
     SkipReason, CalcResult,
 )
+from backend.etl.recalc_spec import RecalcSpec
 
 logger = logging.getLogger(__name__)
 
@@ -17,22 +19,34 @@ def _compute_slope_pct(series: np.ndarray, window: int = 5) -> np.ndarray:
     Replaces the old diff(3)/shift(3)*100 formula. The normalization by
     current MA value makes slopes comparable across stocks of different prices.
     """
+    # Vectorized fixed-window OLS slope (decay=0), equivalent to the legacy
+    # per-bar linear_regression_slope loop. See base.weighted_window_slopes.
+    series = np.asarray(series, dtype=float)
+    slopes = weighted_window_slopes(series, window, 0.0)
     result = np.full(len(series), np.nan)
-    for i in range(window - 1, len(series)):
-        segment = series[i - window + 1:i + 1]
-        valid = segment[~np.isnan(segment)]
-        if len(valid) < window or series[i] == 0:
-            continue
-        raw_slope = linear_regression_slope(valid, use_log=False)
-        result[i] = raw_slope / series[i] * 100.0
+    mask = np.isfinite(slopes) & (series != 0)
+    result[mask] = slopes[mask] / series[mask] * 100.0
     return result
 
 
 
 class MACalculator:
     """Moving Average indicator calculator. Computes MA5, MA10, bias, slope,
-    alignment (9-value classification), and turning points (golden/dead cross).
+    alignment (10 DWS enums + single-slope fallback), and turning points (golden/dead cross).
     Works for both daily and weekly frequencies."""
+
+    RECALC_SPEC_DAILY = RecalcSpec(lookback=10, seed=10, event_tail=5, min_rows=11)
+    RECALC_SPEC_WEEKLY = RecalcSpec(lookback=10, seed=10, event_tail=5, min_rows=11)
+
+    SIGNATURE_COLS = ["close_qfq"]
+
+    DWS_COLS = [
+        "ts_code", "trade_date", "ma_5", "ma_10",
+        "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope",
+        "alignment", "turning_point", "calc_date",
+        "input_fingerprint", "spec_version",
+    ]
+    FLOAT_COLS = ["ma_5", "ma_10", "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope"]
 
     def __init__(self, con, freq: str = "daily"):
         self.con = con
@@ -40,24 +54,25 @@ class MACalculator:
         self.src_table = "dwd_daily_quote" if freq == "daily" else "dwd_weekly_quote"
         self.dws_table = f"dws_ma_{freq}"
 
-    def calculate(self, ts_codes: list[str], calc_date: str) -> CalcResult:
+    def calculate(self, ts_codes: list[str], calc_date: str,
+                  recalc_start: str = None,
+                  quote_groups: dict = None) -> CalcResult:
         result = CalcResult()
+        latest_fps = load_latest_fingerprints(self.con, self.dws_table, ts_codes)
+        if quote_groups is None:
+            load_start = None
+            if recalc_start:
+                from backend.etl.recalc_spec import resolve_load_start
+                load_start = resolve_load_start(self.con, recalc_start, self.freq)
+            groups = load_quote_groups(self.con, self.src_table, self.freq,
+                                       ["trade_date", "close_qfq"], ts_codes,
+                                       start_date=load_start)
+        else:
+            groups = quote_groups
         for ts_code in ts_codes:
-            if self.freq == "weekly":
-                df = self.con.execute(f"""
-                    SELECT d.trade_date, d.close_qfq FROM {self.src_table} d
-                    JOIN dim_date dd ON d.trade_date = dd.trade_date
-                    WHERE d.ts_code = ? AND dd.is_week_end = 1
-                    ORDER BY d.trade_date
-                """, (ts_code,)).df()
-            else:
-                df = self.con.execute(f"""
-                    SELECT trade_date, close_qfq FROM {self.src_table}
-                    WHERE ts_code = ? AND is_suspended = 0
-                    ORDER BY trade_date
-                """, (ts_code,)).df()
+            df = groups.get(ts_code)
 
-            if df.empty:
+            if df is None or df.empty:
                 logger.debug("MA %s skip %s: no DWD data", self.freq, ts_code)
                 result.add_skip(SkipReason.NO_DWD_DATA, ts_code, "DWD returned 0 rows")
                 continue
@@ -67,15 +82,18 @@ class MACalculator:
                                 f"DWD rows={len(df)}, min=11")
                 continue
 
-            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df):
+            if check_dwd_unchanged(self.con, self.dws_table, ts_code, df,
+                                   latest_fps=latest_fps, recalc_start=recalc_start):
                 result.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code,
                                 "DWD fingerprint match")
                 continue
 
-            fp = compute_fingerprint(df)
+            fp = compute_input_fingerprint(df, recalc_start=recalc_start)
             df = self._compute_indicators(df)
-            self._insert(ts_code, df, calc_date, input_fingerprint=fp)
-            result.calculated += 1
+            if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                            write_start=recalc_start,
+                            write_end=calc_date if recalc_start else None):
+                result.calculated += 1
         return result
 
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -93,10 +111,11 @@ class MACalculator:
         return df
 
     def _compute_alignment(self, df: pd.DataFrame) -> list:
-        """10-value alignment classification based on MA5/MA10 relative position
-        and dual-slope direction (threshold +/- 0.08%/day via 5-bar regression).
+        """11-value alignment: 8 directional + tangle + sideways + single-slope fallback.
 
-        Tangle requires BOTH: gap < 3% of MA10 AND >= 2 crosses in last 10 days.
+        Layer 1 tangle: gap < 3% of MA10 AND >= 2 crosses in last 10 days.
+        Layer 2 sideways: both |slope| < 0.08%/day.
+        Layer 3 (fallback): exactly one slope flat, map to nearest of 8 directional codes.
         """
         result = [None] * len(df)
         ma5 = df["ma_5"].values
@@ -155,6 +174,18 @@ class MACalculator:
                 result[i] = "bear_weakening"
             elif not above and s5_up and s10_up:
                 result[i] = "bear_rolling"
+            # Layer 3: single-slope transitional (exactly one flat, one trending)
+            elif s5_flat != s10_flat:
+                if above:
+                    if s5_up or s10_up:
+                        result[i] = "bull_building" if s5_up else "bull_strong"
+                    elif s5_dn or s10_dn:
+                        result[i] = "bull_weakening"
+                else:
+                    if s5_dn or s10_dn:
+                        result[i] = "bear_building" if s5_dn else "bear_strong"
+                    elif s5_up or s10_up:
+                        result[i] = "bear_weakening"
 
         return result
 
@@ -215,13 +246,31 @@ class MACalculator:
 
         return result
 
+    def _compute_indicators_append(self, df: pd.DataFrame, new_bars: list) -> pd.DataFrame:
+        """Compute MA indicators over the full tail-window df; caller writes only new_bars.
+
+        MA5/MA10 and all derived indicators (bias, slope, alignment, turning point)
+        are causal rolling: a bar's value depends only on its preceding N bars.
+        With a tail window >= 10 bars of warmup, append values equal FULL by
+        construction.
+        """
+        return self._compute_indicators(df)
+
+    def append_calculate(self, ts_code: str, df: pd.DataFrame, new_bars: list,
+                         calc_date: str, state: dict) -> "CalcResult":
+        """APPEND mode: compute over full tail window, write only new_bars."""
+        result = CalcResult()
+        df = self._compute_indicators_append(df, new_bars)
+        fp = compute_history_signature(df, self.SIGNATURE_COLS)
+        if self._insert(ts_code, df, calc_date, input_fingerprint=fp,
+                        write_start=new_bars[0], write_end=new_bars[-1]):
+            result.calculated += 1
+        return result
+
     def _insert(self, ts_code: str, df: pd.DataFrame, calc_date: str,
-                input_fingerprint: str = None):
-        dws_cols = ["ts_code", "trade_date", "ma_5", "ma_10",
-                    "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope",
-                    "alignment", "turning_point", "calc_date",
-                    "input_fingerprint", "spec_version"]
-        float_cols = ["ma_5", "ma_10", "bias_ma5", "bias_ma10", "ma5_slope", "ma10_slope"]
-        insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
-                         dws_cols, float_cols,
-                         input_fingerprint=input_fingerprint)
+                input_fingerprint: str = None,
+                write_start: str = None, write_end: str = None):
+        return insert_dws_batch(self.con, self.dws_table, df, ts_code, calc_date,
+                                self.DWS_COLS, self.FLOAT_COLS,
+                                input_fingerprint=input_fingerprint,
+                                write_start=write_start, write_end=write_end)

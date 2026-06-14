@@ -1,6 +1,41 @@
 import pandas as pd
 import numpy as np
-from backend.etl.calc_ma import MACalculator
+from backend.etl.calc_ma import MACalculator, _compute_slope_pct
+from backend.etl.base import linear_regression_slope
+
+
+# ── B2 golden-master: frozen pre-vectorization oracle (unweighted OLS slope) ──
+
+def _oracle_slope_pct(series, window=5):
+    result = np.full(len(series), np.nan)
+    for i in range(window - 1, len(series)):
+        segment = series[i - window + 1:i + 1]
+        valid = segment[~np.isnan(segment)]
+        if len(valid) < window or series[i] == 0:
+            continue
+        raw_slope = linear_regression_slope(valid, use_log=False)
+        result[i] = raw_slope / series[i] * 100.0
+    return result
+
+
+def test_ma_slope_pct_matches_oracle_random():
+    rng = np.random.default_rng(31)
+    for _ in range(40):
+        series = rng.normal(10, 2.0, size=rng.integers(5, 90))
+        if rng.random() < 0.5:
+            idx = rng.integers(0, len(series), size=max(1, len(series) // 6))
+            series[idx] = np.nan
+        got = _compute_slope_pct(series)
+        exp = _oracle_slope_pct(series)
+        np.testing.assert_array_equal(np.isnan(got), np.isnan(exp))
+        m = ~np.isnan(exp)
+        np.testing.assert_allclose(got[m], exp[m], rtol=0, atol=1e-9)
+
+
+def test_ma_slope_pct_zero_current_value_skipped():
+    series = np.array([1.0, 2.0, 3.0, 4.0, 0.0, 6.0, 7.0, 8.0, 9.0])
+    got = _compute_slope_pct(series)
+    assert np.isnan(got[4]), "series[i]==0 must be skipped (NaN)"
 
 
 def test_ma5_ma10_formula():
@@ -234,6 +269,79 @@ def test_alignment_sideways():
     result = calc._compute_alignment(df)
     for i in range(10, n):
         assert result[i] == "sideways", f"idx {i}: 期望 sideways，实际 {result[i]}"
+
+
+def _alignment_df(ma5, ma10, s5, s10, n=15):
+    """Helper: build minimal DataFrame for _compute_alignment tests."""
+    calc = MACalculator.__new__(MACalculator)
+    n = len(ma5) if hasattr(ma5, "__len__") else n
+    if not hasattr(ma5, "__len__"):
+        ma5 = np.full(n, ma5)
+        ma10 = np.full(n, ma10)
+        s5 = np.full(n, s5)
+        s10 = np.full(n, s10)
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": ma5,
+        "ma_5": ma5,
+        "ma_10": ma10,
+        "ma5_slope": s5,
+        "ma10_slope": s10,
+    })
+    return calc, df
+
+
+def test_alignment_fallback_bull_building_s5_up_s10_flat():
+    """一走平一趋势：MA5>MA10, s5上行, s10走平 → bull_building（平安银行类）。"""
+    calc, df = _alignment_df(10.9, 10.8, 0.40, -0.01)
+    result = calc._compute_alignment(df)
+    assert result[-1] == "bull_building", f"期望 bull_building，实际 {result[-1]}"
+
+
+def test_alignment_fallback_bull_strong_s5_flat_s10_up():
+    """一走平一趋势：MA5>MA10, s5走平, s10上行 → bull_strong。"""
+    calc, df = _alignment_df(10.9, 10.8, 0.02, 0.25)
+    result = calc._compute_alignment(df)
+    assert result[-1] == "bull_strong", f"期望 bull_strong，实际 {result[-1]}"
+
+
+def test_alignment_fallback_bull_weakening_s5_dn_s10_flat():
+    """一走平一趋势：MA5>MA10, s5下行, s10走平 → bull_weakening。"""
+    calc, df = _alignment_df(10.9, 10.8, -0.15, 0.03)
+    result = calc._compute_alignment(df)
+    assert result[-1] == "bull_weakening", f"期望 bull_weakening，实际 {result[-1]}"
+
+
+def test_alignment_fallback_bear_building_s5_dn_s10_flat():
+    """一走平一趋势：MA5<MA10, s5下行, s10走平 → bear_building。"""
+    calc, df = _alignment_df(10.7, 10.9, -0.20, -0.02)
+    result = calc._compute_alignment(df)
+    assert result[-1] == "bear_building", f"期望 bear_building，实际 {result[-1]}"
+
+
+def test_alignment_fallback_bear_strong_s5_flat_s10_dn():
+    """一走平一趋势：MA5<MA10, s5走平, s10下行 → bear_strong。"""
+    calc, df = _alignment_df(10.7, 10.9, 0.01, -0.30)
+    result = calc._compute_alignment(df)
+    assert result[-1] == "bear_strong", f"期望 bear_strong，实际 {result[-1]}"
+
+
+def test_alignment_fallback_bear_weakening_s5_up_s10_flat():
+    """一走平一趋势：MA5<MA10, s5上行, s10走平 → bear_weakening。"""
+    calc, df = _alignment_df(10.7, 10.9, 0.18, 0.04)
+    result = calc._compute_alignment(df)
+    assert result[-1] == "bear_weakening", f"期望 bear_weakening，实际 {result[-1]}"
+
+
+def test_alignment_fallback_does_not_override_existing_bull_strong():
+    """回归：双明确上行仍 bull_strong，fallback 不得覆盖。"""
+    calc = MACalculator.__new__(MACalculator)
+    dates = [f"202601{i:02d}" for i in range(1, 41)]
+    prices = [10.0 + i * 0.2 for i in range(40)]
+    df = pd.DataFrame({"trade_date": dates, "close_qfq": prices})
+    result = calc._compute_indicators(df)
+    valid = result["alignment"].dropna()
+    assert (valid == "bull_strong").sum() > 0, f"双上行应仍有 bull_strong，实际 {valid.unique()}"
 
 
 def test_ma5_slope_not_diff3_formula():

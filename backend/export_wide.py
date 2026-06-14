@@ -1,7 +1,12 @@
+import logging
+import time
+
 import duckdb
 import pandas as pd
 from datetime import datetime
 from openpyxl import Workbook
+
+logger = logging.getLogger(__name__)
 from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -13,6 +18,17 @@ INDEX_VIEW_MAP = {
     "daily": "v_ads_index_wide",
     "weekly": "v_ads_index_wide_weekly",
 }
+
+EXPORT_DIR = "exports"
+
+
+def default_export_path(trade_date: str, output: str = None) -> str:
+    """Default Excel path under exports/; explicit output is returned unchanged."""
+    if output is not None:
+        return output
+    gen_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{EXPORT_DIR}/analysis_{trade_date}_gen{gen_ts}.xlsx"
+
 
 # Column name translations (English → Chinese) — with units where applicable
 _COL_NAMES = {
@@ -72,11 +88,24 @@ _ENUM_VALUES = {
     },
 }
 
-# Signal columns — NULL means "no signal today" (shown as "-")
-_SIGNAL_COLS = {"kpattern", "kpattern_strength", "macd_divergence", "macd_turning_point",
-                "macd_alert", "ma_turning_point", "dde_alert", "dde_divergence",
-                "vol_divergence", "vol_signal",
-                "price_position_60d", "price_position_120d", "price_position_250d"}
+# Event columns — NULL means "no signal today" (shown as "-")
+_EVENT_SIGNAL_COLS = {
+    "kpattern", "kpattern_strength",
+    "macd_divergence", "macd_turning_point", "macd_alert",
+    "ma_turning_point", "dde_alert", "dde_divergence",
+    "vol_divergence", "vol_signal",
+}
+# State metrics — NULL means "not computable / insufficient history" (shown as "N/A")
+_STATE_METRIC_COLS = {
+    "pct_vol_rank", "vol_zone", "ma_alignment",
+    "macd_zone", "macd_trend", "macd_trend_strength",
+    "dde_trend", "dde_trend_strength",
+    "vol_trend", "vol_trend_strength", "volume_ratio",
+    "price_position_60d", "price_position_120d", "price_position_250d",
+}
+_FUNDAMENTAL_NA_COLS = {"pe_ttm"}
+# Backward-compatible union for highlight logic
+_SIGNAL_COLS = _EVENT_SIGNAL_COLS | _STATE_METRIC_COLS | _FUNDAMENTAL_NA_COLS
 
 # Columns to round to 2 decimal places
 _ROUND_2DP = {"close", "pct_chg", "pe_ttm", "turnover_rate", "net_mf_amount",
@@ -107,6 +136,8 @@ def export_wide_to_excel(
     Row 1 merges group labels (日线指标/周线指标), Row 2 has individual column names.
     Returns total rows written.
     """
+    logger.info("progress export: started | date=%s", trade_date)
+    t0 = time.monotonic()
     con = duckdb.connect(db_path)
 
     # ---- Daily data ----
@@ -117,7 +148,13 @@ def export_wide_to_excel(
     ).df()
     if daily.empty:
         con.close()
+        logger.info("progress export: done | rows=0 | %.0fs", time.monotonic() - t0)
         return 0
+
+    logger.info(
+        "progress export: daily query done | rows=%d | %.0fs",
+        len(daily), time.monotonic() - t0,
+    )
 
     # ---- Optional ts_code filter ----
     if ts_codes:
@@ -129,6 +166,8 @@ def export_wide_to_excel(
     daily = _format_numbers(daily)
 
     # ---- Weekly data: use latest week-end ≤ trade_date ----
+    t_weekly = time.monotonic()
+    logger.info("progress export: loading weekly | date=%s", trade_date)
     week_end = con.execute(
         "SELECT MAX(trade_date) FROM dim_date "
         "WHERE trade_date <= ? AND is_week_end = 1",
@@ -139,6 +178,10 @@ def export_wide_to_excel(
         + (" AND is_st = 0" if filter_st else ""),
         [week_end]
     ).df() if week_end else pd.DataFrame()
+    logger.info(
+        "progress export: weekly query done | week_end=%s rows=%d | %.0fs",
+        week_end or "-", len(weekly), time.monotonic() - t_weekly,
+    )
     if ts_codes:
         weekly = weekly[weekly["ts_code"].isin(ts_codes)]
     weekly = _format_numbers(weekly)
@@ -164,11 +207,20 @@ def export_wide_to_excel(
     weekly_indicator_cols = [c for c in weekly_cols if c != "ts_code"]
     weekly_renamed = weekly.rename(columns={c: f"__w__{c}" for c in weekly_indicator_cols})
 
-    # LEFT JOIN on ts_code
-    merged = daily.merge(weekly_renamed, on="ts_code", how="left")
-    weekly_cols = weekly_indicator_cols  # for header building, exclude ts_code
+    # LEFT JOIN on ts_code. When weekly is empty (e.g. no week-end ≤ trade_date),
+    # the frame has no ts_code column — keep daily rows, omit weekly indicators.
+    if "ts_code" in weekly_renamed.columns:
+        merged = daily.merge(weekly_renamed, on="ts_code", how="left")
+        weekly_cols = weekly_indicator_cols  # for header building, exclude ts_code
+    else:
+        merged = daily.copy()
+        weekly_cols = []
+
+    logger.info("progress export: weekly merge done | %.0fs", time.monotonic() - t0)
 
     # ---- Write to Excel ----
+    t_sheets = time.monotonic()
+    logger.info("progress export: building sheets | rows=%d", len(merged))
     wb = Workbook()
     wb.remove(wb.active)
     # ---- Signal-only analysis sheet (first sheet) ----
@@ -197,20 +249,23 @@ def export_wide_to_excel(
             _write_sheet_merged(wb, "上证指数", idx_daily, list(idx_daily.columns), [])
 
     con.close()
+    logger.info("progress export: sheets built | %.0fs", time.monotonic() - t_sheets)
 
     import os
     if not output_path or output_path == "analysis.xlsx":
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = "exports"
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = f"{output_dir}/analysis_{ts}.xlsx"
-    else:
-        # Ensure parent directory exists (e.g. "exports/" passed by caller)
-        parent = os.path.dirname(os.path.abspath(output_path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
+        output_path = default_export_path(trade_date)
+    parent = os.path.dirname(os.path.abspath(output_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
+    t_save = time.monotonic()
+    logger.info("progress export: writing xlsx | path=%s", output_path)
     wb.save(output_path)
+    logger.info("progress export: xlsx saved | %.0fs", time.monotonic() - t_save)
+    logger.info(
+        "progress export: done | rows=%d | %.0fs",
+        len(merged), time.monotonic() - t0,
+    )
     return len(merged)
 
 
@@ -231,17 +286,32 @@ def _format_numbers(df: "pd.DataFrame") -> "pd.DataFrame":
     return df
 
 
+def apply_display_nulls(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply export display semantics before Chinese rename."""
+    df = df.copy()
+    for col in _EVENT_SIGNAL_COLS:
+        if col in df.columns:
+            df[col] = df[col].fillna("-")
+        wcol = f"__w__{col}"
+        if wcol in df.columns:
+            df[wcol] = df[wcol].fillna("-")
+    for col in _STATE_METRIC_COLS | _FUNDAMENTAL_NA_COLS:
+        if col in df.columns:
+            df[col] = df[col].fillna("N/A")
+        wcol = f"__w__{col}"
+        if wcol in df.columns:
+            df[wcol] = df[wcol].fillna("N/A")
+    return df
+
+
 def _translate_df(df: "pd.DataFrame") -> "pd.DataFrame":
-    """Translate column names to Chinese, enum values to Chinese, NULL signals to '-'."""
+    """Translate column names to Chinese, enum values to Chinese, apply null semantics."""
+    df = apply_display_nulls(df)
     df = df.rename(columns={c: _COL_NAMES.get(c, c) for c in df.columns})
     for col, mapping in _ENUM_VALUES.items():
         cn_col = _COL_NAMES.get(col, col)
         if cn_col in df.columns:
             df[cn_col] = df[cn_col].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
-    for col in _SIGNAL_COLS:
-        cn_col = _COL_NAMES.get(col, col)
-        if cn_col in df.columns:
-            df[cn_col] = df[cn_col].fillna("-")
     return df
 
 
@@ -275,13 +345,7 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         wcol = f"__w__{col}"
         if wcol in df.columns:
             df[wcol] = df[wcol].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
-    # NULL signals → "-"
-    for col in _SIGNAL_COLS:
-        if col in df.columns:
-            df[col] = df[col].fillna("-")
-        wcol = f"__w__{col}"
-        if wcol in df.columns:
-            df[wcol] = df[wcol].fillna("-")
+    df = apply_display_nulls(df)
 
     # Build final display column order: basic → daily_signal → weekly_signal
     display_order = [c for c in basic_cols if c in df.columns] \
@@ -430,7 +494,8 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         "MACD转折": {"金叉": green, "死叉": red}, "MACD区域": {"多头": green, "空头": red},
         "MACD背离": {"顶背离": red, "底背离": green},
         "均线形态": {"多头强势": green, "多头初建": green, "多头衰竭": blue, "多头翻转": blue,
-                     "空头强势": red, "空头初建": red, "空头衰竭": blue, "空头翻转": blue, "均线缠绕": blue},
+                     "空头强势": red, "空头初建": red, "空头衰竭": blue, "空头翻转": blue,
+                     "均线缠绕": blue, "均线走平": blue},
         "均线转折": {"金叉": green, "死叉": red}, "DDE趋势": {"上升": green, "下降": red},
         "DDE背离": {"顶背离": red, "底背离": green}, "量能区域": {"爆量": red, "地量": blue},
         "量能趋势": {"放量": green, "缩量": red},
@@ -451,8 +516,14 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
                 col_idx = list(df.columns).index(lookup) + 1
                 for row_idx in range(3, len(df) + 3):
                     val = ws.cell(row=row_idx, column=col_idx).value
-                    if val in value_colors:
-                        ws.cell(row=row_idx, column=col_idx).fill = value_colors[val]
+                    fill = value_colors.get(val)
+                    if fill is None and isinstance(val, str):
+                        for signal_prefix, color in value_colors.items():
+                            if val.startswith(signal_prefix):
+                                fill = color
+                                break
+                    if fill is not None:
+                        ws.cell(row=row_idx, column=col_idx).fill = fill
     if "K线形态" in df.columns:
         col_idx = list(df.columns).index("K线形态") + 1
         for row_idx in range(3, len(df) + 3):

@@ -58,23 +58,32 @@ def log_etl_end(con, log_id: str, step_name: str, start_time: float,
         (now_iso, status, row_count, error_msg or "", comp, log_id),
     )
 
-    if status in ("failed", "degraded"):
-        logger.warning(f"ETL {step_name}: {status} ({duration_ms}ms) — {error_msg}")
+    if status == "failed":
+        err_summary = error_msg.split("\n")[0] if error_msg else ""
+        logger.error("ETL %s: failed (%dms) — %s",
+                     step_name, duration_ms, err_summary)
+    elif status == "degraded":
+        logger.warning("ETL %s: degraded (%dms) — %s",
+                       step_name, duration_ms,
+                       error_msg[:200] if error_msg else "")
     else:
-        logger.info(f"ETL {step_name}: {status} ({duration_ms}ms, {row_count} rows)")
+        logger.info("ETL %s: %s (%dms, %d rows)",
+                    step_name, status, duration_ms, row_count)
 
 
 def log_etl_error(con, log_id: str, step_name: str, start_time: float,
                   row_count: int, exception: Exception,
                   min_trade_date: Optional[str] = None,
                   max_trade_date: Optional[str] = None):
-    """Convenience: log a step as 'failed' with full traceback via logger.exception()."""
+    """Log a step as 'failed' — one-line ERROR to logger, full traceback to DB."""
     tb = traceback.format_exc()
-    logger.exception(f"ETL {step_name} — FAILED")
+    duration_ms = round((time.monotonic() - start_time) * 1000)
+    logger.error("ETL %s — FAILED: %s (%dms)",
+                 step_name, exception, duration_ms)
     log_etl_end(
         con, log_id, step_name, start_time, "failed",
         row_count=row_count,
-        error_msg=f"{type(exception).__name__}: {exception}\n{tb[-500:]}",
+        error_msg=f"{type(exception).__name__}: {exception}\n{tb}",
     )
 
 

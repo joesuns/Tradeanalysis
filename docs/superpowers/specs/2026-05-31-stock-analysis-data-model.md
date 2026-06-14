@@ -1,6 +1,6 @@
 # 个股技术分析数据模型设计
 
-> 日期: 2026-06-01 | 状态: 已确认 | 版本: v1.8
+> 日期: 2026-06-11 | 状态: 已确认 | 版本: v1.12
 
 ---
 
@@ -144,8 +144,8 @@ tushare API
        │                        │ ETL: 指标计算引擎 (DuckDB)
        │           ┌────────────┴──────────────────────────────────┐
        │           ▼            ▼          ▼          ▼          ▼
-       │         dws_kpattern  dws_macd  dws_ma    dws_dde   dws_volume
-       │         (K线形态)     (MACD)    (均线)     (DDE)     (量能)
+       │         dws_kpattern  dws_macd  dws_ma    dws_dde   dws_volume  dws_price_position
+       │         (K线形态)     (MACD)    (均线)     (DDE)     (量能)       (价格位置)
        │           │            │          │          │          │
        │           │            │   各含日线/周线两个粒度           │
        └───────────┴────────────┴──────────┴──────────┴──────────┘
@@ -413,11 +413,26 @@ CREATE TABLE dwd_daily_moneyflow (
 > 来源: `ods_moneyflow` 清洗后映射。total_vol = buy_sm_vol + buy_md_vol + buy_lg_vol + buy_elg_vol（用买入侧求和；tushare 的成交分类基于主动买卖方向，买卖两侧合计在理论上市值等价，但实际因分类算法可能存在微小偏差。选用买入侧口径与 DDX 分子的大单+超大单净买入方向一致）。
 > 注意：tushare 不提供 DDX/DDY/DDZ 原始值，DWS 层自行计算 DDX 代理指标。
 
+### 5.4 DWD 增量 rebuild 语义（`DWD_INCREMENTAL=1` 默认）
+
+日常 `run` / calc G3 走 `rebuild_dwd_for_stale(con, stale_codes, trade_date)` → `rebuild_dwd_incremental`，**禁止日常全库** `rebuild_all_dwd(con)`（无 `ts_codes` 仅限运维/首次建库）。`DWD_INCREMENTAL=0` 回退 stale 子集全量 rebuild。
+
+| 层 | 路径 | 行为 |
+|----|------|------|
+| **daily** | qfq / adj 漂移 | `refresh_qfq_prices`：SQL UPDATE 四列 `open/high/low/close_qfq`，**非 DELETE** |
+| **daily** | 新股（无 DWD 历史） | 该股 full `build_dwd_daily_quote` |
+| **daily** | tail（其余 stale） | 仅 `trade_date` 当日 INSERT（`mode=tail=`，无 DELETE） |
+| **weekly** | tail 股 | `mode=week=`：仅删/插含 `trade_date` 的周分区（`dwd_weekly_sql.py`） |
+| **weekly** | qfq / insert 股 | 该股 full `build_dwd_weekly_quote` |
+| **moneyflow** | stale 子集 | tail INSERT（`mode=tail=`） |
+
+停牌填充 gap 检测改为 **DWD 行数 vs 交易日历**（非 ODS vs 日历），已填充股不再重复 LATERAL。运维：`docs/superpowers/plans/2026-06-09-daily-runbook.md`。
+
 ---
 
 ## 6. DWS 层 — 技术指标汇总层
 
-> 按指标类型拆分为 5 个子表（日线 + 周线各一张，共 10 表），所有计算使用**前复权价格**。
+> 按指标类型拆分为 **6** 个子表（日线 + 周线各一张，共 **12** 表），所有计算使用**前复权价格**。
 
 ---
 
@@ -444,23 +459,36 @@ CREATE TABLE dws_kpattern_daily (
 -- 周线表结构完全相同，表名 dws_kpattern_weekly
 ```
 
+#### 通用前提
+
+> 实现：`backend/etl/calc_kpattern.py`；数值参数：`backend/kpattern_params.py`（回测调参不改计算器逻辑）。
+
+| 项目 | 口径 |
+|------|------|
+| **数据源** | `dwd_daily_quote` / `dwd_weekly_quote` 前复权 OHLCV（`open_qfq`/`high_qfq`/`low_qfq`/`close_qfq`/`vol`） |
+| **阴阳判定** | 阳线：`close ≥ open`；阴线：`close < open`（平盘/十字星算阳线） |
+| **最小数据** | 每股 ≥ 30 根 K 线（`min_data_rows`），不足则跳过 |
+| **涨跌停过滤** | `\|pct_chg\| ≥ 9.9%`（非 ST）或 `≥ 4.9%`（ST）→ 当日 7 列形态均为 0，`strength=NULL` |
+| **周线** | 判定逻辑与日线相同；周线计算器仅采样 `dim_date.is_week_end=1` 的真周末 bar |
+| **DWS 输出** | 7 个独立 0/1 列可**同日并存**；ADS `kpattern` 枚举合并为单一展示值（见 §12.43） |
+
 #### 计算口径
 
-> 以下参数为初始默认值，标注 `[待回测调优]` 的阈值应在实现后通过历史回测验证并调整。
+> 以下参数为 `kpattern_params.py` 默认值，标注 `[待回测调优]` 的阈值应在实现后通过历史回测验证并调整。
 
 | 形态 | 类型 | 判定逻辑 | 关键参数 |
 |------|------|---------|---------|
-| **阳包阴** | 买入 | 前日阴线 + 当日阳线；当日开 ≤ 前日收 **且** 当日收 ≥ 前日开（实体吞没，不看影线） | — |
-| **阳克阴** | 买入 | 量学"量价双向胜阴"：①当日量 > 前日量 × 1.2 **且** ②当日实顶[max(开,收)] > 前日实顶。单向胜 = 不触发 | 量能放大 ≥ 1.2x `[待回测]` |
-| **墓碑线** | 卖出 | ① 上升趋势高位：close 处于近 60 日最高价 10% 以内，或近 20 日累计涨幅 > 15% `[待回测]`；② 无实体 Doji：\|O-C\|/前收 < 0.5%，或实体 < 全日振幅 10%；③ 长上影：(H - max(O,C)) / 实体 ≥ 3x（实体近零时改用 (H-max(O,C)) / 全日振幅 > 60%） | 高位: 60日高点10%内 或 20日涨>15% `[待回测]`；Doji: <0.5%或<振幅10%；上影≥3x实体 |
-| **避雷针** | 卖出 | ① 上升趋势高位（同上）；② 小实体位于当日价格区间底部：实体 < 全日振幅 20%，且实体中心处于全日区间下 1/3 `[待回测]`；③ 上影线 ≥ 实体 3 倍 | 高位: 同上；实体<振幅20%；上影≥3x实体 |
-| **高开长阴** | 卖出 | ① 显著上涨后高位出现：近 10 日累计涨幅 > 15% `[待回测]`；② 跳空高开：当日开 > 前日收；③ 长阴实体 ≥ 5%（\|C-O\|/O ≥ 5%）；④ 成交量放大：vol > MA5_vol × 1.5 | 前序涨幅>15%(10日)；阴体≥5%；量>MA5×1.5 |
-| **阴包阳** | 卖出 | 前日阳线 + 当日阴线；当日开 ≥ 前日收 **且** 当日收 ≤ 前日开（实体吞没） | — |
-| **阴克阳** | 卖出 | 量学"量价双向胜阳"：①当日量 > 前日量 × 1.2 **且** ②当日实底[min(开,收)] < 前日实底。单向胜 = 不触发 | 量能放大 ≥ 1.2x `[待回测]` |
+| **阳包阴** | 买入 | 前日阴线 + 当日阳线 + 当日实体 > 0；当日开 ≤ 前日收 **且** 当日收 ≥ 前日开（实体吞没，不看影线）；非涨跌停日 | `ma10_filter`/`vol_filter` 已在 params 预留，**检测逻辑尚未接入** |
+| **阳克阴** | 买入 | 前日阴线 + 量学"量价双向胜阴"：① 当日量 > MA5_vol × 1.2 **且** ② 当日实顶[max(开,收)] > 前日实顶 **且** ③ 收盘 > MA10。单向胜 = 不触发 | `vol_multiplier=1.2`；`ma10_filter=True` `[待回测]` |
+| **墓碑线** | 卖出 | ① 上升趋势高位：close ≥ 近 60 日最高价 × 0.90，或近 20 日累计涨幅 > 15% `[待回测]`；② Doji：\|O-C\|/前收 < 0.5%，**或** 实体 < 全日振幅 10%；③ 长上影：实体 > 0 时上影 ≥ 3×实体；实体近零时上影/全日振幅 > 60% | 高位/Doji/上影阈值见 `mu_bei_xian` 块 |
+| **避雷针** | 卖出 | ① 上升趋势高位（同墓碑线）；② 小实体：实体 < 全日振幅 20%，且实体中心处于全日区间下 1/3 `[待回测]`；③ 长上影规则同墓碑线 | 见 `bi_lei_zhen` 块 |
+| **高开长阴** | 卖出 | ① 近 10 日累计涨幅 > 15% `[待回测]`；② 跳空高开：当日开 > 前日收；③ 当日阴线且 \|C-O\|/O ≥ 5%；④ vol > MA5_vol × 1.5 | `trend_10d_gain=0.15`；`bear_body_min=0.05`；`vol_multiplier=1.5` |
+| **阴包阳** | 卖出 | 前日阳线 + 当日阴线 + 当日实体 > 0；当日开 ≥ 前日收 **且** 当日收 ≤ 前日开（实体吞没）；非涨跌停日 | — |
+| **阴克阳** | 卖出 | 前日阳线 + 量学"量价双向胜阳"：① 当日量 > MA5_vol × 1.2 **且** ② 当日实底[min(开,收)] < 前日实底 **且** ③ 收盘 < MA10。单向胜 = 不触发 | `vol_multiplier=1.2`；`ma10_filter=True` `[待回测]` |
 
 #### 强度评分 (strength)
 
-> `strength` 字段输出 0.0~1.0 的连续值。触发哪个形态就用该形态公式计算；多重触发（阳包阴↔阳克阴、阴包阳↔阴克阳）取子形态公式——子形态条件更严，强度值天然高于父形态。无形态触发时为 NULL。
+> `strength` 输出 0.0~1.0 连续值；无形态触发时为 NULL。实现用 `if/elif` 链，**同日多形态时按下列固定顺序取第一个触发形态的公式**（与 ADS `kpattern` 展示优先级不同）：阳包阴 → 阳克阴 → 墓碑线 → 避雷针 → 高开长阴 → 阴包阳 → 阴克阳。
 
 **买入形态强度公式**：
 
@@ -470,7 +498,7 @@ CREATE TABLE dws_kpattern_daily (
 | | 量能配合 | `min(1.0, 当日量 / MA5_vol / 1.5)` | 0.3 |
 | | 收盘位置 | `(收-低) / (高-低)` — 光头上线趋近 1.0 | 0.2 |
 | **阳克阴** | 实顶超越 | `min(1.0, (当日实顶-前日实顶) / 前日实顶 / 0.02)` | 0.4 |
-| | 量能超越 | `min(1.0, (当日量/前日量 - 1.2) / 0.8)` | 0.4 |
+| | 量能配合 | `min(1.0, 当日量 / MA5_vol / 1.5)`（MA5 不足时回退 `当日量/前日量/1.5`） | 0.4 |
 | | 收盘位置 | `(收-低) / (高-低)` | 0.2 |
 
 **卖出形态强度公式**：
@@ -491,7 +519,7 @@ CREATE TABLE dws_kpattern_daily (
 | | 量能配合 | `min(1.0, 当日量 / MA5_vol / 1.5)` | 0.3 |
 | | 收盘位置 | `1.0 - (收-低)/(高-低)` — 光脚满分 | 0.2 |
 | **阴克阳** | 实底超越 | `min(1.0, (前日实底-当日实底) / 前日实底 / 0.02)` | 0.4 |
-| | 量能超越 | `min(1.0, (当日量/前日量 - 1.2) / 0.8)` | 0.4 |
+| | 量能配合 | `min(1.0, 当日量 / MA5_vol / 1.5)`（MA5 不足时回退 `当日量/前日量/1.5`） | 0.4 |
 | | 收盘位置 | `1.0 - (收-低)/(高-低)` | 0.2 |
 
 > `strength = Σ(维度得分 × 权重)`。所有阈值 `[待回测]`。
@@ -521,6 +549,7 @@ CREATE TABLE dws_macd_daily (
                                        -- 'upturn_flat' / 'downturn_flat' / NULL
     -- 趋势
     trend          TEXT,               -- 'up' / 'down' / 'flat'
+    trend_strength REAL,               -- 加权斜率/均值去量纲，横截面可比
     calc_date      TEXT,               -- 计算日期
     PRIMARY KEY (ts_code, trade_date, calc_date)
 );
@@ -528,25 +557,52 @@ CREATE TABLE dws_macd_daily (
 
 #### 计算口径
 
+> 实现：`backend/etl/calc_macd.py`。背离调用 `backend/etl/divergence_structure.py` → `compute_macd_structure_divergence()`（通达信 Level 2 顶底结构，非 60 窗 rolling）。`RECALC_SPEC` lookback=**250**、event_tail=**10**（覆盖 ≥3 个金/死叉周期 + dedup）。
+
 | 字段 | 计算方法 | 参数 |
 |------|---------|------|
-| **EMA 初始值** | 前 N 日 SMA 做种子 | — |
+| **EMA 初始值** | 前 N 日 SMA 做种子；APPEND 模式用 `resolve_ema_seeds` 递推 | EMA26 种子需 ≥26 有效 bar |
 | **基础公式** | EMA(Close,12), EMA(Close,26), DIF = EMA12-EMA26, DEA = EMA(DIF,9), MACD柱 = 2×(DIF-DEA) | α=2/(N+1) |
-| **顶背离** | 价格创 60 日新高 + DIF 峰顶**未**创 60 日新高 | 60 日回溯窗口 |
-| **底背离** | 价格创 60 日新低 + DIF 谷底**未**创 60 日新低 | 60 日回溯窗口 |
 | **多方区域** | MACD柱 > 0 | 纯柱体符号 |
-| **空方区域** | MACD柱 < 0 | 纯柱体符号 |
-| **金叉** | DIF 上穿 DEA（MACD柱从负翻正日） | — |
-| **死叉** | DIF 下穿 DEA（MACD柱从正翻负日） | — |
-| **即将金叉** | DIF < DEA **且** 差值收窄 **且** \|DIF-DEA\|/\|DEA\| < 15% | 三条件同时满足 |
-| **即将死叉** | DIF > DEA **且** 差值收窄 **且** \|DIF-DEA\|/\|DEA\| < 15% | 三条件同时满足 |
-| **上升拐头** | 此前连续上升（柱体连续3日向上）→ 今日柱体 < 昨日 | 趋势终结首日 |
-| **下降拐头** | 此前连续下降（柱体连续3日向下）→ 今日柱体 > 昨日 | 趋势终结首日 |
-| **上升走平** | 此前连续上升 → 今日\|柱体-昨日\|/昨日\| ≤ 2% | 动量消失 |
-| **下降走平** | 此前连续下降 → 今日\|柱体-昨日\|/昨日\| ≤ 2% | 动量消失 |
-| **趋势（上升）** | MACD柱 4 日窗口线性回归斜率 > 0.02 | 日线/周线均 N=4，use_log=False（原值回归） |
-| **趋势（下降）** | MACD柱 4 日窗口线性回归斜率 < -0.02 | 同上 |
-| **趋势（走平）** | 斜率在 [-0.02, 0.02] 之间 | — |
+| **空方区域** | MACD柱 < 0 | 柱体 = 0 → NULL |
+| **金叉** | MACD柱从 ≤0 翻正（`bar[i-1]≤0 且 bar[i]>0`） | — |
+| **死叉** | MACD柱从 ≥0 翻负（`bar[i-1]≥0 且 bar[i]<0`） | — |
+| **即将金叉** | DIF < DEA **且**（\|DIF-DEA\| < 0.005 小间距直通 **或** 3 日 gap 回归收敛且预估交叉 < 3 日）；零轴兜底：\|DEA\| < close×0.1% 时用绝对阈值 | 15% 为 \|DEA\| 较大时的相对阈值 |
+| **即将死叉** | DIF > DEA **且** 对称于即将金叉 | 同上 |
+| **上升拐头** | 柱体连续 2 日上升 → 今日柱体 < 昨日 | `upturn_reverse` |
+| **下降拐头** | 柱体连续 2 日下降 → 今日柱体 > 昨日 | `downturn_reverse` |
+| **上升走平** | 柱体连续 2 日上升 → 今日 \|变化\|/\|昨日\| ≤ 2% | 拐头优先于走平 |
+| **下降走平** | 柱体连续 2 日下降 → 今日 \|变化\|/\|昨日\| ≤ 2% | 同上 |
+| **趋势（上升）** | MACD柱 **5-bar** 指数加权回归斜率 > **0.001** | decay=0.15 |
+| **趋势（下降）** | 加权斜率 < **-0.001** | 同上 |
+| **趋势（走平）** | 斜率在 [-0.001, 0.001] | 同上 |
+| **trend_strength** | 加权斜率 / mean(\|MACD柱\|)，有符号去量纲 | 与 trend 同窗口 |
+
+#### 背离 (divergence)
+
+> MACD 调用：`compute_macd_structure_divergence(close_qfq, dif, dea, macd_bar, dedup=10)`。语义对齐通达信「MACD 顶底结构」**Level 2**（直接线背 + 隔峰线背 ∧ 柱背）；**DWS 仅写入结构形成日 TG**，钝化日 T 不落库（§12.29）。非东财黑盒、非 60 bar rolling。
+
+| 项目 | 口径 |
+|------|------|
+| **锚点** | 顶背离：红柱区，锚点 = **金叉** `CROSS(DIF, DEA)`；底背离：绿柱区，锚点 = **死叉** `CROSS(DEA, DIF)` |
+| **段内极值** | `M1=BARSLAST(金叉)` 后：`CH1=HHV(close,M1+1)`、`DIFH1=HHV(DIF,M1+1)`、`MACDH1=HHV(MACD柱, M1+1)`（仅 `macd_bar>0`）；前段 `CH2/DIFH2/MACDH2=REF(·,M1+1)`；隔峰 `CH3/DIFH3/MACDH3` 再 REF 一档 |
+| **MDIF 归一** | `mdif_part(value, ref_peak)`：INTPART 截断，`PDIFH=INTPART(LOG(\|ref\|))-1`，scale=`10^PDIFH`；顶背比较 `MDIFT` vs `MDIFH`，底背比较 `MDIFB` vs `MDIFL` |
+| **钝化 T** | 直接：`CH1>CH2` ∧ `MDIFT2<MDIFH2` ∧ 红柱连续（`macd_bar>0` 且 `REF>0`）∧ `MDIFT2≥REF(MDIFT2,1)` ∧ **柱背** `MACDH1<MACDH2`；隔峰：`CH1>CH3>CH2` ∧ `MDIFT3<MDIFH3` ∧ 红柱连续 ∧ `MDIFT3≥REF` ∧ `MACDH1<MACDH3` |
+| **结构形成 TG** | 前 bar 钝化 T 成立，且所用 `MDIFT` **转向**（顶：`MDIFT<REF`；底：`MDIFB>REF`）→ 候选标注日；**消失**则否决（顶：`DIFH1≥DIFH2` 或 `≥DIFH3`；底：`DIFL1≤DIFL2` 或 `≤DIFL3`） |
+| **去重** | 同类背离标注后 **10 bar** 内不重复（`FILTER(dedup=10)`） |
+| **标注日** | **结构形成 TG**（非钝化 T、非价格/DIF 极值当日），消除前视偏差（§12.29） |
+
+**顶背离 `top_divergence`**：红柱区自最近金叉起，价创新高（直接或隔峰）而 DIF MDIF 未创新高（直接或隔峰），且 MACD 红柱峰值回落（柱背），于 DIF MDIF 转向日 TG 写入。
+
+**底背离 `bottom_divergence`**：绿柱区自最近死叉起对称——价创新低、DIF MDIF 未创新低、绿柱峰值回升（柱背），于 DIF MDIF 转向日 TG 写入。
+
+**各模块调用差异**：
+
+| 模块 | 实现函数 | 锚点/信号 | dedup | 备注 |
+|------|----------|-----------|-------|------|
+| MACD | `compute_macd_structure_divergence` | 金叉/死叉；线=DIF/DEA，柱=MACD柱 | 10 | `divergence_structure.py` |
+| DDE | `compute_dde_structure_divergence` | `CROSS(DDX,DDX2)` / `CROSS(DDX2,DDX)`；柱背段内 DDX 峰 | 10 | 顶区 DDX 峰 **尖刺过滤**（邻域 `[peak-2,peak+3)` 内 ≥0.8×峰值 bar <2 → 剔除）；`require_finite=True` |
+| Volume | `compute_price_signal_divergence` | 60 bar rolling；信号=**vol** | 5 | 仍用 `base.py` rolling 法，口径见 §6.5 |
 
 ---
 
@@ -561,11 +617,11 @@ CREATE TABLE dws_ma_daily (
     -- 乖离率
     bias_ma5       REAL,               -- (close - MA5) / MA5 × 100
     bias_ma10      REAL,               -- (close - MA10) / MA10 × 100
-    -- 斜率（3日间隔）
-    ma5_slope      REAL,               -- (MA5_t - MA5_{t-3}) / MA5_{t-3} × 100
-    ma10_slope     REAL,               -- (MA10_t - MA10_{t-3}) / MA10_{t-3} × 100
+    -- 斜率（5-bar 线性回归，%/日）
+    ma5_slope      REAL,               -- 5-bar OLS 斜率 / 当前 MA5 × 100
+    ma10_slope     REAL,               -- 5-bar OLS 斜率 / 当前 MA10 × 100
     -- 趋势（位置 + 双斜率方向组合，DWS 层存英文码）
-    alignment      TEXT,               -- 'bull_strong' / 'bull_building' / ... / 'tangle' / NULL
+    alignment      TEXT,               -- 8方向 + tangle + sideways + NULL
     -- 转折点
     turning_point  TEXT,               -- 'golden_cross' / 'dead_cross' /
                                        -- 'near_golden' / 'near_dead' / NULL
@@ -576,6 +632,8 @@ CREATE TABLE dws_ma_daily (
 
 #### 计算口径
 
+> 实现：`backend/etl/calc_ma.py`。min_rows=11。
+
 **基础值**：
 
 | 字段 | 计算方法 | 参数 |
@@ -584,32 +642,38 @@ CREATE TABLE dws_ma_daily (
 | **MA10** | SMA(Close, 10) | 前复权收盘价 |
 | **bias_ma5** | `(close_qfq - ma_5) / ma_5 × 100` | — |
 | **bias_ma10** | `(close_qfq - ma_10) / ma_10 × 100` | — |
-| **ma5_slope** | `(ma_5_t - ma_5_{t-3}) / ma_5_{t-3} × 100` | 3 日间隔 `[待回测]` |
-| **ma10_slope** | `(ma_10_t - ma_10_{t-3}) / ma_10_{t-3} × 100` | 同上 |
+| **ma5_slope** | 5-bar 线性回归斜率 / 当前 MA5 × 100（%/日） | `weighted_window_slopes(decay=0)` |
+| **ma10_slope** | 同上，分母为 MA10 | 同上 |
 
-**alignment 9 值枚举**（基于 MA5 vs MA10 位置 + 双斜率方向，斜率正负分界 ±0.3%/3 日 `[待回测]`）：
+**alignment 判定顺序**（Layer 1 → 2 → 3 → 8 方向；斜率平区阈值 **±0.08%/日**）：
+
+| DWS 存储 | 条件 |
+|----------|------|
+| `tangle` | Layer 1：\|MA5-MA10\|/MA10 < **2.99%** 且近 10 日 MA5/MA10 交叉 ≥ **2** 次 |
+| `sideways` | Layer 2：\|ma5_slope\| 与 \|ma10_slope\| 均 < 0.08%/日（且非 tangle） |
+| `bull_strong` … `bear_rolling` | Layer 4：MA5 vs MA10 位置 × 双斜率方向（>0.08 上升，<-0.08 下降） |
+| Layer 3 fallback | 一走平一趋势：归入最近 8 类（如多头位 + s5↑ + s10平 → `bull_building`） |
+| NULL | MA5/MA10/斜率不可用（<11 bar、NaN） |
 
 | DWS 存储 | MA5/MA10 | ma5_slope | ma10_slope | 交易含义 |
 |----------|:--------:|:---------:|:----------:|------|
-| `bull_strong` | > | > 0 | > 0 | 两线同步上行，持仓舒适区 |
-| `bull_building` | > | > 0 | < 0 | MA5 已拐头向上，MA10 惯性下行，多头初建 |
-| `bull_weakening` | > | < 0 | > 0 | MA5 先拐头向下，即将死叉前兆 |
-| `bull_rolling` | > | < 0 | < 0 | 两线均下行，死叉边缘 |
-| `bear_strong` | < | < 0 | < 0 | 两线同步下行，持币观望区 |
-| `bear_building` | < | < 0 | > 0 | 死叉后 MA10 惯性未消，下跌中继 |
-| `bear_weakening` | < | > 0 | < 0 | MA5 尝试上拐，空方减弱 |
-| `bear_rolling` | < | > 0 | > 0 | 两线均上行，金叉边缘 |
-| `tangle` | — | — | — | 近 10 日交叉 ≥2 次 + 间距<3%（此时忽略斜率） |
-| NULL | — | — | — | MA5 或 MA10 值不可用（IPO <10 日、停牌复牌后窗口不足） |
+| `bull_strong` | > | > 0.08 | > 0.08 | 两线同步上行 |
+| `bull_building` | > | > 0.08 | < -0.08 | MA5 上行、MA10 仍下行 |
+| `bull_weakening` | > | < -0.08 | > 0.08 | MA5 先拐头向下 |
+| `bull_rolling` | > | < -0.08 | < -0.08 | 两线均下行，死叉边缘 |
+| `bear_strong` | < | < -0.08 | < -0.08 | 两线同步下行 |
+| `bear_building` | < | < -0.08 | > 0.08 | 死叉后 MA10 惯性未消 |
+| `bear_weakening` | < | > 0.08 | < -0.08 | MA5 尝试上拐 |
+| `bear_rolling` | < | > 0.08 | > 0.08 | 两线均上行，金叉边缘 |
 
-**转折点**（不变）：
+**转折点**：
 
-| 字段 | 计算方法 |
-|------|---------|
-| **金叉** | MA5 上穿 MA10 |
-| **死叉** | MA5 下穿 MA10 |
-| **即将金叉** | MA5 < MA10 + 差值收窄 + \|MA5-MA10\|/\|MA10\| < 15% |
-| **即将死叉** | MA5 > MA10 + 差值收窄 + \|MA5-MA10\|/\|MA10\| < 15% |
+| 字段 | 计算方法 | 参数 |
+|------|---------|------|
+| **金叉** | MA5 上穿 MA10（`ma5[i-1]≤ma10[i-1]` 且 `ma5[i]>ma10[i]`） | — |
+| **死叉** | MA5 下穿 MA10 | — |
+| **即将金叉** | MA5 < MA10 **且**（间距/MA10 < **0.5%** 小间距直通 **或** 3 日 gap 回归收敛且 `gap/conv_speed < 3`） | 同 MACD near 逻辑 |
+| **即将死叉** | MA5 > MA10 **且** 对称于即将金叉 | 同上 |
 
 ---
 
@@ -624,10 +688,11 @@ CREATE TABLE dws_dde_daily (
     ddx2           REAL,               -- DDX2 = EMA(DDX, 5)
     -- 趋势（基于 DDX2）
     trend          TEXT,               -- 'up' / 'down' / 'flat'
+    trend_strength REAL,               -- 加权斜率/mean(|DDX2|)
     -- 警惕点（基于 DDX2）
     alert          TEXT,               -- 'upturn_reverse' / 'downturn_reverse' /
                                        -- 'upturn_flat' / 'downturn_flat' / NULL
-    -- 背离（DDX2 vs 价格）
+    -- 背离（DDX vs 价格，见 §6.2 背离专节）
     divergence     TEXT,               -- 'top_divergence' / 'bottom_divergence' / NULL
     calc_date      TEXT,               -- 计算日期（回测快照）
     PRIMARY KEY (ts_code, trade_date, calc_date)
@@ -636,20 +701,23 @@ CREATE TABLE dws_dde_daily (
 
 #### 计算口径
 
+> 实现：`backend/etl/calc_dde.py`。数据源 `dwd_daily_moneyflow` + quote JOIN；`.BJ` 无 moneyflow → 跳过。min_rows=10。
+
 | 字段 | 计算方法 | 参数 |
 |------|---------|------|
-| **net_mf_amount** | 直接取自 `dwd_daily_moneyflow` | — |
-| **DDX** | `(buy_lg_vol + buy_elg_vol - sell_lg_vol - sell_elg_vol) / total_vol` | 大单+超大单净买入量占比 |
-| **DDX2** | EMA(DDX, 5) | α = 2/(5+1)，种子 = SMA(DDX, 5) |
-| **趋势（上升）** | DDX2 4 日窗口线性回归斜率 > 0.0001 | 日线/周线均 N=4 |
-| **趋势（下降）** | DDX2 4 日窗口线性回归斜率 < -0.0001 | 同上 |
-| **趋势（走平）** | 斜率在 [-0.0001, 0.0001] 之间 | — |
-| **上升拐头** | 此前 DDX2 连续上升 → 今日 < 昨日 | 单日判定 |
-| **下降拐头** | 此前 DDX2 连续下降 → 今日 > 昨日 | 单日判定 |
-| **上升走平** | 此前 DDX2 连续上升 → 今日\|变化\|/昨日\| ≤ 2% | 单日判定 |
-| **下降走平** | 此前 DDX2 连续下降 → 今日\|变化\|/昨日\| ≤ 2% | 单日判定 |
-| **顶背离** | ① close 创近 60 日新高 **且** ② DDX2 < 近 60 日 DDX2 最大值 | 标注在确认日（与 MACD 背离 12.29 一致） |
-| **底背离** | ① close 创近 60 日新低 **且** ② DDX2 > 近 60 日 DDX2 最小值 | 同上 |
+| **net_mf_amount** | 直接取自 `dwd_daily_moneyflow` | 万元 |
+| **DDX** | `(buy_lg + buy_elg - sell_lg - sell_elg) / total_vol`；`total_vol=0` → NULL | 大单+超大单净买入量占比 |
+| **DDX2** | EMA(DDX, 5) | SMA 种子 / APPEND `resolve_ema_seeds` |
+| **趋势（上升）** | DDX2 **8-bar** 指数加权回归斜率 > **0.0001** | decay=0.20 |
+| **趋势（下降）** | 加权斜率 < **-0.0001** | 同上 |
+| **趋势（走平）** | 斜率在 [-0.0001, 0.0001] | 同上 |
+| **trend_strength** | 加权斜率 / mean(\|DDX2\|) | 与 trend 同窗口 |
+| **上升拐头** | DDX2 连续 **2** 日上升 → 今日 < 昨日 | `upturn_reverse` |
+| **下降拐头** | DDX2 连续 **2** 日下降 → 今日 > 昨日 | `downturn_reverse` |
+| **上升走平** | 连涨 2 日后 \|变化\|/\|昨日\| ≤ **2%** | 拐头优先 |
+| **下降走平** | 连跌 2 日后 \|变化\|/\|昨日\| ≤ 2% | 同上 |
+| **顶背离** | `compute_dde_structure_divergence`；锚点 `CROSS(DDX,DDX2)` + 尖刺过滤 | dedup=10；`RECALC_SPEC` lookback=250 |
+| **底背离** | 同上；锚点 `CROSS(DDX2,DDX)`，底区对称 | dedup=10 |
 
 > **DDX 说明**：tushare 不直接提供东方财富 DDX/DDY/DDZ。本方案使用 `moneyflow` 接口的大单+超大单净买入占比作为 DDX 代理——语义等价（主力资金方向），且与 DDX 的量纲一致（-1 到 +1）。DDY 和 DDZ 因需要逐单数据无法从 tushare 计算，从方案中移除。
 
@@ -661,40 +729,83 @@ CREATE TABLE dws_dde_daily (
 CREATE TABLE dws_volume_daily (
     ts_code        TEXT,
     trade_date     TEXT,
-    ma_vol_5       REAL,               -- MA(vol, 5)，用于区域判定
-    pct_vol_rank   REAL,               -- MA5_vol 在近 120 日的百分位排名
-    -- 区域
+    ma_vol_5       REAL,               -- MA(vol, 5)
+    pct_vol_rank   REAL,               -- MA5_vol 在近 120 bar 内的百分位排名 [0,100]
+    volume_ratio   REAL,               -- vol / MA5_vol（量比）
+    -- 区域（基于 pct_vol_rank 迟滞）
     zone           TEXT,               -- 'explosive' / 'low_volume' / 'normal'
-    -- 区域内趋势
+    -- 趋势（全样本，非 zone 内子集）
     trend          TEXT,               -- 'expanding' / 'shrinking' / 'flat'
-    calc_date      TEXT,               -- 计算日期
+    trend_strength REAL,               -- ln(vol) 加权斜率/mean(|ln vol|)
+    -- 量价背离
+    divergence     TEXT,               -- 'top_divergence' / 'bottom_divergence' / NULL
+    calc_date      TEXT,
     PRIMARY KEY (ts_code, trade_date, calc_date)
 );
 ```
 
 #### 计算口径
 
-**区域判定**（基于 MA5_vol 在近 120 日的百分位）：
+> 实现：`backend/etl/calc_volume.py`。min_rows=5；APPEND 时 zone 迟滞用 `zone_seed` 续接。
+
+**周线窗口说明：** 周线 `dws_volume_weekly` 的 120 窗口指 **120 根 week-end bar**（约 2.5 年），非 120 个交易日。fetch/calc 门禁 `WEEKLY_WARMUP_WEEKS=120` 与 `dim_date.is_week_end=1` 对齐。
+
+**calc 与 fetch 门禁分离：** 新股 `daily_ok` 即可 calc（周线 volume 窗口不足导出 N/A）；仅 mature 股 history 不足时进入 `weekly_fetch` 补拉。
+
+| 字段 | 计算方法 | 参数 |
+|------|---------|------|
+| **ma_vol_5** | SMA(vol, 5) | — |
+| **volume_ratio** | vol / MA5_vol | MA5=0 → NaN |
+| **pct_vol_rank** | 当前 MA5_vol 在 trailing 120 bar 有效值中的百分位 | mid-rank，`len<2` → NaN |
+
+**区域判定**（基于 `pct_vol_rank` 迟滞；APPEND 从上一 bar 的 zone 种子续接）：
 
 | 切换方向 | 条件 | 参数 |
 |---------|------|------|
-| **进入爆量区** | MA5_vol > P90(近120日 vol) **且** 连续 2 日满足 | 120日, P90, M=2 |
-| **退出爆量区** | MA5_vol < P75(近120日 vol) **且** 连续 2 日满足 | 迟滞阈值 P75 |
-| **进入地量区** | MA5_vol < P10(近120日 vol) **且** 连续 5 日满足 | P10, M=5 |
-| **退出地量区** | MA5_vol > P25(近120日 vol) **且** 连续 2 日满足 | 迟滞阈值 P25 |
-| **正常区** | 不处于爆量区也不处于地量区 | — |
+| **进入爆量区** | `pct_vol_rank > 90` **且** 连续 **2** 日 | P90 进 |
+| **退出爆量区** | `pct_vol_rank < 75` **且** 连续 **2** 日 | P75 出 |
+| **进入地量区** | `pct_vol_rank < 10` **且** 连续 **5** 日 | P10 进 |
+| **退出地量区** | `pct_vol_rank > 25` **且** 连续 **2** 日 | P25 出 |
+| **正常区** | 非爆量非地量 | — |
 
-> 进出阈值不对称（P90 进 / P75 出）形成迟滞效应，防止在阈值边界反复切换。
+> 进出阈值不对称形成迟滞，防止边界反复切换。
 
-**区域内趋势判定**（线性回归斜率）：
+**趋势判定**（**ln(原始 vol)** 10-bar 指数加权回归，**全 bar 计算**，非 zone 内子集）：
 
-| 趋势 | 判定 |
-|------|------|
-| **放量** | 区域内 MA5_vol 序列线性回归斜率 > 0.5%/日 |
-| **缩量** | 区域内 MA5_vol 序列线性回归斜率 < -0.5%/日 |
-| **平量** | 斜率在 [-0.5%/日, 0.5%/日] 之间 |
+| 趋势 | 判定 | 参数 |
+|------|------|------|
+| **expanding（放量）** | 加权斜率 > **0.008** | decay=0.20；窗内 ≥5 个正 vol |
+| **shrinking（缩量）** | 加权斜率 < **-0.008** | 同上 |
+| **flat（平量）** | 斜率在 [-0.008, 0.008] | 同上 |
+| **trend_strength** | 加权斜率 / mean(\|ln vol\|) | 与 trend 同窗口 |
 
-> 回归斜率天然同时捕捉"首尾差异 + 过程方向一致性"，避免首尾比 + 单调比例方案在"冲高回落"型序列上的误判。
+**量价背离**：`compute_price_signal_divergence(close_qfq, vol, window=60, dedup=5)`（`base.py` rolling 60 窗法，与 MACD/DDE 结构法独立）。顶：价近窗高（≥98%）+ vol 峰不在当日 + 当日 vol < 窗峰；底：价近窗低（≤102%）+ vol 谷不在当日 + vol 回升 >10% + 价低 ≥3 bar 前；确认日 `argmax/argmin < window-1`。
+
+---
+
+### 6.6 dws_price_position_daily / dws_price_position_weekly — 价格位置
+
+```sql
+CREATE TABLE dws_price_position_daily (
+    ts_code              TEXT,
+    trade_date           TEXT,
+    price_position_60d   REAL,       -- 60 bar 滚动分位 [0,100]
+    price_position_120d  REAL,       -- 120 bar 滚动分位
+    price_position_250d  REAL,       -- 250 bar 滚动分位
+    calc_date            TEXT,
+    PRIMARY KEY (ts_code, trade_date, calc_date)
+);
+-- 周线表结构相同，表名 dws_price_position_weekly；窗口为 week-end bar 数
+```
+
+#### 计算口径
+
+> 实现：`backend/etl/calc_price_position.py`。纯价格特征，**不依赖**其他 DWS 表。min_rows=2。
+
+| 字段 | 公式 | 参数 |
+|------|------|------|
+| **price_position_Nd** | `(close - N_bar_low) / (N_bar_high - N_bar_low) × 100` | N ∈ {60, 120, 250}；`min_periods=2`；high=low → NaN |
+| **算法** | `rolling_window_minmax_deque` 滚动 min/max | 值域 [0, 100] |
 
 ---
 
@@ -715,7 +826,7 @@ CREATE TABLE dws_volume_daily (
 
 ### 7.1 ads_analysis_wide — 分析宽表
 
-> 将 5 张 DWS 表 + dim_stock 通过 `v_*_latest` 视图 JOIN 为一张大宽表，每个交易日每只股票一行，包含全部技术指标 + 基础信息。数据可直接导出 Excel 做离线分析。
+> 将 **6** 张 DWS 表 + dim_stock 通过 `v_*_latest` 视图 JOIN 为一张大宽表，每个交易日每只股票一行，包含全部技术指标 + 基础信息。数据可直接导出 Excel 做离线分析。
 
 ```sql
 -- ============================================================
@@ -741,12 +852,12 @@ SELECT
     q.pe_ttm         AS pe_ttm,
     q.turnover_rate  AS turnover_rate,
 
-    -- K线形态合并为单一字段（子形态优先：阳克阴 > 阳包阴，阴克阳 > 阴包阳）
+    -- K线形态合并为单一字段（子形态优先；阴包阳/阴克阳回测为反向买入 → contrarian_*）
     CASE
         WHEN k.yang_ke_yin = 1    THEN 'yang_ke_yin'
         WHEN k.yang_bao_yin = 1   THEN 'yang_bao_yin'
-        WHEN k.yin_ke_yang = 1    THEN 'yin_ke_yang'
-        WHEN k.yin_bao_yang = 1   THEN 'yin_bao_yang'
+        WHEN k.yin_ke_yang = 1    THEN 'contrarian_yin_ke_yang'
+        WHEN k.yin_bao_yang = 1   THEN 'contrarian_yin_bao_yang'
         WHEN k.mu_bei_xian = 1    THEN 'mu_bei_xian'
         WHEN k.bi_lei_zhen = 1    THEN 'bi_lei_zhen'
         WHEN k.gao_kai_chang_yin = 1 THEN 'gao_kai_chang_yin'
@@ -818,12 +929,12 @@ SELECT
     qw.pe_ttm        AS pe_ttm,
     qw.turnover_rate AS turnover_rate,
 
-    -- K线形态合并为单一字段（子形态优先）
+    -- K线形态合并为单一字段（子形态优先；阴包阳/阴克阳 → contrarian_*）
     CASE
         WHEN kw.yang_ke_yin = 1    THEN 'yang_ke_yin'
         WHEN kw.yang_bao_yin = 1   THEN 'yang_bao_yin'
-        WHEN kw.yin_ke_yang = 1    THEN 'yin_ke_yang'
-        WHEN kw.yin_bao_yang = 1   THEN 'yin_bao_yang'
+        WHEN kw.yin_ke_yang = 1    THEN 'contrarian_yin_ke_yang'
+        WHEN kw.yin_bao_yang = 1   THEN 'contrarian_yin_bao_yang'
         WHEN kw.mu_bei_xian = 1    THEN 'mu_bei_xian'
         WHEN kw.bi_lei_zhen = 1    THEN 'bi_lei_zhen'
         WHEN kw.gao_kai_chang_yin = 1 THEN 'gao_kai_chang_yin'
@@ -893,12 +1004,12 @@ SELECT
     q.vol            AS vol,
     q.amount         AS amount,
 
-    -- K线形态合并为单一字段（子形态优先）
+    -- K线形态合并为单一字段（子形态优先；阴包阳/阴克阳 → contrarian_*）
     CASE
         WHEN k.yang_ke_yin = 1    THEN 'yang_ke_yin'
         WHEN k.yang_bao_yin = 1   THEN 'yang_bao_yin'
-        WHEN k.yin_ke_yang = 1    THEN 'yin_ke_yang'
-        WHEN k.yin_bao_yang = 1   THEN 'yin_bao_yang'
+        WHEN k.yin_ke_yang = 1    THEN 'contrarian_yin_ke_yang'
+        WHEN k.yin_bao_yang = 1   THEN 'contrarian_yin_bao_yang'
         WHEN k.mu_bei_xian = 1    THEN 'mu_bei_xian'
         WHEN k.bi_lei_zhen = 1    THEN 'bi_lei_zhen'
         WHEN k.gao_kai_chang_yin = 1 THEN 'gao_kai_chang_yin'
@@ -963,8 +1074,8 @@ SELECT
     CASE
         WHEN k.yang_ke_yin = 1    THEN 'yang_ke_yin'
         WHEN k.yang_bao_yin = 1   THEN 'yang_bao_yin'
-        WHEN k.yin_ke_yang = 1    THEN 'yin_ke_yang'
-        WHEN k.yin_bao_yang = 1   THEN 'yin_bao_yang'
+        WHEN k.yin_ke_yang = 1    THEN 'contrarian_yin_ke_yang'
+        WHEN k.yin_bao_yang = 1   THEN 'contrarian_yin_bao_yang'
         WHEN k.mu_bei_xian = 1    THEN 'mu_bei_xian'
         WHEN k.bi_lei_zhen = 1    THEN 'bi_lei_zhen'
         WHEN k.gao_kai_chang_yin = 1 THEN 'gao_kai_chang_yin'
@@ -1110,11 +1221,12 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
         for col_idx, value in enumerate(row, 1):
             ws.cell(row=row_idx, column=col_idx, value=value)
 
-    # 信号高亮：K线形态（单一枚举列）
+    # 信号高亮：K线形态（单一枚举列；阴包阳/阴克阳回测为反向买入 → 绿色）
     kpattern_colors = {
         'yang_bao_yin': green, 'yang_ke_yin': green,
         'mu_bei_xian': red, 'bi_lei_zhen': red,
         'gao_kai_chang_yin': red, 'yin_bao_yang': red, 'yin_ke_yang': red,
+        'contrarian_yin_bao_yang': green, 'contrarian_yin_ke_yang': green,
     }
     if 'kpattern' in df.columns:
         col_idx = list(df.columns).index('kpattern') + 1
@@ -1133,7 +1245,7 @@ def _write_sheet(wb: Workbook, sheet_name: str, df: "pd.DataFrame"):
             '多头衰竭': blue, '多头翻转': blue,
             '空头强势': red,  '空头初建': red,
             '空头衰竭': blue, '空头翻转': blue,
-            '均线缠绕': blue,
+            '均线缠绕': blue, '均线走平': blue,
         },
         'ma_turning_point':    {'golden_cross': green, 'dead_cross': red},
         'dde_trend':           {'up': green, 'down': red},
@@ -1187,7 +1299,7 @@ Step 4 — 构建 DWS（DuckDB 分析引擎计算）
   dwd_daily_quote        → dws_kpattern_daily / dws_macd_daily /
                             dws_ma_daily / dws_volume_daily
   dwd_daily_moneyflow    → dws_dde_daily
-  dwd_weekly_quote       → 对应的 5 张周线表
+  dwd_weekly_quote       → 对应的 6 张周线表
 
 Step 5 — 后续
   DWS → ADS（根据后续分析需求扩展）
@@ -1326,61 +1438,71 @@ python -m backend.cli status
 
 | 指标 | 类型 | 核心逻辑 | 关键参数 |
 |------|------|---------|---------|
-| 阳包阴 | 买入 | 实体吞没阴线，不看影线，不强制量能 | — |
-| 阳克阴 | 买入 | 量价双向胜：量>前量×1.2 且 实顶>前实顶 | 量能放大≥1.2x |
-| 墓碑线 | 卖出 | 高位无实体Doji+长上影(≥3x实体) | 高位:60日高点10%内或20日涨>15%; Doji:<0.5%或<振幅10% |
-| 避雷针 | 卖出 | 高位小实体(<振幅20%)+长上影(≥3x实体)，实体在下1/3 | 高位:同上; 实体<振幅20% |
-| 高开长阴 | 卖出 | 高位高开(前涨>15%/10日)，长阴(≥5%)，放量(>MA5×1.5) | 前涨>15%(10日); 阴体≥5%; 量>MA5×1.5 |
-| 阴包阳 | 卖出 | 实体吞没阳线，不看影线 | — |
-| 阴克阳 | 卖出 | 量价双向胜：量>前量×1.2 且 实底<前实底 | 量能放大≥1.2x |
-| **strength** | 强度 | 触发形态的加权评分 (0.0~1.0)，无形态=NULL。权重: 吞没/影线/量能/高位确认 | `[待回测]` |
+| 阳包阴 | 买入 | 前阴+当阳实体吞没；涨跌停日过滤 | — |
+| 阳克阴 | 买入 | 前阴+量价双向胜：量>MA5×1.2 且 实顶>前实顶 且 收>MA10 | vol×1.2；MA10 |
+| 墓碑线 | 卖出 | 高位+Doji+长上影(≥3x实体或零实体时上影/振幅>60%) | 60日高点90%内或20日涨>15% |
+| 避雷针 | 卖出 | 高位+小实体(<振幅20%且在下1/3)+长上影 | 同墓碑线高位规则 |
+| 高开长阴 | 卖出 | 10日涨>15%+跳空高开+阴体≥5%+量>MA5×1.5 | 见 `gao_kai_chang_yin` |
+| 阴包阳 | 卖出 | 前阳+当阴实体吞没；涨跌停日过滤 | — |
+| 阴克阳 | 卖出 | 前阳+量价双向胜：量>MA5×1.2 且 实底<前实底 且 收<MA10 | vol×1.2；MA10 |
+| **strength** | 强度 | 0.0~1.0 加权评分，无形态=NULL；多形态同日取 `if/elif` 固定顺序（§6.1） | `[待回测]` |
+| **ADS kpattern** | 展示 | DWS 7 列合并为枚举；阴包阳/阴克阳映射为 `contrarian_*`（回测反向买入） | 子形态优先 |
 
 ### 9.2 MACD
 
 | 子类 | 指标 | 判定 |
 |------|------|------|
-| 基础 | DIF/DEA/MACD柱 | EMA(12,26,9)，前N日SMA种子 |
-| 背离 | 顶/底背离 | 严格口径：价新高+DIF未新高 / 价新低+DIF未新低（60 日回溯窗口，标注在确认日） |
+| 基础 | DIF/DEA/MACD柱 | EMA(12,26,9)，SMA 种子 / APPEND 递推 |
+| 背离 | 顶背离 | 结构法：金叉锚点 + 直接/隔峰线背(MDIF) ∧ 红柱柱背；TG 日标注；10 bar 去重 |
+| | 底背离 | 死叉锚点对称；绿柱柱背；TG 日标注 |
 | 区域 | 多方/空方 | MACD柱 > 0 / < 0 |
-| 转折点 | 金叉/死叉 | MACD柱正负号翻转 |
-| | 即将金叉/死叉 | 差值<DEA×15% + 收敛中 |
-| 警惕点 | 上升拐头/下降拐头 | 趋势→逆转（单日） |
-| | 上升走平/下降走平 | 趋势→停滞（单日变化≤2%） |
-| 趋势 | 上升/下降/走平 | MACD柱 4日窗口线性回归斜率，阈值±0.02 |
+| 转折点 | 金叉/死叉 | MACD柱符号翻转 |
+| | 即将金叉/死叉 | gap<0.005 或 3日收敛预估<3日（零轴兜底见 §6.2） |
+| 警惕点 | 上升/下降拐头 | 柱体连涨/跌2日后逆转 |
+| | 上升/下降走平 | 连涨/跌2日后日变化≤2% |
+| 趋势 | 上升/下降/走平 | MACD柱 5-bar 加权回归(decay=0.15)，阈值 ±0.001 |
+| | trend_strength | 加权斜率/mean(\|柱\|) |
 
 ### 9.3 均线
 
 | 子类 | 指标 | 判定 |
 |------|------|------|
 | 基础 | MA5/MA10 | 前复权收盘价 SMA |
-| | 乖离率 bias_ma5/bias_ma10 | (close-MA)/MA×100 |
-| | 斜率 ma5_slope/ma10_slope | 3日间隔变化率 `[待回测]` |
-| 趋势 | alignment 9 值 | DWS: bull_strong/bull_building/.../tangle; ADS: 多头强势/多头初建/.../均线缠绕 |
-| 转折点 | 金叉/死叉 | MA5上穿/下穿MA10 |
-| | 即将金叉/死叉 | 差值<MA10×15% + 收敛中 |
+| | 乖离率 | (close-MA)/MA×100 |
+| | 斜率 | 5-bar OLS 斜率/当前MA×100（%/日） |
+| 趋势 | alignment | tangle(间距<2.99%+10日交叉≥2) → sideways(双斜率<0.08%/日) → 8方向；Layer3 单斜率 fallback |
+| 转折点 | 金叉/死叉 | MA5 上穿/下穿 MA10 |
+| | 即将金叉/死叉 | 间距/MA10<0.5% 或 3日 gap 收敛预估<3日 |
 
 ### 9.4 DDE
 
 | 子类 | 指标 | 判定 |
 |------|------|------|
-| 基础 | DDX（代理）| (大单+超大单净买入)/总成交量 |
-| | DDX2 | EMA(DDX, 5), SMA种子 |
+| 基础 | DDX | (大单+超大单净买入)/total_vol；.BJ 无数据 |
+| | DDX2 | EMA(DDX,5) |
 | | net_mf_amount | 主力净流入额（万元） |
-| 趋势 | 上升/下降/走平 | DDX2 4日窗口线性回归斜率，阈值±0.0001 |
-| 警惕点 | 上升拐头/下降拐头 | 趋势→逆转（单日） |
-| | 上升走平/下降走平 | 趋势→停滞（单日变化≤2%） |
-| 背离 | 顶/底背离 | 价创60日新高/低 + DDX2未跟随。标注在确认日 |
+| 趋势 | 上升/下降/走平 | DDX2 8-bar 加权回归(decay=0.20)，阈值 ±0.0001 |
+| | trend_strength | 加权斜率/mean(\|DDX2\|) |
+| 警惕点 | 上升/下降拐头 | DDX2 连涨/跌2日后逆转 |
+| | 上升/下降走平 | 连涨/跌2日后变化≤2% |
+| 背离 | 顶/底背离 | `compute_dde_structure_divergence`；DDX/DDX2 交叉锚点 + 柱背；顶区尖刺过滤；TG 日标注 |
 
 ### 9.5 量能
 
 | 子类 | 指标 | 判定 |
 |------|------|------|
-| 区域 | 爆量区 | MA5_vol > P90(120日)，连续2日进入，P75退出 |
-| | 地量区 | MA5_vol < P10(120日)，连续5日进入，P25退出 |
-| | 正常区 | 非爆量非地量 |
-| 趋势 | 放量 | 区域内 ln(MA5_vol) 回归斜率 > 0.005/日 |
-| | 缩量 | 区域内 ln(MA5_vol) 回归斜率 < -0.005/日 |
-| | 平量 | 斜率在 [-0.005, 0.005]/日 |
+| 基础 | ma_vol_5 / volume_ratio | SMA(vol,5)；vol/MA5_vol |
+| | pct_vol_rank | MA5_vol 在 120 bar 内百分位 |
+| 区域 | 爆量/地量/正常 | pct_vol_rank 迟滞：>90×2日进/<75×2日出；<10×5日进/>25×2日出 |
+| 趋势 | expanding/shrinking/flat | ln(vol) 10-bar 加权回归，阈值 ±0.008 |
+| | trend_strength | 加权斜率/mean(\|ln vol\|) |
+| 背离 | 量价顶/底背离 | 同 §6.2，信号=vol |
+
+### 9.6 价格位置
+
+| 子类 | 指标 | 判定 |
+|------|------|------|
+| 分位 | 60/120/250 bar | `(close-N_low)/(N_high-N_low)×100`；min_periods=2 |
 
 ---
 
@@ -1729,12 +1851,43 @@ CREATE INDEX idx_ods_moneyflow_date ON ods_moneyflow(trade_date);
 每日跑批流程（INSERT-only 快照模式）：
   0. ETL 启动自检：DuckDB 数据库文件可读写
   1. ODS 增量拉取最新 N 日数据，INSERT INTO ODS 表
-  2. DuckDB 窗口函数计算 DWS（直接读 DWD 表）
-  3. INSERT INTO DWS 表（新 calc_date 行），每批 100 只股票一个事务
-  4. 最近 60 个交易日产生新的 calc_date 快照（同一 trade_date 可有多个 calc_date）
-  5. 60 日之前的 DWS 行冻结不变（不再产生新 calc_date）
-  6. calc_date = 当前跑批日期
+  2. DuckDB 计算 DWS（直接读 DWD 表；CALC_INCREMENTAL=1 时窄读窄写）
+  3. INSERT INTO DWS 表（新 calc_date 行），每股窄写 [recalc_start, calc_date]
+  4. 快照保留由 prune_dws_snapshots(keep_runs=N) 运维清理（默认 5 次 calc_date）
+  5. calc_date = 当前跑批日期
+  6. 墙钟耗时记入 ods_etl_log（观测项，非硬 KPI）
 ```
+
+**重算窗口（RecalcSpec 注册表，禁止 magic number）：**
+
+| 概念 | 含义 |
+|------|------|
+| `RecalcSpec` | 各 Calculator 声明 `lookback + seed + event_tail + min_rows` |
+| `resolve_recalc_bars()` | `max(total) + safety(5)`；当前 daily 聚合值 **255** |
+| `recalc_start` | `calc_date` 向前回溯 255 交易日（指纹域 + DWS 窄写起点） |
+| `load_start` | `recalc_start` 再向前 `max(lookback)-1` bar（EMA/PP 种子正确性） |
+| `CALC_INCREMENTAL=0` | 回退全量读/写（指纹 skip 仍可用） |
+| `CALC_WORKERS` | 计算**线程**并行度，默认 `min(cpu-1, 8)`（DuckDB 单文件禁跨进程写，故用线程池） |
+| `CALC_APPEND=1`（默认） | 新交易日双路径追算：每股每 freq 每指标按 `dws_calc_state` 路由 SKIP/APPEND/FULL；`=0` 回退 12.7 窄窗 |
+| `CALC_FAST_SKIP=1`（默认） | chunk 级 preflight v2：按指标 partial skip（`preflight_stock_modes_v2` + `calc_stock_pipeline_selective`）；BSE DDE 空帧视为 SKIP；需 `CALC_APPEND`；`=0` 回退 |
+| `CALC_BATCH_APPEND=1`（默认） | 全市场新日 `run_calc` 在 ThreadPool 前走 `run_batch_append_phase()`：APPEND/SKIP 股按 `(indicator,freq)` 跨股批处理（共享尾窗加载 + batch 种子）；FULL/fallthrough 股仍进 `_calc_stock_chunk`；`--ts-code` 子集或 `=0` 回退逐股 APPEND；需 `CALC_APPEND`；设计见 `docs/superpowers/plans/2026-06-08-cross-stock-batch-append.md` |
+| `CALC_SKIP_STATE_REFRESH=1`（默认） | 同日复跑 SKIP 路径：当 `history_fp` 未变且 `updated_calc_date` 同 `calc_date` 时跳过冗余 `dws_calc_state` UPSERT；`=0` 回退旧行为（每次 SKIP 仍写 state）；需 `CALC_APPEND`；设计见 `docs/superpowers/plans/2026-06-08-calc-performance-special.md` |
+
+**同日复跑 partial skip（CALC_FAST_SKIP v2）：** v1 实库 **834s→630s**（12 指标全 SKIP 才短路）。v2 见 `docs/superpowers/plans/2026-06-08-calc-partial-skip-v2.md`：`SKIP` 指标直接记 `fingerprint_match`，仅 `APPEND`/`FULL` 走 selective pipeline；DDE weekly batch SQL `tail_window=245`。
+
+**新日追算（append-only，CALC_APPEND）：** 见独立设计 `docs/superpowers/specs/2026-06-07-calc-append-only-design.md`。要点：
+
+- **状态表 `dws_calc_state`** — PK `(ts_code, freq, indicator)`，列 `last_trade_date / history_fp / quote_latest_adj / spec_version / updated_calc_date`，每指标一行。缺失（新股/首部署）→ FULL 建基线。
+- **路由 `classify_calc_mode()`** — 无 state→FULL；强签名变（除权/填充/修正）→FULL；无新 bar 同签名→SKIP；有新 bar 同签名→APPEND。
+- **强签名 `state_signature()`** — 对 `last_td` 前**固定 245 根尾窗**的输入值序列（按各计算器 `SIGNATURE_COLS`）做 SHA256，替代弱的 min/max/mean 指纹；固定宽度保证跨运行稳定。误判方向只会多一次安全 FULL，绝不误 APPEND（新 bar 始终全窗重算）。
+- **APPEND `append_calculate()`** — 仅算/写新 bar；EMA/ddx2 `resolve_ema_seeds` 种子递推、Volume 迟滞 zone 种子、滚动类复用全尾窗算法。INSERT-only 不改写历史。与 FULL 逐值 `atol=1e-9` 等价（`tests/test_etl/test_append_calc.py`）。
+- **范围外后续项：** 端到端「秒级日更」仍受 ~320s 全市场 freshness-fetch 拖累，需单独立项。
+
+**P3 热路径优化（与全量 golden-master 等价）：**
+
+- PricePosition：`rolling_window_minmax_deque` O(n) 滚动极值
+- MACD/DDE：`load_ema_seed` 从上一 calc_date DWS 读 EMA 状态再递推
+- 背离：MACD/DDE → `divergence_structure` 结构法（Level 2 隔峰柱背，TG 标注，dedup=10，lookback=250）；Volume → `compute_price_signal_divergence` 60 窗 + 5 bar dedup
 
 ### 12.7b ETL 故障恢复与数据回补
 
@@ -1940,6 +2093,14 @@ DDX = (buy_lg_vol + buy_elg_vol - sell_lg_vol - sell_elg_vol) / total_vol
 ```
 DDY/DDZ 因 tushare 无法提供逐单数据，从方案中移除。
 
+#### 12.17.1 B4 DDE trend 双轨与有效区间
+
+- **DDX/DDX2**：`moneyflow` 量口径（2015 起，§12.17）
+- **dde_trend 日线**：`moneyflow_dc` + `circ_mv` 优先，缺则回退 `net_mf_amount` + `total_mv`
+- **dde_trend 周线**：仅 `moneyflow_dc` + `circ_mv`（日级 resample-W），**禁止** net_mf 回退；`moneyflow_dc` 自 **2023-09-11**
+- **运维**：dc/circ 历史不足时须 `cli backfill-dde-meta --sync-dwd` + weekly DDE `--force` FULL
+- **合法 N/A**：BSE 无 moneyflow、上市不足 ~60 周 EMA 预热、`_skip_dde` 不完整周
+
 ### 12.18 架构图表数更正
 
 > ODS 层实际为 7 表（ods_stock_basic/daily/daily_basic/moneyflow/trade_cal/concept_detail + ods_etl_log），DIM 层实际为 4 表（dim_stock/dim_date/dim_concept/dim_concept_stock）。dim_index/dim_index_member 延后至 ADS 板块功能实现时引入（12.63）。架构图已同步更新。
@@ -1948,9 +2109,9 @@ DDY/DDZ 因 tushare 无法提供逐单数据，从方案中移除。
 
 > 周线 DWD 改为从 `ods_daily` 聚合生成后，`ods_weekly` 不再被任何 ETL 步骤引用。已从 ODS DDL 中移除。
 
-### 12.20 MACD 背离回溯窗口
+### 12.20 MACD 结构背离（Level 2）
 
-> 顶背离/底背离的峰值比较窗口指定为 **60 个交易日**。"价格创新高"指价格突破近 60 日最高收盘价，"DIF 未创新高"指当前 DIF 峰值低于近 60 日 DIF 峰值。底背离同理。
+> MACD 背离改用 `divergence_structure.compute_macd_structure_divergence()`，对齐通达信「MACD 顶底结构」**Level 2**（直接 + 隔峰线背 ∧ 柱背），**非** 60 bar rolling。顶区锚点 = 金叉 `CROSS(DIF,DEA)`，自锚点起滚动 `CH1/DIFH1/MACDH1` 与 REF 前段/隔峰段比较；DIF 幅度经 **MDIF** 整数归一后判线背。钝化需红柱连续且柱背（`MACDH1` 低于前段红柱峰）；**仅结构形成日 TG** 写入 DWS（钝化 T 不写）。同类 **10 bar** 去重。`RECALC_SPEC` lookback=**250**、event_tail=**10** 以覆盖多段金/死叉历史。Volume 量价背离仍走 `compute_price_signal_divergence` 60 窗（§6.5）。
 
 ### 12.21 前复权公式修正（Independent Review 发现）
 
@@ -1965,7 +2126,9 @@ DDY/DDZ 因 tushare 无法提供逐单数据，从方案中移除。
 ### 12.23 增量策略改为 INSERT-only 快照模式（Independent Review 发现）
 
 > DELETE+INSERT 破坏性滑动窗口与 calc_date 回测快照存在架构冲突——DELETE 会销毁旧快照。
-> 改为 INSERT-only：每日跑批只 INSERT 新 calc_date 行，旧 calc_date 永不清除。每只股票最近 60 日 window 内的行每个交易日产出一个新快照，60 日前的行冻结。所有 DWS 表 PK 扩展为 `(ts_code, trade_date, calc_date)`。
+> 改为 INSERT-only：每日跑批只 INSERT 新 calc_date 行。每只股票最近 60 日 window 内的行每个交易日产出一个新快照，60 日前的行冻结。所有 DWS 表 PK 扩展为 `(ts_code, trade_date, calc_date)`。
+>
+> **快照保留策略（2026-06-05 修订）**：原"旧 calc_date 永不清除"导致 DWS 无界增长（实测 12 表 10.96M 行 / 3.1 GB）。改为**窗口保留**：提供 `prune_dws_snapshots(con, keep_runs=N)`（默认 `keep_runs=5`）与 CLI `prune --keep N` 子命令。清理只删除被更新 calc_date 覆盖（superseded）的旧快照行，**绝不删除任一 `(ts_code, trade_date)` 的 `MAX(calc_date)` 行**——因此 `v_*_latest` 视图结果逐行不变（即使指纹跳过导致某键最新值落在旧 calc_date 也安全保留）。`keep_runs=1` 完全坍缩为纯 latest，`>1` 保留最近 N 次运行的审计窗口。清理为逻辑删除 + `CHECKPOINT`（文件内空间复用），不挂进 `run_calc`（避免隐式删除），由运维显式执行。
 
 ### 12.24 dim_stock.sector 推导规则
 
@@ -2007,9 +2170,9 @@ DDY/DDZ 因 tushare 无法提供逐单数据，从方案中移除。
 > - 熔断日从量能百分位计算中硬排除
 > - ST 股票（5% 涨跌停）的形态判定阈值相应收紧至 `|pct_chg| ≥ 4.9%`
 
-### 12.29 MACD 背离确认日标注（Quant Review 发现）
+### 12.29 MACD/DDE 背离标注日（结构形成 TG）
 
-> 顶背离的日期标注从"价格创60日新高的那一天"改为"DIF确认未跟随的**确认日**"——即 DIF 已从峰值回落但价格尚未跌破前高的第一天。消除前视偏差（peak bar 当天 DIF 通常也创新高，背离事实上要到 2-5 天后才可观测）。
+> **标注日 = 结构形成 TG**，非钝化 T、非价格/DIF（或 DDX）极值当日。实现：前 bar 满足钝化 T（线背直接∨隔峰 ∧ 柱背），当日所用 MDIF 转向（顶背离 `MDIFT<REF(MDIFT,1)`；底背离 `MDIFB>REF(MDIFB,1)`）且结构未「消失」（顶：`DIFH1` 未再创新高超越对照峰；底：`DIFL1` 未再创新低）→ 写入 `top_divergence`/`bottom_divergence`。钝化日仅内部状态，**不落 DWS**。语义：结构在 DIF/DDX 转向瞬间确认，消除前视偏差（极值 bar 当天信号通常同步极值，需待转向才可观测）。DDE 同构，锚点为 `DDX/DDX2` 交叉。
 
 ### 12.30 走平阈值调整（Quant Review 发现）
 
@@ -2086,11 +2249,11 @@ WHERE calc_date = (
 
 ### 12.43 ADS 层 K 线形态合并（方案优化）
 
-> 原方案 7 个 1/0 布尔列（`yang_bao_yin`, `yang_ke_yin`, `mu_bei_xian`...）稀疏且冗余——同一交易日最多触发一种 K 线形态。ADS 层合并为单一 `kpattern` 枚举字段（取值 `'yang_bao_yin'` / `'yang_ke_yin'` / ... / NULL）。CASE 优先级顺序作为多重触发的兜底策略（买入形态优先 → 卖出形态）。Excel 导出代码同步改为单列枚举高亮。DWS 层保持原布尔列结构不变（计算层与展示层分离）。
+> DWS 层保留 7 个独立 0/1 布尔列（同日可**多列并存**）。ADS 层合并为单一 `kpattern` 枚举（取值 `'yang_ke_yin'` / `'yang_bao_yin'` / `'contrarian_yin_ke_yang'` / `'contrarian_yin_bao_yang'` / ... / NULL）。CASE 优先级：买入子形态 `阳克阴 > 阳包阴`；阴包阳/阴克阳经回测重标为 `contrarian_*`（展示为反向买入，Excel 绿色高亮）；卖出 `墓碑线 > 避雷针 > 高开长阴`。`strength` 仍取自 DWS，与 `kpattern` 展示优先级独立（见 §6.1）。Excel 导出同步单列枚举高亮。
 
 ### 12.44 K 线形态量化参数（交易专家 Review）
 
-> 原方案 7 种 K 线形态中，墓碑线/避雷针/高开长阴/阳克阴/阴克阳 存在模糊描述（"长上影线极长""小实体""显著上涨""高位"），无法直接编码。补全精确参数：墓碑线上影≥3x、Doji<0.5%或<振幅10%、高位=60日高点10%内或20日涨>15%；避雷针实体<振幅20%+实体在下1/3；高开长阴前涨>15%(10日)+量>MA5×1.5；阳克阴/阴克阳量能放大≥1.2x。所有阈值标注 `[待回测调优]`。
+> 原方案 7 种 K 线形态中，墓碑线/避雷针/高开长阴/阳克阴/阴克阳 存在模糊描述（"长上影线极长""小实体""显著上涨""高位"），无法直接编码。补全精确参数：墓碑线上影≥3x、Doji<0.5%或<振幅10%、高位=60日高点90%内或20日涨>15%；避雷针实体<振幅20%+实体在下1/3；高开长阴前涨>15%(10日)+量>MA5×1.5；阳克阴/阴克阴检测量能基准为 **MA5_vol×1.2**（非前日量），并叠加 MA10 趋势过滤。所有阈值集中 `kpattern_params.py`，标注 `[待回测调优]`。
 
 ### 12.45 周线涨跌幅公式统一（Data Architect Review 发现）
 
@@ -2124,9 +2287,9 @@ WHERE calc_date = (
 
 > 补全 12.10 节：dws_kpattern 布尔列 CHECK (0/1)、dws_volume pct_vol_rank 值域 CHECK [0,100] + zone/trend 枚举 CHECK、dws_ma 布尔列+枚举 CHECK、dws_dde 枚举 CHECK。v1.5 切换纯 DuckDB 后 CHECK 由数据库强制执行。
 
-### 12.53 dws_ma.alignment NULL 语义明确（Data Architect Review 未优化项）
+### 12.53 dws_ma.alignment NULL 语义明确
 
-> alignment 取 NULL 的场景：MA5 或 MA10 值不可用（IPO 上市不足 10 日 MA10 尚未计算，或停牌复牌后 MA 窗口内有效交易日不足）。
+> alignment 取 NULL 的唯一场景：MA5、MA10 或斜率不可用（<11 bar、NaN）。`sideways` 为独立枚举（双斜率 |s|<0.08%/日 且非 tangle）。「一走平一趋势」过渡态由 Layer 3 fallback 归入 8 方向类，不再 NULL。
 
 ### 12.54 dim_date 补 is_year_end（Data Architect Review 未优化项）
 
@@ -2135,6 +2298,12 @@ WHERE calc_date = (
 ### 12.55 total_vol 口径说明（Data Architect Review 未优化项）
 
 > dwd_daily_moneyflow.total_vol 选用买入侧求和（buy_sm + buy_md + buy_lg + buy_elg），与 DDX 分子的大单+超大单净买入方向一致。注明了 tushare 买卖分类基于主动方向，两侧合计理论上等价但实际可能有微小偏差。
+
+### 12.56 周划分改用 date_trunc('week')，修正跨年周切分（Data Architect Review 发现）
+
+> 原 `dim_date.is_week_end`（build_dim）与 `dwd_weekly_quote` 滚动周线分区（build_dwd）均用 `strftime(dt, '%Y-%W')` 作为周键。`%Y` 为日历年、`%W` 年初不满一周记为第 `00` 周，导致**跨年自然周被切成两段**（如 2025-12-29 周一~2026-01-02 周五被分为 `2025-52` 与 `2026-00`）。后果：跨年周周线 bar 的 open/high/low/pct_chg/active_days 错误，且该周出现两个 `is_week_end=1`（上一年尾 + 新年头），下游 6 个周线指标在年初多算一根假周末 bar。每年元旦附近发生一次。
+> **修复**：两处统一改为 `date_trunc('week', dt)`（周一锚点，跨年自然周天然归入同一分区）。`week_of_year` 展示字段无下游计算依赖，保留 `%W`。
+> **实库副作用**：需重建 `dim_date` + `dwd_weekly_quote` 并重算周线 DWS，历史跨年周数据才会纠正。
 
 ### 12.56 ods_etl_log DDL 一致性修正（Data Architect Review 未优化项）
 
@@ -2146,15 +2315,15 @@ WHERE calc_date = (
 
 ### 12.58 K 线形态 strength 强度评分（交易专家 Review）
 
-> dws_kpattern 新增 `strength REAL` 列（0.0~1.0）。7 种形态各定义加权公式，触发哪个形态用哪个公式；子形态（阳克阴/阴克阳）权重侧重量能超越，天然强于父形态。ADS 宽表映射为 `kpattern_strength`。
+> dws_kpattern 新增 `strength REAL` 列（0.0~1.0）。7 种形态各定义加权公式；同日多形态时 `calc_kpattern._compute_strength()` 按固定 `if/elif` 顺序取第一个触发形态（阳包阴优先于阳克阴，与 ADS `kpattern` 子形态优先展示顺序不同）。阳克阴/阴克阴量能维度与检测对齐，使用 `当日量/MA5_vol/1.5`。ADS 宽表映射为 `kpattern_strength`。
 
 ### 12.59 均线指标重构（交易专家 Review）
 
 > 删除 `ma5_flat`/`ma10_flat`/`ma_all_flat` 三个布尔列。新增 `bias_ma5`/`bias_ma10`（乖离率）、`ma5_slope`/`ma10_slope`（3 日斜率）。`alignment` 从 3 值扩展为 9 值枚举（bull_strong/bull_building/bull_weakening/bull_rolling/bear_strong/bear_building/bear_weakening/bear_rolling/tangle），基于位置+双斜率方向组合。DWS 层存英文码，ADS 层 CASE WHEN 翻译为中文展示文本。
 
-### 12.60 DDE 背离信号（交易专家 Review）
+### 12.60 DDE 结构背离信号（交易专家 Review → Level 2）
 
-> dws_dde 新增 `divergence TEXT` 列（top_divergence/bottom_divergence/NULL）。判定逻辑与 MACD 背离一致，将 DIF 替换为 DDX2：价格创 60 日新高/低 + DDX2 未跟随。标注在确认日消除前视偏差。ADS 宽表映射为 `dde_divergence`。
+> dws_dde `divergence TEXT` 列（top_divergence/bottom_divergence/NULL）。调用 `compute_dde_structure_divergence()`（`divergence_structure.py`），与 MACD 同构：**锚点** = `CROSS(DDX,DDX2)`（顶）/ `CROSS(DDX2,DDX)`（底）；`fast=DDX`、`slow=DDX2`，柱背段内取 DDX 峰（顶区 `ddx>0`）。顶区 DDX 峰 **尖刺过滤**（邻域 `[peak-2,peak+3)` 内 ≥0.8×峰值 bar <2 → 剔除）；窗内 DDX 含 NaN → 该 bar 不判（`require_finite=True`）。标注日 = 结构形成 **TG**（§12.29）；dedup=**10**。`RECALC_SPEC` lookback=**250**。ADS 宽表映射为 `dde_divergence`。注：DDX 为 tushare moneyflow 代理，与东方财富终端数值可能有偏差。
 
 ### 12.61 v1.4.1 文档勘误（Data Architect Review 发现）
 
@@ -2256,6 +2425,39 @@ WHERE calc_date = (
 ### 12.81 ETL 错误分级补充 DEGRADED 级别（/autoplan Final Review 发现）
 
 > 8.2 节原 FATAL/ERROR/WARN/INFO 四级分级缺少对"数据降级"（12.7b `status='degraded'`、11.2 `freshness.status='stale'`）的映射。新增 `DEGRADED` 级别：数据可用但新鲜度下降，写 `ods_etl_log.status='degraded'`，API 返回 `freshness.status='stale'`，ETL 继续运行。
+
+### 12.82 K 线形态 spec 与实现对齐（v1.9）
+
+> §6.1 / §9.1 按 `calc_kpattern.py` + `kpattern_params.py` 重对齐：
+> - 新增「通用前提」：阴阳判定、min 30 行、涨跌停过滤、周线周末 bar、DWS 多列并存语义
+> - 阳克阴/阴克阴：检测量能基准改为 **MA5_vol×1.2** + MA10 趋势过滤（修正旧版「前日量×1.2」表述）
+> - 阳包阴：注明 `ma10_filter`/`vol_filter` 已在 params 预留、检测尚未接入
+> - `strength`：阳克阴/阴克阴量能维度改为 MA5；明确 `if/elif` 固定顺序与 ADS 展示优先级分离
+> - ADS `kpattern` CASE：阴包阳/阴克阳映射为 `contrarian_*`（与 `schema.py` / `export_wide.py` 一致）
+
+### 12.83 MACD/DDE 背离 spec 与实现对齐（v1.10）
+
+> §6.2 / §9.2 / §12.20 / §12.29 / §12.60 按 `calc_macd.py` + `base.compute_price_signal_divergence()` 重对齐：
+> - 新增 §6.2「背离」专节：98%/102% 近高/近低位容忍、DIF 回升 >10%、价低 ≥3 bar、5 bar 去重、确认日 `argmax/argmin < window-1`
+> - §6.2 同步修正：trend 5-bar 加权回归(decay=0.15, ±0.001)、near 交叉判定、alert 连涨/跌 2 日、`trend_strength` 列
+> - DDE 背离：信号列 **DDX**（非 DDX2）+ 尖刺过滤 + 有限窗要求
+
+### 12.84 MA/DDE/Volume/PricePosition spec 与实现对齐（v1.11）
+
+> §6.3–§6.6 / §9.3–§9.6 按各 Calculator 重对齐：
+> - **MA**：斜率改为 5-bar OLS %/日；alignment 增 `sideways`、阈值 ±0.08%/日、tangle 2.99%；near 改为 0.5% 小间距或 3 日收敛预估
+> - **DDE**：trend 8-bar 加权(decay=0.20)；增 `trend_strength`；alert 基于 DDX2 连涨/跌 2 日
+> - **Volume**：DDL 增 `volume_ratio`/`trend_strength`/`divergence`；zone 基于 `pct_vol_rank` 迟滞；trend 为 ln(vol) 10-bar 加权 ±0.008（非 zone 内子集）
+> - **Price Position**：新增 §6.6 / §9.6（原 spec 缺失）；DWS 6 类×2 频 = 12 表
+> - §6.2 背离：补充 MACD/DDE/Volume 三模块调用差异表
+
+### 12.85 MACD/DDE 结构背离 Level 2（v1.12）
+
+> §6.2 / §9.2 / §9.4 / §12.20 / §12.29 / §12.60 按 `divergence_structure.py` + `calc_macd.py` / `calc_dde.py` 重对齐：
+> - MACD/DDE 背离由 60 bar rolling `compute_price_signal_divergence` 改为通达信 **Level 2 顶底结构**（金叉/死叉锚点、直接+隔峰 MDIF 线背、柱背、TG 标注、dedup=10）
+> - 新增 `backend/etl/divergence_structure.py`：`compute_macd_structure_divergence` / `compute_dde_structure_divergence`
+> - MACD/DDE `RECALC_SPEC` lookback 60→**250**、event_tail→**10**
+> - Volume 量价背离仍用 `base.compute_price_signal_divergence`（window=60, dedup=5）
 
 ---
 
