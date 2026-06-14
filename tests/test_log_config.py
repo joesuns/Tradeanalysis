@@ -84,88 +84,74 @@ def test_log_file_created():
         assert "[test_module]" in content
 
 
-def test_etl_log_duration_tracking():
+def test_etl_log_duration_tracking(db_with_schema):
     """log_etl_start/end captures real wall-clock time with different timestamps."""
-    from backend.db.connection import get_connection
     from backend.etl.error_handler import log_etl_start, log_etl_end
     import time
 
-    con = get_connection()
-    try:
-        lid, t0 = log_etl_start(con, "test_step")
-        time.sleep(0.1)
-        log_etl_end(con, lid, "test_step", t0, "success", row_count=42)
+    con = db_with_schema
+    lid, t0 = log_etl_start(con, "test_step")
+    time.sleep(0.1)
+    log_etl_end(con, lid, "test_step", t0, "success", row_count=42)
 
-        row = con.execute(
-            "SELECT status, row_count, started_at, finished_at "
-            "FROM ods_etl_log WHERE id = ?", (lid,)
-        ).fetchone()
+    row = con.execute(
+        "SELECT status, row_count, started_at, finished_at "
+        "FROM ods_etl_log WHERE id = ?", (lid,)
+    ).fetchone()
 
-        assert row is not None, "Log row not found"
-        assert row[0] == "success"
-        assert row[1] == 42
-        assert row[2] != "", "started_at should not be empty"
-        assert row[3] != "", "finished_at should not be empty"
-        assert row[2] != row[3], (
-            f"started_at ({row[2]}) should differ from finished_at ({row[3]})"
-        )
+    assert row is not None, "Log row not found"
+    assert row[0] == "success"
+    assert row[1] == 42
+    assert row[2] != "", "started_at should not be empty"
+    assert row[3] != "", "finished_at should not be empty"
+    assert row[2] != row[3], (
+        f"started_at ({row[2]}) should differ from finished_at ({row[3]})"
+    )
 
-        # Clean up test row
-        con.execute("DELETE FROM ods_etl_log WHERE id = ?", (lid,))
-    finally:
-        con.close()
+    con.execute("DELETE FROM ods_etl_log WHERE id = ?", (lid,))
 
 
-def test_etl_log_error_stores_full_traceback():
+def test_etl_log_error_stores_full_traceback(db_with_schema):
     """log_etl_error stores the complete traceback in DB, not truncated.
 
     Verifies the fix: tb[-500:] → tb (full traceback).
     Uses a deeply nested call chain to generate >1000 chars of traceback.
     """
-    import io
-    from backend.db.connection import get_connection
     from backend.etl.error_handler import log_etl_start, log_etl_error
 
-    # Generate a long traceback through deep recursion
     def nested_error(depth):
         if depth <= 0:
             raise ValueError("deeply nested test error")
         return nested_error(depth - 1)
 
-    con = get_connection()
+    con = db_with_schema
+    lid, t0 = log_etl_start(con, "test_error_step")
+
     try:
-        lid, t0 = log_etl_start(con, "test_error_step")
+        nested_error(15)  # ~60 lines of traceback
+    except ValueError as e:
+        log_etl_error(con, lid, "test_error_step", t0, 0, e)
 
-        try:
-            nested_error(15)  # ~60 lines of traceback
-        except ValueError as e:
-            log_etl_error(con, lid, "test_error_step", t0, 0, e)
+    row = con.execute(
+        "SELECT status, error_msg FROM ods_etl_log WHERE id = ?", (lid,)
+    ).fetchone()
 
-        row = con.execute(
-            "SELECT status, error_msg FROM ods_etl_log WHERE id = ?", (lid,)
-        ).fetchone()
+    assert row is not None, "Log row not found"
+    assert row[0] == "failed"
+    error_msg = row[1]
 
-        assert row is not None, "Log row not found"
-        assert row[0] == "failed"
-        error_msg = row[1]
+    assert "ValueError: deeply nested test error" in error_msg
+    assert "nested_error" in error_msg, (
+        f"Expected traceback in error_msg, got: {error_msg[:200]!r}..."
+    )
 
-        # The full traceback should not be truncated
-        assert "ValueError: deeply nested test error" in error_msg
-        assert "nested_error" in error_msg, (
-            f"Expected traceback in error_msg, got: {error_msg[:200]!r}..."
-        )
+    frame_count = error_msg.count("nested_error")
+    assert frame_count > 5, (
+        f"Expected >5 traceback frames, got {frame_count}. "
+        f"error_msg may be truncated: {error_msg[:300]!r}..."
+    )
 
-        # Verify it's NOT truncated (should contain many frames)
-        frame_count = error_msg.count("nested_error")
-        assert frame_count > 5, (
-            f"Expected >5 traceback frames, got {frame_count}. "
-            f"error_msg may be truncated: {error_msg[:300]!r}..."
-        )
-
-        # Clean up test row
-        con.execute("DELETE FROM ods_etl_log WHERE id = ?", (lid,))
-    finally:
-        con.close()
+    con.execute("DELETE FROM ods_etl_log WHERE id = ?", (lid,))
 
 
 def test_default_run_id_is_dash():
