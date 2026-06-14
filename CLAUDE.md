@@ -44,6 +44,7 @@ python -m backend.cli fetch --ts-code 000543.SZ 600580.SH  # 指定股票
 python -m backend.cli calc                         # 全市场（analysis_date=今天）
 python -m backend.cli calc --date 20260605         # 指定分析日
 python -m backend.cli calc --ts-code 000543.SZ 600580.SH  # 指定股票
+python -m backend.cli calc --date 20260612 --refresh-spec ma  # spec 落后时窄窗 FULL（仅 ma）
 
 # ===== Excel 导出 =====
 # 从数据库直接导出（不重算），默认 exports/analysis_{date}_gen{now}.xlsx
@@ -77,6 +78,12 @@ python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date 20260
 python -m backend.cli backfill-dde-meta --sync-dwd-only              # 中断恢复：仅 ODS→DWD
 python -m backend.cli backfill-dde-meta --recalc-only --date 20260612  # ODS/DWD 已就绪，仅 calc 闭环
 
+# ===== DDE trend 内容修复（Tier-0 DQ；repair 窗口禁并行 run/calc）=====
+python -m backend.cli repair-dde-trend --date 20260612 --freq daily --dry-run  # 预览 invalidate 范围
+python -m backend.cli repair-dde-trend --date 20260612 --freq daily --ts-code 600831.SH  # 六股 pilot
+python -m backend.cli repair-dde-trend --date 20260612 --freq daily              # 全市场 daily 修复
+python -m scripts.audit_dde_trend_oracle --date 20260612 --freq daily --sample 500  # stored vs recompute
+
 # 启动 API
 uvicorn backend.api.app:app --reload
 
@@ -89,6 +96,10 @@ python -m scripts.health_check   # 跑批后全链路质量体检（只读，Sec
 python -m scripts.collect_divergence_golden smoke --indicator macd --count 25 --start 20230101 --end 20251231
 python -m scripts.collect_divergence_golden smoke --indicator dde --count 25 --start 20230101 --end 20251231
 # 可选人工 golden：worksheet → 通达信填 tdx 列 → import → diff（见 scripts/collect_divergence_golden.py 头注释）
+
+# ===== 可交易背离 screening（L2 消费层，不改 DWS）=====
+python -m scripts.screen_divergence_tradable --date 20260612 --freq weekly --indicator macd
+python -m scripts.screen_divergence_tradable --date 20260612 --freq daily --indicator macd --tradable-only
 
 # ===== B4 硬门禁（12 列，不含 ma_alignment；过渡期对 123 diff）=====
 python3 -m scripts.diff_vs_123 --date 20260609 --breakdown --summary
@@ -124,6 +135,7 @@ backend/
 │   ├── base.py            # EMA/SMA/线性回归/安全浮点转换/compute_fingerprint/insert_dws_batch
 │   ├── b4_macd.py         # B4 MACD zone/trend（123 10,20,7 日线 + resample-W 周线）
 │   ├── divergence_structure.py  # MACD/DDE Level 2 结构背离（通达信顶底结构：隔峰柱背+TG标注）
+│   ├── divergence_tradable.py   # L2 可交易背离消费层（三条硬门槛；export/combo/screening enrich）
 │   ├── build_dim.py       # 维度表构建（stock/date/concept，事务保护）
 │   ├── build_dwd.py       # DWD 三层：rebuild_all_dwd() 全量入口 + rebuild_dwd_for_stale() 增量入口
 │   ├── dwd_weekly_sql.py  # dwd_weekly_quote 滚动周线 SQL（week_trunc + WTD 窗口聚合）
@@ -172,7 +184,9 @@ calc/export 共用同一 analysis_date（`--date`）；calc 收尾 run_checkpoin
   - 停牌填充 gap 检测 **DWD vs 日历**（已填充股不再重复 LATERAL）
   - 运维手册：`docs/superpowers/plans/2026-06-09-daily-runbook.md`
 - **DWD rebuild 后自动 refresh-state（`DWD_REBUILD_REFRESH_STATE=1` 默认）：** `run_rebuild_dwd` 实际写入后，对 **stale 子集** 调用 `refresh_calc_state_fingerprints`（`run_refresh_state` 审计步），对齐 `history_fp` 再进 calc；防止真新日 fp 漂移 → 全股 FULL/chunk。`run_calc` 内 auto-fetch / G3 stale DWD rebuild 同理。`=0` 回退旧行为（仅运维 `cli refresh-state`）。
-- **CalcPreflightContext（M1+M1.1，`CALC_REUSE_REFRESH_CTX=1` 默认，计划 `docs/superpowers/plans/2026-06-13-calc-preflight-context-p0.md` + `2026-06-13-calc-preflight-merge-m1.1.md`）：** `cli run` Step1 refresh 产出 tails+modes+fp_cache，Step2 calc **热路径**复用，跳过 `batch_tails`/`batch_preflight`；APPEND/FULL state 改 `upsert_calc_state_batch` 批写。独立 `cli calc` 走冷路径。G3/auto-fetch 二次 DWD rebuild 后 **`merge_context_patch`** 仅 merge patch 子集（非整包 cold）；batch append 对缺失股走 `_merge_cold_tails_and_preflight`。观测：`preflight_source=refresh|cold`、`tails_load_skipped`、`state_upsert_mode=batch`（`ods_etl_log.calc_dws`）。
+- **CalcPreflightContext（M1+M1.1，`CALC_REUSE_REFRESH_CTX=1` 默认，计划 `docs/superpowers/plans/2026-06-13-calc-preflight-context-p0.md` + `2026-06-13-calc-preflight-merge-m1.1.md`）：** `cli run` Step1 refresh 产出 tails+modes+fp_cache，Step2 calc **热路径**复用，跳过 `batch_tails`/`batch_preflight`；APPEND/FULL state 改 `upsert_calc_state_batch` 批写。独立 `cli calc` 走冷路径。G3/auto-fetch 二次 DWD rebuild 后 **`merge_context_patch`** 仅 merge patch 子集（非整包 cold）；batch append 对缺失股走 `_merge_cold_tails_and_preflight`（含 `progress calc.batch_preflight` 心跳）。观测：`preflight_source=refresh|cold`、`tails_load_skipped`、`cold_merge_stocks`/`cold_merge_elapsed_sec`、`state_upsert_mode=batch`（`ods_etl_log.calc_dws`）。
+- **双指纹门（`CALC_DWD_FP_GATE=1` 默认，计划 `docs/superpowers/plans/2026-06-14-calc-routing-dual-fp-export-opt.md`）：** `history_fp`（路由）与 DWS `input_fingerprint`（写跳过）分叉时：preflight FULL 且无 new_bars → `check_dwd_unchanged` 真 → 降级 SKIP 并写 state；batch_full fingerprint_match 兜底 upsert `history_fp`。**batch_append + chunk fallthrough** 均传 `dwd_fp_cache`。B4 元数据回填后一次性 `cli refresh-state --date X` 运维补洞。
+- **chunk_codes 重算（同上 plan）：** batch_append 收尾 `_compute_chunk_codes`（preflight 失败 ∪ 剩余 FULL），热路径 cold merge 成功不再 fallthrough chunk（修复 7c090546：5290 股空转）。
 - **M2 Vector Append（`CALC_VECTOR_APPEND=1` 默认，计划 `docs/superpowers/plans/2026-06-13-calc-vector-append-m2.md`）：** `vector/macd_batch.py` / `dde_batch.py` / `volume_batch.py`；结构背离 O(n) cross。**M2c+ volume trend：** APPEND `require_trend_target_indices` fail-fast + `compute_volume_trend_series(..., target_indices=new_bars)` 仅算新 bar（~184×）；FULL 保持全序列。Profiling：`python3 scripts/profile_volume_trend_v2.py`。**M2d MACD weekly B4：** APPEND `require_b4_weekly_target_indices` + `b4_weekly_series_from_daily(..., target_indices=new_bars)` 消除 O(n²) resample；`append_calculate` + `batch_append_macd` 已接线。Profiling：`python3 scripts/profile_macd_b4_weekly.py`。
 - **run 观测：** `ods_etl_log` 新增 `run_fetch` / `run_rebuild_dwd` / **`run_refresh_state`** / `run_export`；`run_rebuild_dwd.data_completeness.skipped=true` 表示未重建。
 - **边界：** 除权/adj 回填后若未触发 fetch，须 `fetch` + `calc --force` 或手动 rebuild；同日复跑不覆盖此场景。
@@ -261,6 +275,7 @@ export（导出层）
 - **趋势方向：** 5-bar 指数加权回归（decay=0.15），阈值 0.001
 - **趋势强度：** `trend_strength` 列，加权斜率/均值去量纲
 - **背离：** `divergence_structure.compute_macd_structure_divergence` — 通达信 Level 2 顶底结构（金叉/死叉锚点、直接+隔峰 MDIF 线背、柱背、**结构形成 TG 日**标注，dedup=10）；非 60 窗 rolling。`RECALC_SPEC` lookback=250、event_tail=10
+- **可交易背离（L2 消费层）：** `divergence_tradable.classify_tradable` — 在 L1 不变前提下，export/combo/screening 经三条硬门槛生成 `*_tradable` / `*_reject`；Excel 结构列改名「MACD/DDE结构背离」。export 打 `progress export: tradable enrich`；`cli run` 的 `run_export.data_completeness.tradable_enrich` 含日/周统计
 - **B4 `macd_zone` / `w_macd_zone`（DWS `turning_point`）：** 123 `identify_macd_crossover` + `identify_near_crossover`；日线 MACD **(10,20,7)** ewm；周线日线 `resample('W')` 后 **(12,26,9)**。`backend/etl/b4_macd.py`
 - **B4 `macd_trend` / `w_macd_trend`（DWS `trend`）：** 123 `get_macd_trend` — 5 柱柱体加权回归 + `eps=0.001`；与 `trend_strength`（12,26,9 柱）口径分离
 - **警惕（B4 `macd_alert` / `w_macd_alert`）：** 123 `trend_reversal_signals._hist_turn_up/down` — 3 柱 MACD 柱拐点（无 flat）；`backend/etl/b4_alerts.py`。`MACDCalculator.SPEC_VERSION=v3`（v2=alert；v3=zone/trend）
@@ -269,7 +284,8 @@ export（导出层）
 ### MA 信号
 
 - **斜率：** 5-bar 线性回归归一化 %/日，alignment 阈值 0.08%/日
-- **alignment：** 10 值 DWS 枚举（8 方向 + tangle + sideways）；一走平一趋势过渡态 Layer 3 fallback 归入 8 类，不扩枚举。**B4 软层**：保留 TA 算法，不对 123 `ma_regime` 硬比
+- **alignment：** 10 值 DWS 枚举（8 方向 + tangle + sideways）；一走平一趋势过渡态 Layer 3 **八格查表** fallback 归入 8 类，不扩枚举。**B4 软层**：保留 TA 算法，不对 123 `ma_regime` 硬比
+- **MACalculator.SPEC_VERSION=v2：** v2=Layer 3 fallback 八格语义（2026-06-14）；算法升级后须 `calc --force` 或待新日窄窗 FULL 刷新存量 alignment
 
 ### K线形态
 
@@ -280,8 +296,10 @@ export（导出层）
 - **DDX：** (大单+超大单净买入量) / 总成交量（`moneyflow` 量口径，背离/alert 仍用此列）
 - **DDX2：** EMA(DDX, 5)
 - **背离：** `divergence_structure.compute_dde_structure_divergence` — 与 MACD 同构，`CROSS(DDX,DDX2)` 锚点 + 隔峰柱背 + TG 日标注（dedup=10）；顶区 DDX 峰邻域尖刺过滤；`RECALC_SPEC` lookback=250
+- **可交易背离：** 同 MACD L2 门槛；DDE 为辅信号，`.BJ` 无数据
 - **警惕（B4 `dde_alert` / `w_dde_alert`）：** 123 `_eval_ddx2_slope_reversal` — 相邻 5 窗 DDX2 线性回归斜率拐点（`eps=0`）；`b4_alerts.compute_ddx2_slope_alerts`。`DDECalculator.SPEC_VERSION=v2`
 - **趋势（B4 `dde_trend` / `w_dde_trend`）：** 日线 123 同构 `analyze_moneyflow_trend_optimized` — `moneyflow_dc`+`circ_mv` → DDX1/DDX3 + 5 日 polyfit；缺 dc/circ 日线可回退 `net_mf_amount`/`total_mv`。周线 B4 对齐 `analyze_weekly_dde_trend`：`resample('W')` 独立聚合 **仅 `net_amount_dc`** 与 `circ_mv` 再 inner merge（禁止日级 join 后 resample、周线 trend **禁止** `net_mf_amount`/`total_mv` 回退）、`ddx3.tail(4)` 在全序列 `iloc[-1]`（非 dim_date 周界）；`ddx3` 尾窗含 NaN → flat（不回退 `ddx`）。`ods_moneyflow.net_amount_dc` + `ods_daily_basic.circ_mv` 落库。`trend_strength` 仍基于 DDX2 加权回归
+- **Tier-0 内容 DQ：** 日线 `dde_trend` 须与 B4 moneyflow 重算一致；`scripts/audit_dde_trend_oracle.py` 为 oracle，`health_check` Section K 抽样 200 股（mismatch >0.1% WARN、>1% FAIL）；异常时 `repair-dde-trend` 窄窗 invalidate+`CALC_FORCE_HARD` 重算（见 plan `2026-06-14-dde-trend-repair.md`）
 - **数据源限制：** BSE 股票（.BJ）tushare 不提供 moneyflow，DDE 不可用
 - **warmup 周期：** 系统级 warmup = 250 个交易日（Price Position 250d 窗口，所有指标最大值）。补拉时按此窗口计算起始日期，不拉无用历史数据
 
@@ -325,7 +343,7 @@ export（导出层）
   `check_dwd_unchanged(..., latest_fps=...)`，把 ~6.6 万次单股 SELECT 降到每组一次。
 - **同日复跑短路（CALC_FAST_SKIP v1）:** 实库同日复跑 **834s→630s**（24%）；12 指标全 SKIP 才短路。未达 60s → v2 partial skip 见 `docs/superpowers/plans/2026-06-08-calc-partial-skip-v2.md`。
 - **同日复跑 partial skip（v2）:** `preflight_stock_modes_v2` 按指标分区；SKIP 直接记 skip，APPEND/FULL 走 `calc_stock_pipeline_selective`（按 `(freq,source)` 窄加载，APPEND 复用 chunk 尾窗）；BSE DDE 空帧视为 SKIP。`write_calc_state_from_df` 在 SKIP/写后统一刷新 `dws_calc_state`；`repair-weekly --execute` 自动清空 weekly state。
-- **同日复跑幂等闸门:** 全市场同 `calc_date` 已成功 calc 且无 stale ODS → `run_calc` 秒级退出（`calc idempotent skip`）。**`--force` 智能短路：** 若 ODS 未变且上次 calc 后无 fetch/rebuild → 同 day `--force` 亦秒退（`force_same_day_skip`）；`CALC_FORCE_HARD=1` 可强制真重算。
+- **同日复跑幂等闸门:** 全市场同 `calc_date` 已成功 calc 且无 stale ODS → `run_calc` 秒级退出（`calc idempotent skip`）。**`--force` 智能短路：** 若 ODS 未变且上次 calc 后无 fetch/rebuild → 同 day `--force` 亦秒退（`force_same_day_skip`）；**spec 落后时 force 不短路**（`has_spec_stale_indicators`）；`CALC_FORCE_HARD=1` 可强制真重算。**spec 发布运维：** `calc --refresh-spec ma` 或 `CALC_FORCE_HARD=1 calc --force`（见 runbook「算法 SPEC_VERSION 发布」）。
 - **同 day `--force` batch 短路（`CALC_FORCE_BATCH_REUSE=1` 默认）：** 若 run 级未短路但数据未变，`run_batch_append_phase` 跳过 5388×245 tail SQL，仅读 `dws_calc_state` 路由 SKIP（~489s→秒级）。
 - **新日追算（CALC_APPEND，append-only calc）:** 新交易日 calc 不再对每股窄写 255 窗，
   而由 `classify_calc_mode()` 按 `dws_calc_state`（PK `(ts_code, freq, indicator)`）+ 各计算器
@@ -390,7 +408,7 @@ export（导出层）
 - **异常日志：** `logger.exception()` 保留完整调用栈；`log_etl_error()` 将完整栈存入 DB
 - **API 中间件：** `log_requests` 记录每个请求 method/path/status/耗时
 - **级别规范：** DEBUG=跳过详情 / INFO=进度+完成 / WARNING=降级 / ERROR=异常
-- **统一进度前缀：** `progress {stage}:` — `fetch.ods` / `fetch.stocks` / `dwd.*` / `calc.batch_tails` / `calc.batch_preflight` / `calc.batch_compute` / `calc.chunk*` / `calc.stocks` / `calc.stale_fetch` / `export`
+- **统一进度前缀：** `progress {stage}:` — `fetch.ods` / `fetch.stocks` / `dwd.*` / `calc.batch_*` / `calc.chunk*` / `calc.stocks` / `export` / `export: tradable enrich` / `screening.tradable`
 - **batch 阶段中文进度：** `calc.batch_tails`/`calc.batch_compute` 等用中文步骤名；`calc.batch_compute` 按股 `stock_progress` 心跳（默认 30s + 每 5 股），示例：`progress calc.batch_compute: MACD日线 | 1250/5251 (23%) | 380s | 3.3 股/s | 预计剩余 ~1200s`
 - **节流：** 默认每 5 交易日 / 5 股票一条；`LOG_PROGRESS_HEARTBEAT_SEC=30` 无输出则打 `still running`
 - **环境变量：** `LOG_PROGRESS_HEARTBEAT_SEC` / `LOG_PROGRESS_DAY_STEP` / `LOG_PROGRESS_STOCK_STEP`

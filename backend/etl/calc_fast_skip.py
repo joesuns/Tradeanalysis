@@ -168,8 +168,12 @@ def preflight_stock_modes_with_fps(
     daily_dde: Optional[pd.DataFrame],
     weekly_dde: Optional[pd.DataFrame],
     specs=CALC_ROUTE_SPECS,
+    con=None,
+    dwd_fp_cache: Optional[dict] = None,
 ) -> Tuple[Optional[Dict[Tuple[str, str], Tuple[str, list]]], Dict[Tuple[str, str], str]]:
     """v2 preflight with per-indicator fingerprint cache for skip_refresh reuse."""
+    from backend.etl.calc_dwd_fp_gate import apply_dwd_fp_gate
+
     modes: Dict[Tuple[str, str], Tuple[str, list]] = {}
     fps: Dict[Tuple[str, str], str] = {}
     for indicator_name, freq, CalcCls, sig_cols, source in specs:
@@ -183,6 +187,15 @@ def preflight_stock_modes_with_fps(
         if out is None:
             return None, {}
         mode, new_bars, cur_fp = out
+        if source == "quote":
+            gate_df = daily_q if freq == "daily" else weekly_q
+        else:
+            gate_df = daily_dde if freq == "daily" else weekly_dde
+        mode, new_bars, cur_fp = apply_dwd_fp_gate(
+            mode, new_bars, cur_fp,
+            con=con, ts_code=ts_code, CalcCls=CalcCls, freq=freq, df=gate_df,
+            dwd_fp_cache=dwd_fp_cache, indicator_name=indicator_name,
+        )
         modes[(indicator_name, freq)] = (mode, new_bars)
         if cur_fp is not None:
             fps[(indicator_name, freq)] = cur_fp
@@ -197,10 +210,13 @@ def preflight_stock_modes_v2(
     daily_dde: Optional[pd.DataFrame],
     weekly_dde: Optional[pd.DataFrame],
     specs=CALC_ROUTE_SPECS,
+    con=None,
+    dwd_fp_cache: Optional[dict] = None,
 ) -> Optional[Dict[Tuple[str, str], Tuple[str, list]]]:
     """v2 preflight: BSE empty DDE → per-indicator SKIP instead of whole-stock None."""
     modes, _ = preflight_stock_modes_with_fps(
-        ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde, specs=specs,
+        ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde,
+        specs=specs, con=con, dwd_fp_cache=dwd_fp_cache,
     )
     return modes
 
@@ -236,12 +252,8 @@ def build_skip_state_records(
             st = state_map.get((ts_code, freq, indicator_name))
             if st is None:
                 continue
-            spec = next(
-                s for s in CALC_ROUTE_SPECS
-                if s[0] == indicator_name and s[1] == freq
-            )
-            _, _, CalcCls, _, _ = spec
-            spec_ver = getattr(CalcCls, "SPEC_VERSION", "v1")
+            # Preserve stored spec on SKIP refresh — never advance without DWS write.
+            spec_ver = st.get("spec_version") or "v1"
             if not CALC_SKIP_STATE_REFRESH or should_refresh_calc_state(st, calc_date, fp):
                 records.append((
                     ts_code, freq, indicator_name, st["last_trade_date"], fp,

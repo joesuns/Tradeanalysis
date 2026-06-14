@@ -1015,7 +1015,7 @@ def test_calc_stock_chunk_reuses_batch_ctx_without_reload(monkeypatch):
     monkeypatch.setattr("duckdb.connect", lambda path: real_connect(":memory:"))
     monkeypatch.setattr("backend.etl.orchestrator.resolve_recalc_start", lambda *a, **k: None)
 
-    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde):
+    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde, **kwargs):
         modes = {(s[0], s[1]): ("SKIP", []) for s in CALC_ROUTE_SPECS}
         return modes, {}
 
@@ -1041,6 +1041,61 @@ def test_calc_stock_chunk_reuses_batch_ctx_without_reload(monkeypatch):
     assert "state" not in calls
     assert "quote" not in calls
     assert "dde" not in calls
+
+
+def test_calc_stock_chunk_passes_dwd_fp_cache_to_preflight(monkeypatch):
+    """Chunk fallthrough preflight must wire DWD fingerprint gate (code review M2)."""
+    import importlib
+
+    import pandas as pd
+
+    import backend.config as cfg
+    from backend.etl.calc_indicators import CALC_ROUTE_SPECS
+    from backend.etl.orchestrator import _calc_stock_chunk
+
+    preflight_kwargs = []
+
+    def fake_build_cache(con, codes, calc_date):
+        return {("__probe__", "daily"): {"recalc_start": calc_date}}
+
+    def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde, **kwargs):
+        preflight_kwargs.append(kwargs)
+        modes = {(s[0], s[1]): ("SKIP", []) for s in CALC_ROUTE_SPECS}
+        return modes, {}
+
+    monkeypatch.setenv("CALC_FAST_SKIP", "1")
+    monkeypatch.setenv("CALC_APPEND", "1")
+    importlib.reload(cfg)
+
+    monkeypatch.setattr(
+        "backend.etl.calc_dwd_fp_gate.build_dwd_fp_cache", fake_build_cache,
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_state.load_calc_state_batch", lambda *a, **k: {},
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.batch_load_quote_tails",
+        lambda *a, **k: {"A.SZ": pd.DataFrame({"trade_date": ["20260608"], "close_qfq": [10.0]})},
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.batch_load_dde_tails", lambda *a, **k: {},
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_fast_skip.preflight_stock_modes_with_fps", fake_preflight,
+    )
+    monkeypatch.setattr("backend.etl.orchestrator.resolve_recalc_start", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.orchestrator._write_skip_log_batch", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.orchestrator._count_calc_rows", lambda *a, **k: 0)
+    monkeypatch.setattr("backend.etl.calc_state.upsert_calc_state_batch", lambda *a, **k: 0)
+
+    real_connect = __import__("duckdb").connect
+    monkeypatch.setattr("duckdb.connect", lambda path: real_connect(":memory:"))
+
+    _calc_stock_chunk(["A.SZ"], "20260609", incremental=True, batch_ctx=None)
+
+    assert len(preflight_kwargs) == 1
+    assert preflight_kwargs[0]["dwd_fp_cache"] == {("__probe__", "daily"): {"recalc_start": "20260609"}}
+    assert preflight_kwargs[0]["con"] is not None
 
 
 def test_write_skip_log_batch_summary_when_not_verbose():

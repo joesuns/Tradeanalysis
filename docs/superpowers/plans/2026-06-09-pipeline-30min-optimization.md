@@ -1051,3 +1051,29 @@ python3 scripts/health_check.py
 | M6 里程碑 | **进行中** |
 
 **Plan approved. P4 execution starts at Task 5.**
+
+---
+
+## 附录 E5 — Calc 路由双指纹 + chunk 修复（2026-06-14，✅ 代码落地）
+
+**Plan：** `docs/superpowers/plans/2026-06-14-calc-routing-dual-fp-export-opt.md`
+
+**锚点 run：** `7c090546`（calc_date=20260612，0 calculated，Step2 ~515s）
+
+| 包 | 改动 | E4 签字指标 |
+|----|------|------------|
+| Calc-R1 | `_compute_chunk_codes` 收尾重算 | `chunk_stocks=0`（同日复跑）；`fallthrough=0` |
+| Calc-R2 | `CALC_DWD_FP_GATE` + preflight 门 + batch_full state 对齐 | `full_by_indicator.dde_weekly=0`；`batch_full_items=0` |
+| Calc-O1 | 热路径 cold merge 进度 + `cold_merge_*` 审计 | grep `calc.batch_preflight` 可见 |
+
+**实库复验（待跑）：**
+
+```bash
+python3 -m backend.cli run --date 20260612 --skip-export
+# 期望：chunk_stocks≈0，batch_full_items≈0，Step2 墙钟 <120s
+python3 -m scripts.health_check
+```
+
+**运维一次性（B4 元数据回填后）：** `python -m backend.cli refresh-state --date 20260612`
+
+**Export-E1**（building sheets 119s）→ 独立 plan，不在本附录。
