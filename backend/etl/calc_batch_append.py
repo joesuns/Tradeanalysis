@@ -535,6 +535,7 @@ def _batch_full_loop(
     state_map: Optional[dict] = None,
     indicator_name: Optional[str] = None,
     sig_cols: Optional[List[str]] = None,
+    force_recompute: bool = False,
 ):
     """Shared batch FULL: per-stock compute, one insert_dws_batch_multi narrow write."""
     from backend.etl.base import (
@@ -583,7 +584,7 @@ def _batch_full_loop(
             unchanged_kwargs["expected_spec_version"] = spec_version
             unchanged_kwargs["latest_specs"] = latest_specs
 
-        if check_dwd_unchanged(calc.con, calc.dws_table, ts_code, df, **unchanged_kwargs):
+        if not force_recompute and check_dwd_unchanged(calc.con, calc.dws_table, ts_code, df, **unchanged_kwargs):
             agg.add_skip(SkipReason.FINGERPRINT_MATCH, ts_code, "DWD fingerprint match")
             if (
                 state_map is not None
@@ -689,6 +690,7 @@ def batch_full_ma(
     recalc_start: Optional[str],
     quote_groups: dict,
     state_map: Optional[dict] = None,
+    force_recompute: bool = False,
 ):
     from backend.etl.base import load_latest_fingerprints, load_latest_spec_versions
     from backend.etl.calc_ma import MACalculator
@@ -706,6 +708,7 @@ def batch_full_ma(
         state_map=state_map,
         indicator_name="ma",
         sig_cols=MACalculator.SIGNATURE_COLS,
+        force_recompute=force_recompute,
     )
 
 
@@ -927,16 +930,23 @@ def run_batch_full_phase(
             data_groups = {c: tails[c] for c in ts_codes if c in tails}
 
         batch_fn = BATCH_FULL_FNS[indicator_name]
+        force_recompute = batch_ctx.get("force_recompute", False)
         logger.info(
             "progress calc.batch_full: 开始 %s | FULL=%d",
             label_zh, len(ts_codes),
         )
         t_group = time.monotonic()
 
-        result, stock_rows = batch_fn(
-            con, freq, ts_codes, calc_date, recalc_start,
-            data_groups, state_map,
-        )
+        if indicator_name == "ma":
+            result, stock_rows = batch_fn(
+                con, freq, ts_codes, calc_date, recalc_start,
+                data_groups, state_map, force_recompute=force_recompute,
+            )
+        else:
+            result, stock_rows = batch_fn(
+                con, freq, ts_codes, calc_date, recalc_start,
+                data_groups, state_map,
+            )
 
         key = (indicator_name, freq)
         agg_by_key[key].calculated += result.calculated

@@ -132,6 +132,7 @@ def run_refresh_calc(
         "dde_daily": dde_daily,
         "dde_weekly": dde_weekly,
         "state_map": state_map,
+        "force_recompute": True,
     }
 
     lid, t0 = log_etl_start(con, "calc_dws")

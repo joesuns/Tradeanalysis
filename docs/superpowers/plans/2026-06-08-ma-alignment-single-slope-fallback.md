@@ -31,7 +31,7 @@
 | 位置 (`above`) | 条件 | 结果 |
 |----------------|------|------|
 | MA5 > MA10 | s5_up + s10_flat | `bull_building` |
-| MA5 > MA10 | s5_flat + s10_up | `bull_strong` |
+| MA5 > MA10 | s5_flat + s10_up | `bull_building` |
 | MA5 > MA10 | (s5_dn 或 s10_dn) 且非双明确上行 | `bull_weakening` |
 | MA5 < MA10 | s5_dn + s10_flat | `bear_building` |
 | MA5 < MA10 | s5_flat + s10_dn | `bear_strong` |

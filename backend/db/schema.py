@@ -968,6 +968,41 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # Data freshness view
     con.execute(_V_DATA_FRESHNESS_DDL)
 
+    # Spec freshness DQ view (generated from INDICATOR_SPEC_VERSIONS)
+    con.execute(_build_dq_spec_freshness_ddl())
+
+
+def _build_dq_spec_freshness_ddl() -> str:
+    """Build v_dq_spec_freshness from current Calculator.SPEC_VERSION registry."""
+    from backend.etl.calc_indicators import INDICATOR_SPEC_VERSIONS, dws_latest_view
+
+    daily_anchor = (
+        "(SELECT MAX(trade_date) FROM dwd_daily_quote WHERE is_suspended=0)"
+    )
+    weekly_anchor = """
+        (SELECT MAX(trade_date) FROM dim_date
+         WHERE is_trade_day=1 AND is_week_end=1
+           AND trade_date <= (SELECT MAX(trade_date) FROM ods_daily))
+    """
+    parts = []
+    for (ind, freq), expected in sorted(INDICATOR_SPEC_VERSIONS.items()):
+        view = dws_latest_view(ind, freq)
+        anchor = daily_anchor if freq == "daily" else weekly_anchor
+        parts.append(f"""
+        SELECT
+            '{ind}' AS indicator,
+            '{freq}' AS freq,
+            {anchor} AS anchor_trade_date,
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE COALESCE(spec_version, 'v1') = '{expected}') AS spec_ok,
+            COUNT(*) FILTER (WHERE COALESCE(spec_version, 'v1') <> '{expected}') AS spec_stale,
+            '{expected}' AS expected_spec
+        FROM {view}
+        WHERE trade_date = {anchor}
+        """.strip())
+    body = "\nUNION ALL\n".join(parts)
+    return f"CREATE OR REPLACE VIEW v_dq_spec_freshness AS\n{body}"
+
 
 _DWS_CALC_STATE_DDL = """
     CREATE TABLE IF NOT EXISTS dws_calc_state (

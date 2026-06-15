@@ -40,6 +40,7 @@
 |------|------|------|
 | 1 窄指标刷新（推荐） | `python3 -m backend.cli calc --date YYYYMMDD --refresh-spec ma` | `v_dq_spec_freshness` ma spec_stale=0 |
 | 1b 全链路 R1（含 fetch/DWD） | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | 同上 + ODS/DWD 审计 log |
+| 1c **v2 实现 bugfix（stay v2）** | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | state 已 v2 但 alignment 语义错时；**勿用** refresh-spec |
 | 2 或全 calc HARD | `CALC_FORCE_HARD=1 python3 -m backend.cli calc --date YYYYMMDD --force` | 同上 |
 | 3 语义审计（MA） | `python3 -m scripts.audit_ma_alignment_fallback` | 前两项 = 0 |
 | 4 重导 Excel | `python3 -m backend.cli export --date YYYYMMDD` | export 在 calc **之后** |
