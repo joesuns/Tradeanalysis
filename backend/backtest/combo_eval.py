@@ -3,6 +3,8 @@
 Finds stocks where K-pattern + MACD/MA/DDE/Volume signals fire
 simultaneously, and evaluates combined signal quality.
 """
+from typing import List, Optional
+
 import duckdb
 import pandas as pd
 import numpy as np
@@ -18,7 +20,63 @@ VIEW_MAP = {
 }
 
 
-def find_combo_signals(db_path: str, trade_date: str, **kwargs) -> list[dict]:
+def _filter_tradable_divergence(
+    db_path: str,
+    rows: List[dict],
+    trade_date: str,
+    *,
+    macd_divergence: Optional[str] = None,
+    dde_divergence: Optional[str] = None,
+) -> List[dict]:
+    """Keep rows whose tradable divergence matches the requested label."""
+    if not rows or (not macd_divergence and not dde_divergence):
+        return rows
+
+    from backend.etl.divergence_tradable import enrich_tradable_columns
+
+    df = pd.DataFrame(rows)
+    con = duckdb.connect(db_path, read_only=True)
+    try:
+        if macd_divergence and "macd_divergence" not in df.columns:
+            codes = df["ts_code"].tolist()
+            macd_df = con.execute(
+                """
+                SELECT ts_code, divergence AS macd_divergence
+                FROM v_dws_macd_daily_latest
+                WHERE trade_date = ? AND ts_code IN (SELECT UNNEST(?))
+                """,
+                [trade_date, codes],
+            ).df()
+            df = df.merge(macd_df, on="ts_code", how="left")
+
+        if dde_divergence and "dde_divergence" not in df.columns:
+            codes = df["ts_code"].tolist()
+            dde_df = con.execute(
+                """
+                SELECT ts_code, divergence AS dde_divergence
+                FROM v_dws_dde_daily_latest
+                WHERE trade_date = ? AND ts_code IN (SELECT UNNEST(?))
+                """,
+                [trade_date, codes],
+            ).df()
+            df = df.merge(dde_df, on="ts_code", how="left")
+
+        df, _ = enrich_tradable_columns(df, con, freq="daily")
+        if macd_divergence:
+            df = df[df["macd_divergence_tradable"] == macd_divergence]
+        if dde_divergence:
+            df = df[df["dde_divergence_tradable"] == dde_divergence]
+        return df.to_dict("records")
+    finally:
+        con.close()
+
+
+def find_combo_signals(
+    db_path: str,
+    trade_date: str,
+    use_tradable: bool = True,
+    **kwargs,
+) -> List[dict]:
     """Find stocks where specified signals co-occur on a given date.
 
     Parameters
@@ -26,9 +84,13 @@ def find_combo_signals(db_path: str, trade_date: str, **kwargs) -> list[dict]:
     patterns : list[str]
         K-pattern names to require (e.g. ['yang_ke_yin'])
     macd_divergence : str, optional
+        When use_tradable=True (default), filters on tradable divergence label.
     macd_turning_point : str, optional
     macd_zone : str, optional
     dde_divergence : str, optional
+        Same as macd_divergence for DDE.
+    use_tradable : bool
+        If True (default), divergence filters apply to tradable layer, not L1 structure.
     dde_trend : str, optional
     ma_alignment : str, optional
     vol_zone : str, optional
@@ -76,6 +138,7 @@ def find_combo_signals(db_path: str, trade_date: str, **kwargs) -> list[dict]:
                 if val:
                     conditions.append(f"d.{c} = ?")
                     params.append(val)
+                    select_cols.append(f"d.{c} AS dde_{c}")
 
         # MA join
         if kwargs.get("ma_alignment"):
@@ -99,7 +162,20 @@ def find_combo_signals(db_path: str, trade_date: str, **kwargs) -> list[dict]:
             return []
 
         cols = [d[0] for d in con.description]
-        return [dict(zip(cols, row)) for row in rows]
+        results = [dict(zip(cols, row)) for row in rows]
+
+        if use_tradable:
+            macd_div = kwargs.get("macd_divergence")
+            dde_div = kwargs.get("dde_divergence")
+            if macd_div or dde_div:
+                results = _filter_tradable_divergence(
+                    db_path,
+                    results,
+                    trade_date,
+                    macd_divergence=macd_div,
+                    dde_divergence=dde_div,
+                )
+        return results
     finally:
         con.close()
 
@@ -108,6 +184,7 @@ def count_combo_signals(
     db_path: str,
     start_date: str,
     end_date: str,
+    use_tradable: bool = True,
     **kwargs,
 ) -> int:
     """Count resonance signals across a trade-date range (one scan, not per-day)."""
@@ -116,6 +193,7 @@ def count_combo_signals(
         joins = [f"FROM {VIEW_MAP['kpattern']} k"]
         conditions = ["k.trade_date >= ?", "k.trade_date <= ?"]
         params = [start_date, end_date]
+        select_cols = ["k.ts_code", "k.trade_date"]
 
         patterns = kwargs.get("patterns", [])
         kp_cols = ["yang_bao_yin", "yang_ke_yin", "mu_bei_xian", "bi_lei_zhen",
@@ -164,6 +242,34 @@ def count_combo_signals(
             conditions.append("v.zone = ?")
             params.append(kwargs["vol_zone"])
 
+        macd_div = kwargs.get("macd_divergence")
+        dde_div = kwargs.get("dde_divergence")
+        if use_tradable and (macd_div or dde_div):
+            sql = (
+                f"SELECT DISTINCT {', '.join(select_cols)} "
+                f"{' '.join(joins)} WHERE {' AND '.join(conditions)}"
+            )
+            rows = con.execute(sql, params).fetchall()
+            if not rows:
+                return 0
+            cols = [d[0] for d in con.description]
+            results = [dict(zip(cols, row)) for row in rows]
+            by_date = {}
+            for row in results:
+                by_date.setdefault(row["trade_date"], []).append(row)
+            filtered = []
+            for td, chunk in by_date.items():
+                filtered.extend(
+                    _filter_tradable_divergence(
+                        db_path,
+                        chunk,
+                        td,
+                        macd_divergence=macd_div,
+                        dde_divergence=dde_div,
+                    )
+                )
+            return len(filtered)
+
         sql = (
             f"SELECT COUNT(*) FROM (SELECT DISTINCT k.ts_code, k.trade_date "
             f"{' '.join(joins)} WHERE {' AND '.join(conditions)}) sub"
@@ -198,12 +304,13 @@ if __name__ == "__main__":
 
     con = duckdb.connect(db_path, read_only=True)
     end_date = con.execute(
-        "SELECT MAX(trade_date) FROM v_dws_kpattern_daily_latest"
+        "SELECT MAX(trade_date) FROM dim_date WHERE is_trade_day = 1"
     ).fetchone()[0] or "20260612"
     con.close()
     start_date = "20150101"
 
     import time
+    import sys
     print(f"Combo scan: {start_date} .. {end_date} (batch COUNT)", flush=True)
     print(f"{'Strategy':40s} {'Signals':>8s} {'Sec':>6s} {'Remark'}", flush=True)
     print("-" * 70, flush=True)
@@ -218,7 +325,9 @@ if __name__ == "__main__":
             "dde_trend": s.get("dde_trend"),
         }
         kw = {k: v for k, v in kw.items() if v is not None}
-        total = count_combo_signals(db_path, start_date, end_date, **kw)
+        total = count_combo_signals(
+            db_path, start_date, end_date, use_tradable=True, **kw,
+        )
         elapsed = time.time() - t0
         remark = "insufficient data" if total < 100 else ""
         print(f"{s['label']:40s} {total:>8d} {elapsed:>6.1f}  {remark}", flush=True)

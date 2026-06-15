@@ -1,7 +1,20 @@
 """Tongdaxin-style MACD/DDE structure divergence (Level 2: direct + skip-peak + bar peak)."""
-from typing import List, Optional, Set
+from dataclasses import dataclass
+from typing import List, Literal, Optional, Set, Tuple
 
 import numpy as np
+
+
+@dataclass
+class StructureEvent:
+    """TG-day metadata for one L1 structure divergence label."""
+
+    index: int
+    l1_label: str
+    path: Literal["direct", "skip_peak"]
+    tg_lag_bars: int
+    zone_ok: bool
+    trade_date: Optional[str] = None
 
 
 def mdif_part(value: float, ref_peak: float) -> int:
@@ -88,23 +101,36 @@ def _recent(result: List[Optional[str]], i: int, label: str, dedup: int) -> bool
     return any(result[j] == label for j in range(max(0, i - dedup), i))
 
 
-def compute_macd_structure_divergence(
+def _macd_price_lag(close, anchor: int, i: int, top: bool) -> int:
+    """Bars from segment price extreme to TG bar i."""
+    if anchor is None or anchor < 0 or i < anchor:
+        return 0
+    seg = close[anchor:i + 1]
+    if len(seg) == 0:
+        return 0
+    rel = int(np.argmax(seg) if top else np.argmin(seg))
+    return i - (anchor + rel)
+
+
+def _macd_structure_impl(
     close,
     dif,
     dea,
     macd_bar,
     dedup: int = 10,
     target_indices: Optional[Set[int]] = None,
-) -> List[Optional[str]]:
-    """Tongdaxin Level 2 MACD structure divergence; annotate on TG day only."""
+    collect_events: bool = False,
+) -> Tuple[List[Optional[str]], List[StructureEvent]]:
+    """Core MACD structure divergence; optionally collect TG metadata."""
     close = np.asarray(close, dtype=float)
     dif = np.asarray(dif, dtype=float)
     dea = np.asarray(dea, dtype=float)
     macd_bar = np.asarray(macd_bar, dtype=float)
     n = len(close)
     result: List[Optional[str]] = [None] * n
+    events: List[StructureEvent] = []
     if n < 3:
-        return result
+        return result, events
 
     CH1 = np.full(n, np.nan)
     DIFH1 = np.full(n, np.nan)
@@ -250,6 +276,16 @@ def compute_macd_structure_divergence(
                             invalidated = True
                     if not invalidated and not _recent(result, i, "top_divergence", dedup):
                         _write_divergence(result, i, "top_divergence", target_indices)
+                        if collect_events:
+                            gc = _cross_at(last_gc_arr, i)
+                            path = "direct" if T1[i - 1] else "skip_peak"
+                            events.append(StructureEvent(
+                                i,
+                                "top_divergence",
+                                path,
+                                _macd_price_lag(close, gc, i, top=True),
+                                float(macd_bar[i]) > 0,
+                            ))
 
         if not np.isfinite(CL1[i]) or not np.isfinite(DIFL2[i]):
             continue
@@ -308,8 +344,52 @@ def compute_macd_structure_divergence(
                         invalidated_b = True
                 if not invalidated_b and not _recent(result, i, "bottom_divergence", dedup):
                     _write_divergence(result, i, "bottom_divergence", target_indices)
+                    if collect_events:
+                        dc = _cross_at(last_dc_arr, i)
+                        path = "direct" if B1[i - 1] else "skip_peak"
+                        events.append(StructureEvent(
+                            i,
+                            "bottom_divergence",
+                            path,
+                            _macd_price_lag(close, dc, i, top=False),
+                            float(macd_bar[i]) < 0,
+                        ))
 
+    return result, events
+
+
+def compute_macd_structure_divergence(
+    close,
+    dif,
+    dea,
+    macd_bar,
+    dedup: int = 10,
+    target_indices: Optional[Set[int]] = None,
+) -> List[Optional[str]]:
+    """Tongdaxin Level 2 MACD structure divergence; annotate on TG day only."""
+    result, _ = _macd_structure_impl(
+        close, dif, dea, macd_bar, dedup=dedup, target_indices=target_indices,
+    )
     return result
+
+
+def trace_macd_structure_events(
+    close,
+    dif,
+    dea,
+    macd_bar,
+    dedup: int = 10,
+    trade_dates: Optional[List[str]] = None,
+) -> List[StructureEvent]:
+    """Return TG-day metadata for each L1 MACD structure divergence event."""
+    _, events = _macd_structure_impl(
+        close, dif, dea, macd_bar, dedup=dedup, collect_events=True,
+    )
+    if trade_dates is not None:
+        for ev in events:
+            if 0 <= ev.index < len(trade_dates):
+                ev.trade_date = str(trade_dates[ev.index])
+    return events
 
 
 def _is_ddx_spike(seg_ddx: np.ndarray, peak_idx: int, peak_val: float) -> bool:
@@ -333,7 +413,7 @@ def _segment_ddx_peak(
     return peak_val
 
 
-def compute_dde_structure_divergence(
+def _dde_structure_impl(
     close,
     ddx,
     ddx2,
@@ -341,19 +421,17 @@ def compute_dde_structure_divergence(
     spike_filter_top: bool = True,
     require_finite: bool = True,
     target_indices: Optional[Set[int]] = None,
-) -> List[Optional[str]]:
-    """Tongdaxin Level 2 DDE structure divergence; annotate on TG day only.
-
-    fast=DDX, slow=DDX2, bar=DDX for segment bar-peak comparisons.
-    Top zone: ddx>0 and ref(ddx,1)>0; bottom zone: ddx<0 and ref<0.
-    """
+    collect_events: bool = False,
+) -> Tuple[List[Optional[str]], List[StructureEvent]]:
+    """Core DDE structure divergence; optionally collect TG metadata."""
     close = np.asarray(close, dtype=float)
     ddx = np.asarray(ddx, dtype=float)
     ddx2 = np.asarray(ddx2, dtype=float)
     n = len(close)
     result: List[Optional[str]] = [None] * n
+    events: List[StructureEvent] = []
     if n < 3:
-        return result
+        return result, events
 
     CH1 = np.full(n, np.nan)
     DDXH1 = np.full(n, np.nan)
@@ -514,6 +592,16 @@ def compute_dde_structure_divergence(
                             invalidated = True
                     if not invalidated and not _recent(result, i, "top_divergence", dedup):
                         _write_divergence(result, i, "top_divergence", target_indices)
+                        if collect_events:
+                            gc = _cross_at(last_gc_arr, i)
+                            path = "direct" if T1[i - 1] else "skip_peak"
+                            events.append(StructureEvent(
+                                i,
+                                "top_divergence",
+                                path,
+                                _macd_price_lag(close, gc, i, top=True),
+                                float(ddx[i]) > 0,
+                            ))
 
         if not np.isfinite(CL1[i]) or not np.isfinite(DDXL2[i]):
             continue
@@ -578,5 +666,59 @@ def compute_dde_structure_divergence(
                         invalidated_b = True
                 if not invalidated_b and not _recent(result, i, "bottom_divergence", dedup):
                     _write_divergence(result, i, "bottom_divergence", target_indices)
+                    if collect_events:
+                        dc = _cross_at(last_dc_arr, i)
+                        path = "direct" if B1[i - 1] else "skip_peak"
+                        events.append(StructureEvent(
+                            i,
+                            "bottom_divergence",
+                            path,
+                            _macd_price_lag(close, dc, i, top=False),
+                            float(ddx[i]) < 0,
+                        ))
 
+    return result, events
+
+
+def compute_dde_structure_divergence(
+    close,
+    ddx,
+    ddx2,
+    dedup: int = 10,
+    spike_filter_top: bool = True,
+    require_finite: bool = True,
+    target_indices: Optional[Set[int]] = None,
+) -> List[Optional[str]]:
+    """Tongdaxin Level 2 DDE structure divergence; annotate on TG day only."""
+    result, _ = _dde_structure_impl(
+        close, ddx, ddx2,
+        dedup=dedup,
+        spike_filter_top=spike_filter_top,
+        require_finite=require_finite,
+        target_indices=target_indices,
+    )
     return result
+
+
+def trace_dde_structure_events(
+    close,
+    ddx,
+    ddx2,
+    dedup: int = 10,
+    spike_filter_top: bool = True,
+    require_finite: bool = True,
+    trade_dates: Optional[List[str]] = None,
+) -> List[StructureEvent]:
+    """Return TG-day metadata for each L1 DDE structure divergence event."""
+    _, events = _dde_structure_impl(
+        close, ddx, ddx2,
+        dedup=dedup,
+        spike_filter_top=spike_filter_top,
+        require_finite=require_finite,
+        collect_events=True,
+    )
+    if trade_dates is not None:
+        for ev in events:
+            if 0 <= ev.index < len(trade_dates):
+                ev.trade_date = str(trade_dates[ev.index])
+    return events

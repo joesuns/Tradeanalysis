@@ -60,8 +60,8 @@ def test_export_creates_file():
     os.unlink(out_path)
 
     try:
-        n = export_wide_to_excel(db_path, "20260101", out_path)
-        assert n >= 1, f"Expected at least 1 row, got {n}"
+        result = export_wide_to_excel(db_path, "20260101", out_path)
+        assert result.row_count >= 1, f"Expected at least 1 row, got {result.row_count}"
         assert os.path.exists(out_path), f"Output file not found: {out_path}"
         assert os.path.getsize(out_path) > 0, "Output file is empty"
     finally:
@@ -108,10 +108,10 @@ def test_export_without_index():
     os.unlink(out_path)
 
     try:
-        n = export_wide_to_excel(
+        result = export_wide_to_excel(
             db_path, "20260101", out_path, include_index=False
         )
-        assert n >= 1
+        assert result.row_count >= 1
         assert os.path.exists(out_path)
     finally:
         if os.path.exists(db_path):
@@ -150,8 +150,8 @@ def test_export_handles_empty_weekly():
     os.unlink(out_path)
 
     try:
-        n = export_wide_to_excel(db_path, "20260101", out_path, include_index=False)
-        assert n >= 1, f"Expected daily rows despite empty weekly, got {n}"
+        result = export_wide_to_excel(db_path, "20260101", out_path, include_index=False)
+        assert result.row_count >= 1, f"Expected daily rows despite empty weekly, got {result.row_count}"
         assert os.path.exists(out_path)
     finally:
         if os.path.exists(db_path):

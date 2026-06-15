@@ -16,8 +16,9 @@ def test_apply_net_amount_dc_patch_null_only(db_with_schema):
         {"ts_code": "Y.SZ", "trade_date": "20240102", "net_amount_dc": 10.0},
         {"ts_code": "Y.SZ", "trade_date": "20240103", "net_amount_dc": 99.0},
     ])
-    n = _apply_net_amount_dc_patch(con, patch)
-    assert n == 1
+    result = _apply_net_amount_dc_patch(con, patch)
+    assert int(result) == 1
+    assert any(e[3] == "net_amount_dc" for e in result.changed_field_events)
     assert con.execute(
         "SELECT net_amount_dc FROM ods_moneyflow "
         "WHERE ts_code='Y.SZ' AND trade_date='20240103'"
@@ -41,8 +42,9 @@ def test_apply_circ_mv_patch_insert_and_update(db_with_schema):
     patch = pd.DataFrame([
         {"ts_code": "Z.SZ", "trade_date": "20240102", "circ_mv": 123456.0},
     ])
-    n = _apply_circ_mv_patch(con, patch)
-    assert n == 1
+    result = _apply_circ_mv_patch(con, patch)
+    assert int(result) == 1
+    assert any(e[3] == "circ_mv" for e in result.changed_field_events)
     assert con.execute(
         "SELECT circ_mv FROM ods_daily_basic WHERE ts_code='Z.SZ'"
     ).fetchone()[0] == pytest.approx(123456.0)
@@ -149,10 +151,11 @@ def test_backfill_circ_mv_stock_updates_ods_daily_basic(db_with_schema):
             assert api == "daily_basic"
             return [{"trade_date": "20240102", "circ_mv": 123456.0, "total_mv": 999.0}]
 
-    n = _backfill_circ_mv_stock(
+    result = _backfill_circ_mv_stock(
         con, FakeClient(), "CV.SZ", "20240102", "20240102",
     )
-    assert n == 1
+    assert int(result) == 1
+    assert any(e[3] == "circ_mv" for e in result.changed_field_events)
     circ = con.execute(
         "SELECT circ_mv FROM ods_daily_basic WHERE ts_code='CV.SZ'"
     ).fetchone()[0]

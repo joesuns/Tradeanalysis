@@ -50,13 +50,54 @@ def test_data_mutated_since_last_calc_detects_fetch_after_calc():
         [comp],
     )
     assert data_mutated_since_last_calc(con, "20260608") is False
+    # Compare-only fetch (ODS diff, 0 writes) must NOT block force same-day reuse.
+    compare_only = json.dumps({"ods_rows_written": 0, "ods_rows_unchanged": 5000})
     con.execute(
         """INSERT INTO ods_etl_log
            (id, step_name, started_at, finished_at, status, row_count, error_msg,
             data_completeness)
-           VALUES ('2', 'run_fetch', '2026-06-08T11:00:00', 't2', 'success', 1, '', '{}')"""
+           VALUES ('2', 'run_fetch', '2026-06-08T11:00:00', 't2', 'success', 5000, '', ?)""",
+        [compare_only],
+    )
+    assert data_mutated_since_last_calc(con, "20260608") is False
+    # Actual ODS write after calc → mutated.
+    written = json.dumps({"ods_rows_written": 3, "changed_codes_count": 2})
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('3', 'run_fetch', '2026-06-08T12:00:00', 't3', 'success', 3, '', ?)""",
+        [written],
     )
     assert data_mutated_since_last_calc(con, "20260608") is True
+    con.close()
+
+
+def test_data_mutated_since_last_calc_skipped_rebuild_not_mutation():
+    import json
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.calc_gate import data_mutated_since_last_calc
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    comp = json.dumps({"calc_date": "20260608", "ods_max": "20260608"})
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('1', 'calc_dws', '2026-06-08T10:00:00', 't1', 'success', 1, '', ?)""",
+        [comp],
+    )
+    skipped_rebuild = json.dumps({"skipped": True, "pipeline_shortcut": True})
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('2', 'run_rebuild_dwd', '2026-06-08T11:00:00', 't2', 'success', 0, '', ?)""",
+        [skipped_rebuild],
+    )
+    assert data_mutated_since_last_calc(con, "20260608") is False
     con.close()
 
 

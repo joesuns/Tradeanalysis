@@ -36,6 +36,29 @@ python -m backend.cli run                        # 全市场，最近交易日
 python -m backend.cli run --date 20260605              # 同日复跑（rebuild 可能跳过）
 python -m backend.cli run --date 20260605 --skip-export  # 同日复跑不导 Excel
 
+# ===== change-driven refresh smoke（Wave 1–5）=====
+# ANALYSIS_DATE=20260612 ./scripts/smoke_change_driven_refresh.sh --run-all
+# ANALYSIS_DATE=20260612 SMOKE_TS_CODE=000543.SZ ./scripts/smoke_change_driven_refresh.sh --run-wave5
+
+# ===== 强制重算（refresh R1）=====
+python -m backend.cli refresh --date 20260612                    # 12 路由全 FULL
+python -m backend.cli refresh --date 20260612 --indicator ma     # 仅 ma 日+周
+python -m backend.cli refresh --from 20260610 --to 20260612 --dry-run  # 范围规模预估
+python -m backend.cli refresh --date 20260612 --export           # 重算后导 Excel
+
+# ===== 日期范围（run / export / refresh 共用 --from/--to，与 --date 互斥）=====
+python -m backend.cli run --from 20260610 --to 20260612
+python -m backend.cli export --from 20260610 --to 20260612       # 多文件 exports/analysis_{date}_*.xlsx
+python -m backend.cli run --from 20260610 --to 20260612 --continue-on-error  # 失败继续
+
+# ===== 运维 ops（顶层命令仍可用，会 DeprecationWarning）=====
+python -m backend.cli ops refresh-state --date 20260609
+python -m backend.cli ops backfill-state --date 20260608
+python -m backend.cli ops prune --keep 1
+python -m backend.cli ops repair-weekly --execute
+python -m backend.cli ops backfill-dde-meta --sync-dwd --recalc
+python -m backend.cli ops repair-dde-trend --date 20260612
+
 # ===== 数据拉取 =====
 python -m backend.cli fetch                        # 全市场增量拉取
 python -m backend.cli fetch --ts-code 000543.SZ 600580.SH  # 指定股票
@@ -187,6 +210,7 @@ calc/export 共用同一 analysis_date（`--date`）；calc 收尾 run_checkpoin
 - **CalcPreflightContext（M1+M1.1，`CALC_REUSE_REFRESH_CTX=1` 默认，计划 `docs/superpowers/plans/2026-06-13-calc-preflight-context-p0.md` + `2026-06-13-calc-preflight-merge-m1.1.md`）：** `cli run` Step1 refresh 产出 tails+modes+fp_cache，Step2 calc **热路径**复用，跳过 `batch_tails`/`batch_preflight`；APPEND/FULL state 改 `upsert_calc_state_batch` 批写。独立 `cli calc` 走冷路径。G3/auto-fetch 二次 DWD rebuild 后 **`merge_context_patch`** 仅 merge patch 子集（非整包 cold）；batch append 对缺失股走 `_merge_cold_tails_and_preflight`（含 `progress calc.batch_preflight` 心跳）。观测：`preflight_source=refresh|cold`、`tails_load_skipped`、`cold_merge_stocks`/`cold_merge_elapsed_sec`、`state_upsert_mode=batch`（`ods_etl_log.calc_dws`）。
 - **双指纹门（`CALC_DWD_FP_GATE=1` 默认，计划 `docs/superpowers/plans/2026-06-14-calc-routing-dual-fp-export-opt.md`）：** `history_fp`（路由）与 DWS `input_fingerprint`（写跳过）分叉时：preflight FULL 且无 new_bars → `check_dwd_unchanged` 真 → 降级 SKIP 并写 state；batch_full fingerprint_match 兜底 upsert `history_fp`。**batch_append + chunk fallthrough** 均传 `dwd_fp_cache`。B4 元数据回填后一次性 `cli refresh-state --date X` 运维补洞。
 - **chunk_codes 重算（同上 plan）：** batch_append 收尾 `_compute_chunk_codes`（preflight 失败 ∪ 剩余 FULL），热路径 cold merge 成功不再 fallthrough chunk（修复 7c090546：5290 股空转）。
+- **run 列→指标收窄（Wave 5，`CALC_COLUMN_NARROW=1` 默认，计划 `docs/superpowers/plans/2026-06-15-wave5-column-indicator-deps.md`）：** ODS 列级 diff 事件经 `column_indicator_deps` 映射；`cli run` 在 **有 mutation 且满足 G1–G8** 时仅跑受影响指标 batch（如仅 `circ_mv`/`net_amount_dc` → `dde` 日+周），跳过 quote tail + 无关 10 路由。**refresh R1 不受影响**（仍 12 路由或 `--indicator`）。`adj_factor`/新 PK INSERT/qfq refresh/结构性 stale_dwd → fallback 全 12 路由。观测：`calc_dws.data_completeness.run_indicator_filter` / `calc_routes_narrowed` / `active_routes`。`=0` 回退现网全路由。
 - **M2 Vector Append（`CALC_VECTOR_APPEND=1` 默认，计划 `docs/superpowers/plans/2026-06-13-calc-vector-append-m2.md`）：** `vector/macd_batch.py` / `dde_batch.py` / `volume_batch.py`；结构背离 O(n) cross。**M2c+ volume trend：** APPEND `require_trend_target_indices` fail-fast + `compute_volume_trend_series(..., target_indices=new_bars)` 仅算新 bar（~184×）；FULL 保持全序列。Profiling：`python3 scripts/profile_volume_trend_v2.py`。**M2d MACD weekly B4：** APPEND `require_b4_weekly_target_indices` + `b4_weekly_series_from_daily(..., target_indices=new_bars)` 消除 O(n²) resample；`append_calculate` + `batch_append_macd` 已接线。Profiling：`python3 scripts/profile_macd_b4_weekly.py`。
 - **run 观测：** `ods_etl_log` 新增 `run_fetch` / `run_rebuild_dwd` / **`run_refresh_state`** / `run_export`；`run_rebuild_dwd.data_completeness.skipped=true` 表示未重建。
 - **边界：** 除权/adj 回填后若未触发 fetch，须 `fetch` + `calc --force` 或手动 rebuild；同日复跑不覆盖此场景。

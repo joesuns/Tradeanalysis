@@ -91,7 +91,7 @@ def test_fetch_stocks_incremental_skips_when_complete():
     n = fetch_stocks_incremental(
         FakeClient(), con, ["FULL.SZ"], start="20260101", end="20260103"
     )
-    assert n == 0, f"Should not have fetched any data, got {n}"
+    assert int(n) == 0, f"Should not have fetched any data, got {n}"
     # trade_cal is always called; daily/daily_basic/moneyflow should NOT be called
     data_apis = [a for a in api_calls if a != "trade_cal"]
     assert len(data_apis) == 0, f"Should not have called data APIs, got {data_apis}"
@@ -400,7 +400,7 @@ def test_fetch_stocks_incremental_drops_invalid_rows(db_with_schema):
     fetch_stocks_incremental(FakeClient(), con, ["BAD.SZ"],
                              start="20260101", end="20260101")
     n = con.execute("SELECT COUNT(*) FROM ods_daily").fetchone()[0]
-    assert n == 0, f"invalid BAD.SZ row should be dropped, got {n} rows"
+    assert int(n) == 0, f"invalid BAD.SZ row should be dropped, got {n} rows"
 
 
 def test_fetch_stocks_incremental_bulk_inserts_all_layers(db_with_schema):
@@ -491,7 +491,7 @@ def test_fetch_stocks_incremental_backfills_net_amount_dc_only(db_with_schema):
     n = fetch_stocks_incremental(
         FakeClient(), con, ["DC.SZ"], start="20240102", end="20240102",
     )
-    assert n == 1
+    assert int(n) == 1
     assert ("moneyflow_dc", {"ts_code": "DC.SZ", "start_date": "20240102",
                              "end_date": "20240102"}) in calls
     assert not any(c[0] == "daily" for c in calls)

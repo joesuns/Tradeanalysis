@@ -450,6 +450,56 @@ def test_rebuild_dwd_incremental_full_path_on_adj_drift(temp_db, caplog):
     assert any("dwd.qfq_update" in r.message for r in caplog.records)
 
 
+def test_rebuild_dwd_incremental_qfq_drift_still_tails_new_day(temp_db, caplog):
+    """qfq UPDATE must not skip tail INSERT when DWD max is before trade_date."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    create_all_tables(temp_db)
+    temp_db.execute(
+        "INSERT INTO ods_stock_basic (ts_code,symbol,name) VALUES ('TEST.SZ','TEST','Test')"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_trade_cal (cal_date,is_open) VALUES "
+        "('20260101',1),('20260102',1),('20260103',1)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily (ts_code,trade_date,close,adj_factor,open,high,low,vol,amount,pct_chg) "
+        "VALUES "
+        "('TEST.SZ','20260101',10.0,1.0,10.0,10.5,9.5,100,1000,0.01),"
+        "('TEST.SZ','20260102',10.1,1.0,10.0,10.2,9.9,110,1100,0.02),"
+        "('TEST.SZ','20260103',10.2,1.0,10.1,10.3,10.0,120,1200,0.03)"
+    )
+    temp_db.execute(
+        "INSERT INTO ods_daily_basic (ts_code,trade_date,total_mv) "
+        "VALUES "
+        "('TEST.SZ','20260101',1000),"
+        "('TEST.SZ','20260102',1010),"
+        "('TEST.SZ','20260103',1020)"
+    )
+    build_dim_stock(temp_db)
+    build_dim_date(temp_db)
+    build_dwd_daily_quote(temp_db, ["TEST.SZ"])
+    temp_db.execute(
+        "DELETE FROM dwd_daily_quote WHERE ts_code='TEST.SZ' AND trade_date='20260103'"
+    )
+    temp_db.execute(
+        "UPDATE ods_daily SET adj_factor=2.0 WHERE ts_code='TEST.SZ' AND trade_date='20260101'"
+    )
+
+    rebuild_dwd_incremental(temp_db, ["TEST.SZ"], "20260103")
+
+    max_td = temp_db.execute(
+        "SELECT MAX(trade_date) FROM dwd_daily_quote WHERE ts_code='TEST.SZ'"
+    ).fetchone()[0]
+    assert max_td == "20260103"
+    close_qfq = temp_db.execute(
+        "SELECT close_qfq FROM dwd_daily_quote "
+        "WHERE ts_code='TEST.SZ' AND trade_date='20260101'"
+    ).fetchone()[0]
+    assert abs(close_qfq - 20.0) < 1e-6
+
+
 def test_moneyflow_mapping(temp_db):
     """ods_moneyflow maps to dwd_daily_moneyflow with correct total_vol."""
     create_all_tables(temp_db)

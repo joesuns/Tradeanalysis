@@ -19,6 +19,7 @@ import argparse
 import logging
 import sys
 import uuid
+import warnings
 from datetime import datetime
 
 from backend.log_config import setup_logging, set_run_id
@@ -27,34 +28,18 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
-def _resolve_trade_date(con, date: str = None) -> str:
-    """解析分析日期：指定则用指定，不指定则用今天。
+from backend.cli_dates import ensure_trade_date
+from backend.cli_dates import resolve_trade_date as _resolve_trade_date_value
 
-    Returns YYYYMMDD string.
-    """
-    if date:
-        return date
-    from datetime import datetime
-    return datetime.now().strftime("%Y%m%d")
+
+def _resolve_trade_date(con, date: str = None) -> str:
+    """解析分析日期：指定则用指定，不指定则用今天。"""
+    return _resolve_trade_date_value(date)
 
 
 def _ensure_trade_date(con, date: str) -> str:
-    """确保 date 是交易日；不是则往前找最近交易日。
-
-    Queries dim_date to validate and rollback. Prints a warning if
-    the original date was not a trading day.
-    """
-    row = con.execute(
-        "SELECT MAX(trade_date) FROM dim_date "
-        "WHERE trade_date <= ? AND is_trade_day = 1",
-        (date,),
-    ).fetchone()
-    if not row or not row[0]:
-        return date  # dim_date may be empty — trust the caller
-    trade_date = row[0]
-    if trade_date != date:
-        logger.warning("%s is not a trading day, using %s instead", date, trade_date)
-    return trade_date
+    """确保 date 是交易日；不是则往前找最近交易日。"""
+    return ensure_trade_date(con, date)
 
 
 def _warn_export_coverage(db_path: str, trade_date: str, n_rows: int,
@@ -141,11 +126,15 @@ def cmd_fetch(args):
                 start, end, workers=3, ts_codes=codes, con=con
             )
             mode = "date"
+        rows_written = int(n)
+        completeness = {"mode": mode, "start": start, "end": end}
+        if hasattr(n, "to_completeness"):
+            completeness.update(n.to_completeness())
         log_etl_end(
-            con, lid, "cli_fetch", t0, "success", row_count=n,
-            data_completeness={"mode": mode, "start": start, "end": end},
+            con, lid, "cli_fetch", t0, "success", row_count=rows_written,
+            data_completeness=completeness,
         )
-        logger.info("Fetch complete: %d ODS rows", n)
+        logger.info("Fetch complete: %d ODS rows written", rows_written)
     except Exception:
         log_etl_end(con, lid, "cli_fetch", t0, "failed")
         raise
@@ -164,7 +153,7 @@ def cmd_calc(args, skip_stale_fetch=False):
     from backend.db.connection import get_connection
     from backend.etl.orchestrator import run_calc
 
-    from backend.etl.calc_preflight_context import pop_run_preflight_context
+    from backend.etl.calc_preflight_context import pop_run_calc_handoff, pop_run_preflight_context
 
     con = get_connection()
     try:
@@ -174,6 +163,10 @@ def cmd_calc(args, skip_stale_fetch=False):
                 con, _resolve_trade_date(con, args.date))
         ts_codes = args.ts_code if args.ts_code else None
         preflight_ctx = pop_run_preflight_context()
+        calc_handoff = pop_run_calc_handoff()
+        indicator_filter = (
+            calc_handoff.indicator_filter if calc_handoff else None
+        )
         run_calc(
             con,
             ts_codes=ts_codes,
@@ -182,6 +175,8 @@ def cmd_calc(args, skip_stale_fetch=False):
             skip_stale_fetch=skip_stale_fetch,
             force=getattr(args, "force", False),
             preflight_ctx=preflight_ctx,
+            indicator_filter=indicator_filter,
+            calc_handoff=calc_handoff,
         )
     finally:
         con.close()
@@ -190,131 +185,236 @@ def cmd_calc(args, skip_stale_fetch=False):
 # ── export ──
 
 def cmd_export(args):
-    """Export analysis wide table to Excel.
-
-    Reads DWS data directly from the database. No recalculation.
-    Use 'calc' then 'export' separately if fresh data is needed.
-    """
+    """Export analysis wide table to Excel (single day or --from/--to range)."""
+    from backend.cli_dates import resolve_cli_dates
+    from backend.db.connection import get_connection
     from backend.export_wide import default_export_path, export_wide_to_excel
 
-    args.output = default_export_path(args.date, args.output)
+    con = get_connection()
+    try:
+        dates = resolve_cli_dates(con, args, default_today=False)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        con.close()
 
+    if not dates:
+        print("Error: export requires --date or --from/--to")
+        raise SystemExit(1)
+
+    db_path = args.db_path or "data/tradeanalysis.duckdb"
     ts_codes = args.ts_code if args.ts_code else None
+    outputs = []
 
-    n = export_wide_to_excel(
-        args.db_path or "data/tradeanalysis.duckdb",
-        args.date,
-        args.output,
-        filter_st=not args.include_st,
-        include_index=not args.no_index,
-        ts_codes=ts_codes,
-    )
-    _warn_export_coverage(
-        args.db_path or "data/tradeanalysis.duckdb",
-        args.date, n, filter_st=not args.include_st, ts_codes=ts_codes,
-    )
-    print(f"Exported {n} rows -> {args.output}")
+    for trade_date in dates:
+        out = args.output if len(dates) == 1 and args.output else default_export_path(trade_date)
+        result = export_wide_to_excel(
+            db_path,
+            trade_date,
+            out,
+            filter_st=not args.include_st,
+            include_index=not args.no_index,
+            ts_codes=ts_codes,
+        )
+        _warn_export_coverage(
+            db_path, trade_date, result.row_count,
+            filter_st=not args.include_st, ts_codes=ts_codes,
+        )
+        outputs.append((trade_date, result.row_count, out))
+        print(f"Exported {result.row_count} rows -> {out}")
+
+    if len(outputs) > 1:
+        print(f"export range complete: {len(outputs)} files")
 
 
 # ── run ──
 
-def _rebuild_dwd_for_run(con, codes: list[str], date: str, n_fetch: int) -> tuple:
+def _rebuild_dwd_for_run(con, codes: list[str], date: str, fetch_result) -> tuple:
     """Rebuild DWD after run fetch step.
 
-    n_fetch > 0: rebuild find_stale_dwd_codes subset (incremental when DWD_INCREMENTAL=1).
-    n_fetch == 0: rebuild only find_stale_dwd_codes; skip if none stale.
-    Returns (dwd_result_dict, stale_codes_rebuilt). Empty dict + [] when skipped.
+    Uses FetchResult.changed_codes union find_stale_dwd_codes subset.
+    Returns (dwd_result_dict, stale_codes_rebuilt, dwd_meta). Empty dict + [] + meta when skipped.
     """
     from backend.etl.orchestrator import find_stale_dwd_codes
+    from backend.etl.pipeline_context import coerce_fetch_result
 
+    fr = coerce_fetch_result(fetch_result)
+    changed = fr.changed_codes_for_date(date)
     stale = find_stale_dwd_codes(con, codes, date)
-    if not stale:
-        if n_fetch > 0:
+    stale_extra = sorted(set(stale) - set(changed))
+    to_rebuild = sorted(set(changed) | set(stale))
+    empty_meta = {"qfq_codes": [], "stale_extra_codes": stale_extra}
+    if not to_rebuild:
+        if fr.rows_written > 0:
             logger.info(
-                "DWD already fresh for %s after fetch (%d ODS rows) — skip rebuild",
-                date, n_fetch,
+                "DWD already fresh for %s after fetch (written=%d ODS rows) — skip rebuild",
+                date, fr.rows_written,
             )
         else:
             logger.info(
                 "DWD fresh for %s — skip rebuild (%d stocks checked)",
                 date, len(codes),
             )
-        return {}, []
+        return {}, [], empty_meta
 
-    from backend.etl.build_dwd import rebuild_dwd_for_stale
+    from backend.etl.build_dwd import (
+        find_stocks_needing_qfq_refresh,
+        rebuild_dwd_for_stale,
+    )
 
-    if n_fetch > 0:
+    qfq_codes = find_stocks_needing_qfq_refresh(con, to_rebuild, date)
+
+    if fr.rows_written > 0 or changed:
         logger.info(
-            "Rebuilding DWD for %d stale stocks (fetch wrote %d ODS rows)",
-            len(stale), n_fetch,
+            "Rebuilding DWD for %d stocks on %s (changed=%d stale_dwd=%d written=%d)",
+            len(to_rebuild), date, len(changed), len(stale), fr.rows_written,
         )
     else:
         logger.info(
             "DWD stale for %d/%d stocks on %s — rebuilding subset",
-            len(stale), len(codes), date,
+            len(to_rebuild), len(codes), date,
         )
-    result = rebuild_dwd_for_stale(con, stale, date)
-    return result, stale
+    result = rebuild_dwd_for_stale(con, to_rebuild, date)
+    meta = {"qfq_codes": qfq_codes, "stale_extra_codes": stale_extra}
+    return result, to_rebuild, meta
 
 
 def cmd_run(args):
-    """One-command daily analysis: fetch → calc → export.
-
-    Resolves the target trading date, fetches ODS for that day, rebuilds DWD,
-    runs all DWS calculators, and exports the Excel report.
-    """
+    """One-command daily analysis: fetch → calc → export (single day or --from/--to range)."""
+    from backend.cli_dates import resolve_cli_dates, run_date_range_loop
     from backend.db.connection import get_connection
     from backend.etl.error_handler import log_etl_end, log_etl_start
-    from backend.export_wide import default_export_path, export_wide_to_excel
+
+    con = get_connection()
+    try:
+        dates = resolve_cli_dates(con, args, default_today=True)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        con.close()
+
+    if len(dates) == 1:
+        _cmd_run_single_day(args, dates[0])
+        return
+
+    logger.info("run date range: %d trading days (%s → %s)", len(dates), dates[0], dates[-1])
+    con_range = get_connection()
+    try:
+        lid, t0 = log_etl_start(con_range, "cli_run_range")
+        try:
+            progress = run_date_range_loop(
+                dates,
+                lambda d: _cmd_run_single_day(args, d),
+                continue_on_error=getattr(args, "continue_on_error", False),
+                label="run",
+            )
+            log_etl_end(
+                con_range, lid, "cli_run_range", t0, "success",
+                row_count=len(progress["ok"]),
+                data_completeness={"date_range_progress": progress},
+            )
+            print(
+                f"run range complete: ok={len(progress['ok'])} failed={len(progress['failed'])}",
+            )
+        except Exception:
+            log_etl_end(con_range, lid, "cli_run_range", t0, "failed")
+            raise
+    finally:
+        con_range.close()
+
+
+def _cmd_run_single_day(args, date: str):
+    """Run fetch → DWD → calc → export for one analysis_date."""
+    from backend.db.connection import get_connection
+    from backend.etl.error_handler import log_etl_end, log_etl_start
+    from backend.export_wide import (
+        build_export_data_completeness,
+        default_export_path,
+        export_wide_to_excel,
+    )
     from backend.fetch.client import TushareClient
     from backend.fetch.ods_daily import (
         fetch_by_date_range_parallel,
         fetch_stocks_incremental,
         get_all_active_codes,
     )
-    # Resolve date on a short-lived connection, then close before later steps.
-    con = get_connection()
-    try:
-        date = _resolve_trade_date(con, args.date)
-        date = _ensure_trade_date(con, date)
-    finally:
-        con.close()
 
     db_path = args.db_path or "data/tradeanalysis.duckdb"
     ts_codes = args.ts_code if args.ts_code else None
 
     logger.info("=== Step 1/3: Fetching market data for %s ===", date)
+    skip_dwd_calc = False
+    fetch_result = None
+    dwd_meta = {"qfq_codes": [], "stale_extra_codes": []}
+    calc_handoff = None
     con = get_connection()
     try:
         codes = ts_codes or get_all_active_codes(con)
         lid, t0 = log_etl_start(con, "run_fetch")
         if ts_codes:
             client = TushareClient()
-            n_fetch = fetch_stocks_incremental(
-                client, con, codes, start=date, end=date)
+            fetch_result = fetch_stocks_incremental(
+                client, con, codes, start=date, end=date, force_compare=True)
         else:
-            n_fetch = fetch_by_date_range_parallel(
-                date, date, workers=3, ts_codes=codes, con=con)
-        logger.info("Fetch complete: %d ODS rows for %s", n_fetch, date)
+            fetch_result = fetch_by_date_range_parallel(
+                date, date, workers=3, ts_codes=codes, con=con,
+                skip_covered=False,
+            )
+        from backend.etl.pipeline_context import PipelineContext, coerce_fetch_result
+
+        fetch_result = coerce_fetch_result(fetch_result)
+        pipeline_ctx = PipelineContext.from_fetch(
+            con, date, codes, fetch_result, mode="run",
+        )
+        skip_dwd_calc = pipeline_ctx.skip_dwd_calc
+        logger.info(
+            "Fetch complete: written=%d unchanged=%d for %s",
+            fetch_result.rows_written, fetch_result.rows_unchanged, date,
+        )
+        fetch_completeness = {
+            "analysis_date": date,
+            "stocks": len(codes),
+            **fetch_result.to_completeness(),
+        }
         log_etl_end(
-            con, lid, "run_fetch", t0, "success", row_count=n_fetch,
-            data_completeness={"analysis_date": date, "stocks": len(codes)},
+            con, lid, "run_fetch", t0, "success",
+            row_count=fetch_result.rows_written,
+            data_completeness=fetch_completeness,
         )
 
         lid, t0 = log_etl_start(con, "run_rebuild_dwd")
-        dwd_result, stale_rebuilt = _rebuild_dwd_for_run(con, codes, date, n_fetch)
-        rebuild_rows = sum(dwd_result.values()) if dwd_result else 0
-        log_etl_end(
-            con, lid, "run_rebuild_dwd", t0, "success", row_count=rebuild_rows,
-            data_completeness={
-                "analysis_date": date,
-                "skipped": not dwd_result,
-                "n_fetch": n_fetch,
-                "stale_count": len(stale_rebuilt),
-            },
-        )
+        if pipeline_ctx.skip_dwd_calc:
+            logger.info(
+                "run pipeline shortcut: skip DWD+calc (unchanged ODS, prior calc exists)",
+            )
+            dwd_result, stale_rebuilt = {}, []
+            log_etl_end(
+                con, lid, "run_rebuild_dwd", t0, "success", row_count=0,
+                data_completeness={
+                    "analysis_date": date,
+                    "skipped": True,
+                    "pipeline_shortcut": True,
+                    **pipeline_ctx.to_completeness(),
+                },
+            )
+        else:
+            dwd_result, stale_rebuilt, dwd_meta = _rebuild_dwd_for_run(
+                con, codes, date, fetch_result,
+            )
+            rebuild_rows = sum(dwd_result.values()) if dwd_result else 0
+            log_etl_end(
+                con, lid, "run_rebuild_dwd", t0, "success", row_count=rebuild_rows,
+                data_completeness={
+                    "analysis_date": date,
+                    "skipped": not dwd_result,
+                    **fetch_result.to_completeness(),
+                    "stale_count": len(stale_rebuilt),
+                },
+            )
 
-        if dwd_result and stale_rebuilt:
+        if dwd_result and stale_rebuilt and not pipeline_ctx.skip_dwd_calc:
             from backend.config import CALC_REUSE_REFRESH_CTX
             from backend.etl.calc_state_refresh import maybe_refresh_state_after_dwd_rebuild
 
@@ -359,12 +459,47 @@ def cmd_run(args):
             except Exception:
                 log_etl_end(con, lid2, "run_refresh_state", t02, "failed")
                 raise
+
+        if not skip_dwd_calc and fetch_result is not None:
+            from backend.etl.calc_preflight_context import RunCalcHandoff
+            from backend.etl.column_indicator_deps import (
+                active_route_keys,
+                calc_routes_narrowed,
+                resolve_run_calc_indicator_filter,
+            )
+
+            indicator_filter = resolve_run_calc_indicator_filter(
+                con,
+                fetch_result,
+                changed_codes=fetch_result.changed_codes_for_date(date),
+                stale_extra_codes=dwd_meta.get("stale_extra_codes", []),
+                qfq_codes=dwd_meta.get("qfq_codes", []),
+            )
+            narrowed = calc_routes_narrowed(indicator_filter)
+            if narrowed:
+                logger.info(
+                    "run calc route narrow: indicators=%s routes=%s",
+                    indicator_filter,
+                    active_route_keys(indicator_filter),
+                )
+            calc_handoff = RunCalcHandoff(
+                indicator_filter=indicator_filter,
+                calc_routes_narrowed=narrowed,
+                active_routes=active_route_keys(indicator_filter),
+            )
     finally:
         con.close()
 
     logger.info("=== Step 2/3: Computing indicators for %s ===", date)
     args.date = date
-    cmd_calc(args, skip_stale_fetch=True)
+    if not skip_dwd_calc:
+        if calc_handoff is not None:
+            from backend.etl.calc_preflight_context import set_run_calc_handoff
+
+            set_run_calc_handoff(calc_handoff)
+        cmd_calc(args, skip_stale_fetch=True)
+    else:
+        logger.info("=== Step 2/3: Skipped calc (pipeline shortcut) ===")
 
     if not getattr(args, "skip_export", False):
         logger.info("=== Step 3/3: Exporting analysis for %s ===", date)
@@ -373,7 +508,7 @@ def cmd_run(args):
         con = get_connection()
         try:
             lid, t0 = log_etl_start(con, "run_export")
-            n = export_wide_to_excel(
+            result = export_wide_to_excel(
                 db_path,
                 date,
                 args.output,
@@ -382,19 +517,184 @@ def cmd_run(args):
                 ts_codes=ts_codes,
             )
             log_etl_end(
-                con, lid, "run_export", t0, "success", row_count=n,
-                data_completeness={"analysis_date": date},
+                con, lid, "run_export", t0, "success", row_count=result.row_count,
+                data_completeness=build_export_data_completeness(
+                    date, result.tradable_enrich,
+                ),
             )
         finally:
             con.close()
 
         _warn_export_coverage(
-            db_path, date, n, filter_st=not args.include_st, ts_codes=ts_codes,
+            db_path, date, result.row_count, filter_st=not args.include_st, ts_codes=ts_codes,
         )
-        print(f"Exported {n} rows -> {args.output}")
+        print(f"Exported {result.row_count} rows -> {args.output}")
     else:
         logger.info("Skipping export (--skip-export)")
     logger.info("Done.")
+
+
+# ── refresh ──
+
+def cmd_refresh(args):
+    """Force recalc scoped indicators (R1): fetch → DWD → FULL calc → optional export."""
+    from backend.cli_dates import resolve_cli_dates, run_date_range_loop
+    from backend.db.connection import get_connection
+    from backend.etl.error_handler import log_etl_end, log_etl_start
+    from backend.etl.refresh_pipeline import parse_indicator_filter, run_refresh_pipeline
+
+    con = get_connection()
+    try:
+        dates = resolve_cli_dates(con, args, default_today=True)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        con.close()
+
+    ts_codes = args.ts_code if args.ts_code else None
+    try:
+        indicator_filter = parse_indicator_filter(getattr(args, "indicator", None))
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1) from exc
+
+    db_path = args.db_path or "data/tradeanalysis.duckdb"
+    dry_run = getattr(args, "dry_run", False)
+
+    if dry_run and len(dates) > 1:
+        con = get_connection()
+        try:
+            from backend.etl.refresh_pipeline import (
+                estimate_refresh_scope,
+                resolve_refresh_routes,
+            )
+            from backend.fetch.ods_daily import get_all_active_codes
+
+            codes = ts_codes or get_all_active_codes(con)
+            routes = resolve_refresh_routes(indicator_filter)
+            scope = estimate_refresh_scope(dates, codes, routes)
+            print(
+                f"refresh dry-run: dates={scope['dates']} stocks={scope['n_stocks']} "
+                f"indicators={scope['indicators']} est_route_count={scope['est_route_count']}",
+            )
+        finally:
+            con.close()
+        return
+
+    if len(dates) > 1 and not dry_run:
+        from backend.etl.refresh_pipeline import (
+            REFRESH_CONFIRM_ROUTE_THRESHOLD,
+            estimate_refresh_scope,
+            resolve_refresh_routes,
+        )
+        from backend.fetch.ods_daily import get_all_active_codes
+
+        con = get_connection()
+        try:
+            codes = ts_codes or get_all_active_codes(con)
+            routes = resolve_refresh_routes(indicator_filter)
+            scope = estimate_refresh_scope(dates, codes, routes)
+            if (
+                scope["est_route_count"] > REFRESH_CONFIRM_ROUTE_THRESHOLD
+                and not getattr(args, "confirm", False)
+            ):
+                print(
+                    f"Error: Large refresh scope ({scope['est_route_count']} route-runs). "
+                    f"Re-run with --confirm.",
+                )
+                raise SystemExit(1)
+        finally:
+            con.close()
+
+    def _refresh_one(trade_date: str):
+        con = get_connection()
+        try:
+            return run_refresh_pipeline(
+                con, trade_date,
+                ts_codes=ts_codes,
+                indicator_filter=indicator_filter,
+                do_export=getattr(args, "export", False),
+                dry_run=dry_run,
+                confirmed=getattr(args, "confirm", False),
+                export_path=args.output,
+                db_path=db_path,
+            )
+        finally:
+            con.close()
+
+    if len(dates) == 1:
+        if dry_run:
+            summary = _refresh_one(dates[0])
+            _print_refresh_summary(dates[0], summary)
+            return
+        con = get_connection()
+        try:
+            lid, t0 = log_etl_start(con, "cli_refresh")
+            try:
+                summary = _refresh_one(dates[0])
+                log_etl_end(
+                    con, lid, "cli_refresh", t0, "success",
+                    row_count=summary.get("calc", {}).get("calculated", 0),
+                    data_completeness={"analysis_date": dates[0], **summary},
+                )
+            except Exception:
+                log_etl_end(con, lid, "cli_refresh", t0, "failed")
+                raise
+        finally:
+            con.close()
+        _print_refresh_summary(dates[0], summary)
+        return
+
+    logger.info("refresh date range: %d days (%s → %s)", len(dates), dates[0], dates[-1])
+    summaries = {}
+    con = get_connection()
+    lid, t0 = log_etl_start(con, "cli_refresh_range")
+    try:
+        def _one(d):
+            summaries[d] = _refresh_one(d)
+
+        progress = run_date_range_loop(
+            dates, _one,
+            continue_on_error=getattr(args, "continue_on_error", False),
+            label="refresh",
+        )
+        log_etl_end(
+            con, lid, "cli_refresh_range", t0, "success",
+            row_count=len(progress["ok"]),
+            data_completeness={
+                "date_range_progress": {**progress, "summaries": {
+                    d: s.get("calc", {}) for d, s in summaries.items()
+                }},
+            },
+        )
+        print(f"refresh range complete: ok={len(progress['ok'])} failed={len(progress['failed'])}")
+        for d in progress["ok"]:
+            calc = summaries[d].get("calc", {})
+            print(f"  {d}: calculated={calc.get('calculated', 0)}")
+    except Exception:
+        log_etl_end(con, lid, "cli_refresh_range", t0, "failed")
+        raise
+    finally:
+        con.close()
+
+
+def _print_refresh_summary(date: str, summary: dict) -> None:
+    if summary.get("dry_run"):
+        scope = summary
+        print(
+            f"refresh dry-run: dates={scope['dates']} stocks={scope['n_stocks']} "
+            f"indicators={scope['indicators']} est_route_count={scope['est_route_count']}",
+        )
+        return
+    calc = summary.get("calc", {})
+    print(
+        f"refresh complete: date={date} calculated={calc.get('calculated', 0)} "
+        f"routes={calc.get('routes', [])}",
+    )
+    if summary.get("export"):
+        exp = summary["export"]
+        print(f"Exported {exp['row_count']} rows -> {exp['path']}")
 
 
 # ── backfill-state ──
@@ -765,7 +1065,114 @@ def cmd_status(_args):
 
 # ── main ──
 
+DEPRECATED_OPS_COMMANDS = frozenset({
+    "backfill-state",
+    "backfill-dde-meta",
+    "repair-dde-trend",
+    "refresh-state",
+    "prune",
+    "repair-weekly",
+})
+
+
+def _warn_deprecated_top_level(command: str) -> None:
+    warnings.warn(
+        f"Top-level '{command}' is deprecated; use "
+        f"'python -m backend.cli ops {command}'",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+
+def _add_backfill_state_args(p):
+    p.add_argument("--date", help="Calc date YYYYMMDD (default: today)")
+    p.add_argument("--ts-code", nargs="+", help="Stock codes (default: all active)")
+
+
+def _add_refresh_state_args(p):
+    p.add_argument("--date", help="updated_calc_date tag YYYYMMDD (default: today)")
+    p.add_argument("--ts-code", nargs="+", help="Stock codes (default: all active)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Compute diff only; do not write dws_calc_state")
+
+
+def _add_prune_args(p):
+    p.add_argument("--keep", type=int, default=5,
+                   help="Number of most recent calc runs to retain (default 5)")
+
+
+def _add_repair_weekly_args(p):
+    p.add_argument("--execute", action="store_true",
+                   help="Apply changes (default: dry-run preview only)")
+
+
+def _add_repair_dde_trend_args(p):
+    p.add_argument("--date", required=True, help="Calc date YYYYMMDD")
+    p.add_argument("--freq", choices=["daily", "weekly", "both"], default="daily")
+    p.add_argument("--ts-code", nargs="+")
+    p.add_argument("--dry-run", action="store_true")
+
+
+def _add_backfill_dde_meta_args(p):
+    p.add_argument("--date", help="End date YYYYMMDD (default: today)")
+    p.add_argument("--end", help="Alias for --date")
+    p.add_argument("--since", default="20230911", help="moneyflow_dc min date")
+    p.add_argument("--days", type=int, default=900, help="Calendar-day lookback")
+    p.add_argument("--ts-code", nargs="+", help="Stock subset (default: all active, excl BSE)")
+    p.add_argument("--dry-run", action="store_true",
+                     help="Count gaps only, no API/DWD writes")
+    p.add_argument("--sync-dwd", action="store_true",
+                     help="After ODS backfill, sync ODS→DWD")
+    p.add_argument("--sync-dwd-only", action="store_true",
+                     help="Skip ODS API; DWD sync only")
+    p.add_argument("--workers", type=int, default=3,
+                     help="Parallel day-chunk workers (default 3)")
+    p.add_argument("--sync-dwd-batch", type=int, default=50,
+                     help="DWD sync every N trading days (requires --sync-dwd)")
+    p.add_argument("--recalc", action="store_true",
+                     help="After ODS+DWD: refresh-state → invalidate dde weekly → calc")
+    p.add_argument("--recalc-only", action="store_true",
+                     help="Skip ODS API; DDE weekly recalc closure only")
+
+
+def _register_ops_subparsers(ops_sp):
+    p = ops_sp.add_parser(
+        "backfill-state",
+        help="Backfill dws_calc_state for stocks missing routing state",
+    )
+    _add_backfill_state_args(p)
+
+    p = ops_sp.add_parser(
+        "backfill-dde-meta",
+        help="Backfill net_amount_dc + circ_mv for B4 weekly DDE trend",
+    )
+    _add_backfill_dde_meta_args(p)
+
+    p = ops_sp.add_parser(
+        "repair-dde-trend",
+        help="Invalidate DDE trend routing+DWS and CALC_FORCE_HARD recalc",
+    )
+    _add_repair_dde_trend_args(p)
+
+    p = ops_sp.add_parser(
+        "refresh-state",
+        help="Realign calc state fingerprints with DWD tails (no DWS recalc)",
+    )
+    _add_refresh_state_args(p)
+
+    p = ops_sp.add_parser("prune", help="Prune superseded DWS snapshots")
+    _add_prune_args(p)
+
+    p = ops_sp.add_parser(
+        "repair-weekly",
+        help="Repair weekly data after date_trunc('week') fix",
+    )
+    _add_repair_weekly_args(p)
+
+
 def main():
+    from backend.cli_dates import add_date_range_arguments
+
     p = argparse.ArgumentParser(prog="tradeanalysis")
     sp = p.add_subparsers(dest="command")
 
@@ -794,9 +1201,9 @@ def main():
 
     # export
     xp = sp.add_parser("export", help="Export analysis wide table to Excel")
-    xp.add_argument("--date", required=True, help="Analysis date YYYYMMDD")
+    add_date_range_arguments(xp)
     xp.add_argument("--output", default=None,
-                    help="Output Excel path. Default: exports/analysis_{date}_gen{now}.xlsx")
+                    help="Output Excel path (single-day only; range uses per-day default)")
     xp.add_argument("--ts-code", nargs="+", help="Stock codes to export")
     xp.add_argument("--db-path")
     xp.add_argument("--include-st", action="store_true")
@@ -809,7 +1216,7 @@ def main():
 
     # run
     rp = sp.add_parser("run", help="One-command daily analysis: fetch → calc → export")
-    rp.add_argument("--date", help="Analysis date YYYYMMDD (default: today)")
+    add_date_range_arguments(rp)
     rp.add_argument("--ts-code", nargs="+", help="Stock codes (omitted = all stocks)")
     rp.add_argument("--output", default=None,
                     help="Output Excel path. Default: exports/analysis_{date}_gen{now}.xlsx")
@@ -820,70 +1227,71 @@ def main():
                     help="Force recalc even if calc_date already completed")
     rp.add_argument("--skip-export", action="store_true",
                     help="Skip Excel export (same-day rerun when report unchanged)")
+    rp.add_argument("--continue-on-error", action="store_true",
+                    help="With --from/--to: continue after a failed day (default: fail-fast)")
 
-    # backfill-state
+    # refresh
+    rfp = sp.add_parser(
+        "refresh",
+        help="Force recalc: fetch → DWD → FULL calc (R1); bypasses run idempotent skip",
+    )
+    add_date_range_arguments(rfp)
+    rfp.add_argument("--ts-code", nargs="+", help="Stock codes (default: all active)")
+    rfp.add_argument(
+        "--indicator",
+        help="Comma-separated indicators (macd,ma,...); default = all 12 routes",
+    )
+    rfp.add_argument("--export", action="store_true", help="Export Excel after calc")
+    rfp.add_argument("--dry-run", action="store_true",
+                     help="Print scope estimate only; no API or writes")
+    rfp.add_argument("--confirm", action="store_true",
+                     help="Confirm large-scope refresh (required above route threshold)")
+    rfp.add_argument("--output", default=None, help="Export path when --export")
+    rfp.add_argument("--db-path", help="DuckDB file path")
+    rfp.add_argument("--continue-on-error", action="store_true",
+                     help="With --from/--to: continue after a failed day")
+
+    # ops (maintenance)
+    ops_p = sp.add_parser("ops", help="Maintenance / backfill commands")
+    ops_sp = ops_p.add_subparsers(dest="ops_command")
+    _register_ops_subparsers(ops_sp)
+
+    # backfill-state (top-level alias — deprecated)
     bsp = sp.add_parser(
         "backfill-state",
         help="Backfill dws_calc_state for stocks missing append-routing state",
     )
-    bsp.add_argument("--date", help="Calc date YYYYMMDD (default: today)")
-    bsp.add_argument("--ts-code", nargs="+", help="Stock codes (default: all active)")
+    _add_backfill_state_args(bsp)
 
-    # backfill-dde-meta
+    # backfill-dde-meta (top-level alias — deprecated)
     bdm = sp.add_parser(
         "backfill-dde-meta",
         help="Backfill net_amount_dc + circ_mv for B4 weekly DDE trend (ops)",
     )
-    bdm.add_argument("--date", help="End date YYYYMMDD (default: today)")
-    bdm.add_argument("--end", help="Alias for --date")
-    bdm.add_argument("--since", default="20230911", help="moneyflow_dc min date")
-    bdm.add_argument("--days", type=int, default=900, help="Calendar-day lookback")
-    bdm.add_argument("--ts-code", nargs="+", help="Stock subset (default: all active, excl BSE)")
-    bdm.add_argument("--dry-run", action="store_true",
-                     help="Count gaps only, no API/DWD writes")
-    bdm.add_argument("--sync-dwd", action="store_true",
-                     help="After ODS backfill, sync ODS→DWD")
-    bdm.add_argument("--sync-dwd-only", action="store_true",
-                     help="Skip ODS API; DWD sync only")
-    bdm.add_argument("--workers", type=int, default=3,
-                     help="Parallel day-chunk workers (default 3; use 1 for debug)")
-    bdm.add_argument("--sync-dwd-batch", type=int, default=50,
-                     help="DWD sync every N completed trading days (0=end only; requires --sync-dwd)")
-    bdm.add_argument("--recalc", action="store_true",
-                     help="After ODS+DWD: refresh-state → invalidate dde weekly DWS → calc --force")
-    bdm.add_argument("--recalc-only", action="store_true",
-                     help="Skip ODS API; only run DDE weekly recalc closure (refresh+invalidate+calc)")
+    _add_backfill_dde_meta_args(bdm)
 
-    # repair-dde-trend
+    # repair-dde-trend (top-level alias — deprecated)
     rdt = sp.add_parser(
         "repair-dde-trend",
         help="Invalidate DDE trend routing+DWS and CALC_FORCE_HARD recalc",
     )
-    rdt.add_argument("--date", required=True, help="Calc date YYYYMMDD")
-    rdt.add_argument("--freq", choices=["daily", "weekly", "both"], default="daily")
-    rdt.add_argument("--ts-code", nargs="+")
-    rdt.add_argument("--dry-run", action="store_true")
+    _add_repair_dde_trend_args(rdt)
 
-    # prune
+    # prune (top-level alias — deprecated)
     pp = sp.add_parser("prune", help="Prune superseded DWS snapshots (keep last N runs)")
-    pp.add_argument("--keep", type=int, default=5,
-                    help="Number of most recent calc runs to retain (default 5; 1 = latest only)")
+    _add_prune_args(pp)
 
-    # repair-weekly
+    # repair-weekly (top-level alias — deprecated)
     rwp = sp.add_parser("repair-weekly",
                         help="Repair weekly data after date_trunc('week') fix (dry-run default)")
-    rwp.add_argument("--execute", action="store_true",
-                     help="Apply changes (default: dry-run preview only)")
+    _add_repair_weekly_args(rwp)
 
-    # refresh-state
+    # refresh-state (top-level alias — deprecated)
     rsp = sp.add_parser(
         "refresh-state",
         help="Realign calc state fingerprints with DWD tails (no DWS recalc)",
     )
-    rsp.add_argument("--date", help="updated_calc_date tag YYYYMMDD (default: today)")
-    rsp.add_argument("--ts-code", nargs="+", help="Stock codes (default: all active)")
-    rsp.add_argument("--dry-run", action="store_true",
-                     help="Compute diff only; do not write dws_calc_state")
+    _add_refresh_state_args(rsp)
 
     sp.add_parser("status", help="Show database table stats")
 
@@ -899,6 +1307,7 @@ def main():
         "calc": cmd_calc,
         "export": cmd_export,
         "run": cmd_run,
+        "refresh": cmd_refresh,
         "backfill-state": cmd_backfill_state,
         "backfill-dde-meta": cmd_backfill_dde_meta,
         "repair-dde-trend": cmd_repair_dde_trend,
@@ -908,6 +1317,18 @@ def main():
         "query": cmd_query,
         "status": cmd_status,
     }
+
+    if args.command == "ops":
+        handler = handlers.get(args.ops_command)
+        if handler:
+            handler(args)
+        else:
+            p.print_help()
+        return
+
+    if args.command in DEPRECATED_OPS_COMMANDS:
+        _warn_deprecated_top_level(args.command)
+
     handler = handlers.get(args.command)
     if handler:
         handler(args)

@@ -596,6 +596,37 @@ CREATE TABLE dws_macd_daily (
 
 **底背离 `bottom_divergence`**：绿柱区自最近死叉起对称——价创新低、DIF MDIF 未创新低、绿柱峰值回升（柱背），于 DIF MDIF 转向日 TG 写入。
 
+#### 6.2.1 结构背离三用与可交易门槛
+
+> **一存三用：** DWS `divergence` 列存 **L1 结构背离**（通达信 Level 2，不变）；消费层按场景分三用：
+>
+> | 用途 | 列/出口 | 说明 |
+> |------|---------|------|
+> | **对标** | Excel `MACD结构背离` / `DDE结构背离` | 与通达信 L2 对齐，保留隔峰/TG 滞后语义 |
+> | **交易** | Excel `MACD可交易背离` / `DDE可交易背离` | 三条硬门槛过滤后的 L2 消费层（export 时 enrich，不落 DWS） |
+> | **诊断** | Excel `MACD背离剔除` / `DDE背离剔除` | reject_reason：`隔峰` / `滞后` / `区域` |
+>
+> 实现：`backend/etl/divergence_tradable.py`；trace 元数据来自 `divergence_structure.trace_*_structure_events()`。
+
+**可交易三条硬门槛（`classify_tradable`）：**
+
+| 门槛 | 常量 | 规则 |
+|------|------|------|
+| 路径 | `path == direct` | 仅 T1/B1 直接峰，拒绝 T2/B2 隔峰（`skip_peak`） |
+| 时效 | `TRADABLE_TG_LAG_MAX = 1` | TG 距段内价极值 bar 数 ≤1（`tg_lag`） |
+| 区域 | 顶：`macd_bar>0` / `ddx>0`；底：`<0` | 标注日柱/DDX 与背离方向一致（`zone_mismatch`） |
+
+reject 优先级：`skip_peak` > `tg_lag` > `zone_mismatch`。L1 存在但 trace 无法复现 TG 时，fallback 保守剔除（见 `divergence_tradable._fallback_verdict`）。
+
+**日/周/DDE 定位：**
+
+- **周线可交易背离**：趋势/结构滤镜（慢变量）
+- **日线可交易背离**：执行参考（快变量）
+- **DDE 可交易背离**：辅信号；`.BJ` 无 moneyflow → N/A
+- **共振策略**（`combo_eval`）：默认 `use_tradable=True`，单结构背离不作交易依据；须 K 线形态 + 可交易背离等同向共振
+
+**Screening CLI：** `python -m scripts.screen_divergence_tradable --date YYYYMMDD [--freq daily|weekly] [--indicator macd|dde] [--tradable-only]`
+
 **各模块调用差异**：
 
 | 模块 | 实现函数 | 锚点/信号 | dedup | 备注 |
@@ -652,8 +683,21 @@ CREATE TABLE dws_ma_daily (
 | `tangle` | Layer 1：\|MA5-MA10\|/MA10 < **2.99%** 且近 10 日 MA5/MA10 交叉 ≥ **2** 次 |
 | `sideways` | Layer 2：\|ma5_slope\| 与 \|ma10_slope\| 均 < 0.08%/日（且非 tangle） |
 | `bull_strong` … `bear_rolling` | Layer 4：MA5 vs MA10 位置 × 双斜率方向（>0.08 上升，<-0.08 下降） |
-| Layer 3 fallback | 一走平一趋势：归入最近 8 类（如多头位 + s5↑ + s10平 → `bull_building`） |
+| Layer 3 fallback | 一走平一趋势：8 格显式查表（`MACalculator.SPEC_VERSION=v2`，2026-06-14 修复） |
 | NULL | MA5/MA10/斜率不可用（<11 bar、NaN） |
+
+**Layer 3 fallback 八格映射（v2）：**
+
+| 位置 | s5 | s10 | 结果 |
+|------|----|-----|------|
+| MA5>MA10 | up | flat | `bull_building` |
+| MA5>MA10 | flat | up | `bull_building` |
+| MA5>MA10 | dn | flat | `bull_weakening` |
+| MA5>MA10 | flat | dn | `bull_weakening` |
+| MA5<MA10 | dn | flat | `bear_building` |
+| MA5<MA10 | flat | up | `bear_building` |
+| MA5<MA10 | up | flat | `bear_weakening` |
+| MA5<MA10 | flat | dn | `bear_strong` |
 
 | DWS 存储 | MA5/MA10 | ma5_slope | ma10_slope | 交易含义 |
 |----------|:--------:|:---------:|:----------:|------|
@@ -1881,6 +1925,19 @@ CREATE INDEX idx_ods_moneyflow_date ON ods_moneyflow(trade_date);
 - **路由 `classify_calc_mode()`** — 无 state→FULL；强签名变（除权/填充/修正）→FULL；无新 bar 同签名→SKIP；有新 bar 同签名→APPEND。
 - **强签名 `state_signature()`** — 对 `last_td` 前**固定 245 根尾窗**的输入值序列（按各计算器 `SIGNATURE_COLS`）做 SHA256，替代弱的 min/max/mean 指纹；固定宽度保证跨运行稳定。误判方向只会多一次安全 FULL，绝不误 APPEND（新 bar 始终全窗重算）。
 - **APPEND `append_calculate()`** — 仅算/写新 bar；EMA/ddx2 `resolve_ema_seeds` 种子递推、Volume 迟滞 zone 种子、滚动类复用全尾窗算法。INSERT-only 不改写历史。与 FULL 逐值 `atol=1e-9` 等价（`tests/test_etl/test_append_calc.py`）。
+
+**Calc Spec Version 与 SKIP 不变量（2026-06-14）：**
+
+```
+允许 SKIP ⇔ input_fingerprint 同 AND spec_version 同 AND 无新 bar
+```
+
+- **双门禁：** `classify_calc_mode(..., expected_spec_version)`（路由层）与 `check_dwd_unchanged(..., expected_spec_version)`（per-stock calculate / batch_full `check_spec=True`）须同时生效。
+- **注册表：** `backend/etl/calc_indicators.INDICATOR_SPEC_VERSIONS` — 12 管线 `(indicator,freq) → Calculator.SPEC_VERSION`。
+- **禁止旁路：** `_modes_from_state_only` / `--force` 同日复跑短路 **不得**在 `dws_calc_state.spec_version` 落后时全 SKIP；`has_spec_stale_indicators()` 阻断整段 idempotent skip。
+- **运维刷新：** `cli calc --refresh-spec ma[,volume]` 或 spec 发布日 `CALC_FORCE_HARD=1 calc --force`（窄窗 FULL，**非** DWD rebuild）。Runbook：`docs/superpowers/plans/2026-06-09-daily-runbook.md`「算法 SPEC_VERSION 发布」。
+- **质检视图：** `v_dq_spec_freshness`（按指标/freq 统计 latest 截面 spec_ok/spec_stale）；`health_check` Section J。
+
 - **范围外后续项：** 端到端「秒级日更」仍受 ~320s 全市场 freshness-fetch 拖累，需单独立项。
 
 **P3 热路径优化（与全量 golden-master 等价）：**
@@ -2289,7 +2346,7 @@ WHERE calc_date = (
 
 ### 12.53 dws_ma.alignment NULL 语义明确
 
-> alignment 取 NULL 的唯一场景：MA5、MA10 或斜率不可用（<11 bar、NaN）。`sideways` 为独立枚举（双斜率 |s|<0.08%/日 且非 tangle）。「一走平一趋势」过渡态由 Layer 3 fallback 归入 8 方向类，不再 NULL。
+> alignment 取 NULL 的唯一场景：MA5、MA10 或斜率不可用（<11 bar、NaN）。`sideways` 为独立枚举（双斜率 |s|<0.08%/日 且非 tangle）。「一走平一趋势」过渡态由 Layer 3 **八格查表** fallback 归入 8 方向类（v2 映射见 §6.3 表），不再 NULL。
 
 ### 12.54 dim_date 补 is_year_end（Data Architect Review 未优化项）
 
