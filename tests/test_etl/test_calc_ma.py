@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import pytest
 from backend.etl.calc_ma import MACalculator, _compute_slope_pct
 from backend.etl.base import linear_regression_slope
 
@@ -298,11 +299,11 @@ def test_alignment_fallback_bull_building_s5_up_s10_flat():
     assert result[-1] == "bull_building", f"期望 bull_building，实际 {result[-1]}"
 
 
-def test_alignment_fallback_bull_strong_s5_flat_s10_up():
-    """一走平一趋势：MA5>MA10, s5走平, s10上行 → bull_strong。"""
+def test_alignment_fallback_bull_building_s5_flat_s10_up():
+    """一走平一趋势：MA5>MA10, s5走平, s10上行 → bull_building（非 bull_strong）。"""
     calc, df = _alignment_df(10.9, 10.8, 0.02, 0.25)
     result = calc._compute_alignment(df)
-    assert result[-1] == "bull_strong", f"期望 bull_strong，实际 {result[-1]}"
+    assert result[-1] == "bull_building", f"期望 bull_building，实际 {result[-1]}"
 
 
 def test_alignment_fallback_bull_weakening_s5_dn_s10_flat():
@@ -333,6 +334,52 @@ def test_alignment_fallback_bear_weakening_s5_up_s10_flat():
     assert result[-1] == "bear_weakening", f"期望 bear_weakening，实际 {result[-1]}"
 
 
+def test_alignment_fallback_bear_building_s5_flat_s10_up():
+    """一走平一趋势：MA5<MA10, s5走平, s10上行 → bear_building（301205 类）。"""
+    calc, df = _alignment_df(10.7, 10.9, 0.04, 0.25)
+    result = calc._compute_alignment(df)
+    assert result[-1] == "bear_building", f"期望 bear_building，实际 {result[-1]}"
+
+
+@pytest.mark.parametrize("above,ma5,ma10,s5,s10,expected", [
+    (True,  10.9, 10.8,  0.40, -0.01, "bull_building"),
+    (True,  10.9, 10.8,  0.02,  0.25, "bull_building"),
+    (True,  10.9, 10.8, -0.15,  0.03, "bull_weakening"),
+    (True,  10.9, 10.8,  0.02, -0.30, "bull_weakening"),
+    (False, 10.7, 10.9, -0.20, -0.02, "bear_building"),
+    (False, 10.7, 10.9,  0.04,  0.25, "bear_building"),
+    (False, 10.7, 10.9,  0.18,  0.04, "bear_weakening"),
+    (False, 10.7, 10.9,  0.01, -0.30, "bear_strong"),
+])
+def test_alignment_fallback_eight_cell_matrix(above, ma5, ma10, s5, s10, expected):
+    calc, df = _alignment_df(ma5, ma10, s5, s10)
+    result = calc._compute_alignment(df)
+    assert result[-1] == expected, f"期望 {expected}，实际 {result[-1]}"
+
+
+def test_alignment_regression_301205_dead_cross_day_pattern():
+    """301205 @ 20260612 类：急跌死叉日，s5近平 + s10上 → bear_building。"""
+    calc = MACalculator.__new__(MACalculator)
+    n = 20
+    ma5 = np.full(n, 334.0)
+    ma10 = np.full(n, 330.0)
+    ma5[-1] = 328.10
+    ma10[-1] = 329.71
+    s5 = np.full(n, 0.32)
+    s10 = np.full(n, 2.25)
+    s5[-1] = -0.06
+    df = pd.DataFrame({
+        "trade_date": [f"d{i}" for i in range(n)],
+        "close_qfq": ma5,
+        "ma_5": ma5,
+        "ma_10": ma10,
+        "ma5_slope": s5,
+        "ma10_slope": s10,
+    })
+    result = calc._compute_alignment(df)
+    assert result[-1] == "bear_building", f"301205 类场景期望 bear_building，实际 {result[-1]}"
+
+
 def test_alignment_fallback_does_not_override_existing_bull_strong():
     """回归：双明确上行仍 bull_strong，fallback 不得覆盖。"""
     calc = MACalculator.__new__(MACalculator)
@@ -342,6 +389,10 @@ def test_alignment_fallback_does_not_override_existing_bull_strong():
     result = calc._compute_indicators(df)
     valid = result["alignment"].dropna()
     assert (valid == "bull_strong").sum() > 0, f"双上行应仍有 bull_strong，实际 {valid.unique()}"
+
+
+def test_ma_calculator_spec_version_v2():
+    assert MACalculator.SPEC_VERSION == "v2"
 
 
 def test_ma5_slope_not_diff3_formula():
