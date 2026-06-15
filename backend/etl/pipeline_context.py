@@ -27,6 +27,7 @@ class PipelineContext:
         fetch_result,
         mode: str = "run",
         force_scope: bool = False,
+        force_recalc: bool = False,
         indicator_filter: Optional[List[str]] = None,
     ) -> "PipelineContext":
         from backend.etl.pipeline_context import coerce_fetch_result
@@ -34,7 +35,9 @@ class PipelineContext:
         fr = coerce_fetch_result(fetch_result)
         skip = False
         if mode == "run" and not force_scope:
-            skip = compute_skip_dwd_calc(con, analysis_date, ts_codes, fr)
+            skip = compute_skip_dwd_calc(
+                con, analysis_date, ts_codes, fr, force_recalc=force_recalc,
+            )
         ctx = cls(
             analysis_date=analysis_date,
             ts_codes=ts_codes,
@@ -71,8 +74,11 @@ def compute_skip_dwd_calc(
     analysis_date: str,
     ts_codes: List[str],
     fetch_result,
+    force_recalc: bool = False,
 ) -> bool:
     """True when run may skip DWD+calc (fetch still ran). P0-1A."""
+    if force_recalc:
+        return False
     fr = coerce_fetch_result(fetch_result)
     if fr.rows_written > 0:
         return False

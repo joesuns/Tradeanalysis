@@ -158,6 +158,20 @@ tushare API
 
 ## 3. ODS 层 — 原始贴源层
 
+### 3.0 ODS diff 浮点容差（分层定稿）
+
+ODS 写入前 `backend/fetch/ods_diff.py` 做 API vs DuckDB 行级比对；**容差与 DWS 等价性门禁分离**：
+
+| 层 | 常量 / 阈值 | 用途 |
+|----|-------------|------|
+| ODS diff（价格/比率） | `FLOAT_ABS_TOL = 1e-4` | 元、% 等字段；吸收 float32 存库 vs API roundtrip |
+| ODS diff（大数值） | `FLOAT_LARGE_ABS_TOL = 1.0`, `FLOAT_RTOL = 1e-5` | vol/amount/mv（手、万元）；按 scale 取 max |
+| DWS 等价性 | `atol = 1e-9` | append vs FULL、batch vs selective、Wave5 narrow vs full（pytest golden） |
+
+> ODS 层「未变更」≠ DWS 逐 bit 相等；DWS 门禁在 calc 路由与 golden 测试中单独锁定。
+
+**FetchResult 观测字段（`to_completeness()`）：** `changed_field_events_count`、`affected_ods_columns`（列名去重排序），供 `run_fetch` / `refresh_fetch` 审计。
+
 ### 3.1 ods_stock_basic
 
 ```sql

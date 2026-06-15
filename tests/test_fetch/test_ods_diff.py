@@ -1,4 +1,9 @@
-"""Tests for ODS row diff before INSERT."""
+"""Tests for ODS row diff before INSERT.
+
+Float tolerance layers (see data-model spec §3.0):
+- ODS diff: FLOAT_ABS_TOL=1e-4, FLOAT_LARGE_ABS_TOL=1.0, FLOAT_RTOL=1e-5 (ods_diff.py)
+- DWS equivalence: atol=1e-9 (append/FULL/narrow golden tests)
+"""
 import duckdb
 import pytest
 
@@ -162,6 +167,23 @@ def test_fetch_result_merge_field_events():
     )
     merged = a.merge(b)
     assert len(merged.changed_field_events) == 2
+
+
+def test_fetch_result_to_completeness_field_events():
+    fr = FetchResult(
+        api_rows=100,
+        rows_written=2,
+        rows_unchanged=98,
+        changed_pairs=[("000001.SZ", "20260612"), ("000002.SZ", "20260612")],
+        changed_field_events=[
+            ("000001.SZ", "20260612", "ods_daily_basic", "circ_mv", False),
+            ("000002.SZ", "20260612", "ods_daily", "vol", False),
+        ],
+    )
+    comp = fr.to_completeness()
+    assert comp["changed_field_events_count"] == 2
+    assert comp["affected_ods_columns"] == ["circ_mv", "vol"]
+    assert comp["changed_codes_count"] == 2
 
 
 def test_net_amount_dc_patch_emits_field_events(db_with_schema):

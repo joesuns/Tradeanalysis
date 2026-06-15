@@ -1,0 +1,22 @@
+/Users/joesun/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-06-15T18:25:00 INFO     [11f9431d][backend.etl.error_handler] ETL calc_refresh_spec — started
+2026-06-15T18:25:00 INFO     [11f9431d][backend.etl.calc_spec_refresh] refresh-spec: indicators=['ma'] stocks=1 groups=2
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.calc_batch_append] progress calc.batch_full: 开始 均线日线 | FULL=1
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.progress] progress calc.batch_full: 均线日线 开始 | 共1股
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.progress] progress calc.batch_full: 均线日线 | 1/1 (100%) | 0s | 212.5 股/s | 预计剩余 ~0s
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.progress] progress calc.batch_full: 均线日线 完成 | 0s | 写入行=0
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.calc_batch_append] progress calc.batch_full: 完成 均线日线 | 0s | FULL=1 写入=0
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.calc_batch_append] progress calc.batch_full: 开始 均线周线 | FULL=1
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.progress] progress calc.batch_full: 均线周线 开始 | 共1股
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.progress] progress calc.batch_full: 均线周线 | 1/1 (100%) | 0s | 235.4 股/s | 预计剩余 ~0s
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.progress] progress calc.batch_full: 均线周线 完成 | 0s | 写入行=0
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.calc_batch_append] progress calc.batch_full: 完成 均线周线 | 0s | FULL=1 写入=0
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.error_handler] ETL calc_refresh_spec: success (1452ms, 0 rows)
+2026-06-15T18:25:01 INFO     [11f9431d][backend.etl.calc_spec_refresh] refresh-spec done: calculated=0 full_by_indicator={'ma_daily': 1, 'ma_weekly': 1}
+2026-06-15T18:25:02 INFO     [11f9431d][backend.db.connection] WAL checkpoint done
+before state: [('daily', 'v2', 'a481dc7c30207692'), ('weekly', 'v2', 'a8538479b89ad104')]
+mocked 000001.SZ ma state -> v1
+after state: [('daily', 'v2'), ('weekly', 'v2')]
+calc_refresh_spec log: calc_refresh_spec rows= 0 {'calc_date': '20260612', 'refreshed': 2, 'full_by_indicator': {'ma_daily': 1, 'ma_weekly': 1}, 'calculated': 0}
+§3 calc --refresh-spec ma smoke OK

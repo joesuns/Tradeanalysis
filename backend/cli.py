@@ -149,8 +149,9 @@ def cmd_calc(args, skip_stale_fetch=False):
 
     Auto-fetches missing warmup + stale latest-day ODS before calculating.
     No --ts-code: calculate all active stocks.
+    With --refresh-spec: narrow FULL for indicators whose spec_version lags code.
     """
-    from backend.db.connection import get_connection
+    from backend.db.connection import get_connection, run_checkpoint
     from backend.etl.orchestrator import run_calc
 
     from backend.etl.calc_preflight_context import pop_run_calc_handoff, pop_run_preflight_context
@@ -161,7 +162,18 @@ def cmd_calc(args, skip_stale_fetch=False):
         if getattr(args, "date", None):
             calc_date = _ensure_trade_date(
                 con, _resolve_trade_date(con, args.date))
+        elif getattr(args, "refresh_spec", None):
+            calc_date = _ensure_trade_date(con, _resolve_trade_date(con, None))
         ts_codes = args.ts_code if args.ts_code else None
+
+        refresh_spec = getattr(args, "refresh_spec", None)
+        if refresh_spec:
+            from backend.etl.calc_spec_refresh import cmd_refresh_spec
+
+            cmd_refresh_spec(con, calc_date, refresh_spec, ts_codes)
+            run_checkpoint(con)
+            return
+
         preflight_ctx = pop_run_preflight_context()
         calc_handoff = pop_run_calc_handoff()
         indicator_filter = (
@@ -367,6 +379,7 @@ def _cmd_run_single_day(args, date: str):
         fetch_result = coerce_fetch_result(fetch_result)
         pipeline_ctx = PipelineContext.from_fetch(
             con, date, codes, fetch_result, mode="run",
+            force_recalc=getattr(args, "force", False),
         )
         skip_dwd_calc = pipeline_ctx.skip_dwd_calc
         logger.info(
@@ -1198,6 +1211,11 @@ def main():
                     help="Stock codes to calculate (omitted = all stocks)")
     cp.add_argument("--force", action="store_true",
                     help="Recalculate even if calc_date already completed")
+    cp.add_argument(
+        "--refresh-spec",
+        metavar="INDICATORS",
+        help="Narrow FULL for stale spec_version only (e.g. ma or ma,volume); skips run_calc",
+    )
 
     # export
     xp = sp.add_parser("export", help="Export analysis wide table to Excel")
