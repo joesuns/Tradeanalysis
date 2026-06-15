@@ -199,7 +199,8 @@ run（一站式入口）→ fetch（当日 ODS）→ rebuild DWD → calc → ex
 
 run 分步短连接：解析 dim_date → fetch+rebuild → **refresh-state（条件）** → calc（skip_stale_fetch）→ export。
 calc/export 共用同一 analysis_date（`--date`）；calc 收尾 run_checkpoint。
-- **同日复跑快路径：** Step 1 fetch 若 0 rows 且 `find_stale_dwd_codes` 空 → **跳过 rebuild**；Step 2 calc 幂等闸门秒退；`--skip-export` 跳过 Excel。运维：仅需 Excel 时用 `cli export --date X`。
+- **同日复跑快路径（L0 pipeline_shortcut）：** fetch 0 diff + 无 stale DWD + 已有 prior calc → **跳过 DWD+calc**，仍 export。`run_rebuild_dwd.data_completeness.pipeline_shortcut=true`。**`run --force` 穿透 L0**（仍 fetch；DWD 仅 `changed∪stale` 窄重建，禁止全库 rebuild；calc 走 `run_calc(force=True)`）。验收：`tests/test_etl/test_column_narrow_equivalence.py`（Wave5 narrow vs full，`atol=1e-9`）。
+- **同日复跑快路径（续）：** Step 1 fetch 若 0 rows 且 `find_stale_dwd_codes` 空 → **跳过 rebuild**；无 force 时 Step 2 calc 幂等秒退；`--skip-export` 跳过 Excel。运维：仅需 Excel 时用 `cli export --date X`。
 - **新日 DWD 增量（`DWD_INCREMENTAL=1` 默认）：** stale 子集走 `rebuild_dwd_for_stale` → `rebuild_dwd_incremental`（`n_fetch>0` 与 `n_fetch==0` 同路径）；`find_stale_dwd_codes` 比对 daily/weekly/moneyflow 三张 DWD（moneyflow 仅当 ODS 有当日资金流）。**禁止日常全库 rebuild**（`rebuild_all_dwd` 无 `ts_codes` 仅限运维/首次建库）。`=0` 回退 stale 子集全量 `rebuild_all_dwd`。calc G3 / auto-fetch 亦走 `rebuild_dwd_for_stale`。
   - **daily 三分支：** adj 变 / qfq 漂移 → `refresh_qfq_prices` SQL **UPDATE** 四列 `open/high/low/close_qfq`（非 DELETE）；无 DWD 历史（新股）→ 全量 `build_dwd_daily_quote`；其余 tail 股 → 仅 `trade_date` 当日 INSERT（`mode=tail=`）
   - **weekly 双路径：** tail 股 → `mode=week=` 仅删/插含 `trade_date` 的周分区（`dwd_weekly_sql`）；qfq/insert 股 → 该股 full weekly rebuild
@@ -225,6 +226,7 @@ fetch（数据拉取层）
 
 calc（计算层）
 ├── `--date` 指定 analysis_date（默认 today），与 export/run 对齐
+├── **`--refresh-spec ma[,volume]`** — 仅 `find_spec_stale_codes` 子集窄窗 FULL；**不走** `run_calc` 全路由、**不 rebuild DWD**。与 `cli refresh --indicator` 分工：refresh=全链路 R1（fetch→DWD→calc）；refresh-spec=轻量 spec 运维（见 runbook「算法 SPEC_VERSION 发布」）
 ├── 退市股过滤：delist_date < calc_date 且 DWS 已有 → 跳过
 ├── G1 warmup：`check_data_completeness()` — calc 准入 `dwd_rows≥250`；成熟股 `week_end_bars`（120 周窗口内）不足 → `weekly_fetch` 仅 fetch 不拦 calc
 ├── G2 fresh：find_stale_ods_codes() — ODS max < calc_date → date/stock-batched 补 tail（run 内 skip）

@@ -91,6 +91,15 @@ def test_compute_skip_dwd_calc_false_when_rows_written():
     con.close()
 
 
+def test_compute_skip_dwd_calc_false_when_force_recalc():
+    """run --force 穿透 L0 pipeline shortcut。"""
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    fr = FetchResult(rows_written=0, rows_unchanged=5000)
+    assert compute_skip_dwd_calc(con, "20260612", ["A.SZ"], fr, force_recalc=True) is False
+    con.close()
+
+
 def test_pipeline_context_from_fetch_marks_shortcut():
     con = duckdb.connect(":memory:")
     create_all_tables(con)

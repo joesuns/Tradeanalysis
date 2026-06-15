@@ -1,0 +1,19 @@
+/Users/joesun/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-06-15T18:10:00 INFO     [8813b01f][__main__] === Step 1/3: Fetching market data for 20260612 ===
+2026-06-15T18:10:00 INFO     [8813b01f][backend.etl.error_handler] ETL run_fetch — started
+2026-06-15T18:10:00 INFO     [8813b01f][backend.etl.progress] progress fetch.ods: started | total=1 days | threads=3 range=20260612~20260612 stocks=(5524 stocks)
+2026-06-15T18:10:02 INFO     [-][backend.etl.progress] progress fetch.ods: 1/1 (100%) | 3s | 0.4 days/s | ETA ~0s
+2026-06-15T18:10:02 INFO     [8813b01f][backend.etl.progress] progress fetch.ods: done | 3s | rows=0 days=1
+2026-06-15T18:10:02 INFO     [8813b01f][backend.fetch.ods_daily] ODS fetch complete: api=21738 written=0 unchanged=16209 in 3s (23.6 days/min)
+2026-06-15T18:10:02 INFO     [8813b01f][__main__] Fetch complete: written=0 unchanged=16209 for 20260612
+2026-06-15T18:10:02 INFO     [8813b01f][backend.etl.error_handler] ETL run_fetch: success (2556ms, 0 rows)
+2026-06-15T18:10:02 INFO     [8813b01f][backend.etl.error_handler] ETL run_rebuild_dwd — started
+2026-06-15T18:10:03 INFO     [8813b01f][__main__] DWD fresh for 20260612 — skip rebuild (5524 stocks checked)
+2026-06-15T18:10:03 INFO     [8813b01f][backend.etl.error_handler] ETL run_rebuild_dwd: success (1004ms, 0 rows)
+2026-06-15T18:10:04 INFO     [8813b01f][__main__] === Step 2/3: Computing indicators for 20260612 ===
+2026-06-15T18:10:05 INFO     [8813b01f][backend.etl.error_handler] ETL calc_dws — started
+2026-06-15T18:10:05 INFO     [8813b01f][backend.etl.error_handler] ETL calc_dws: success (0ms, 0 rows)
+2026-06-15T18:10:05 INFO     [8813b01f][backend.etl.orchestrator] calc force same-day skip: 20260612 unchanged since last calc (set CALC_FORCE_HARD=1 to force recalc)
+2026-06-15T18:10:06 INFO     [8813b01f][__main__] Skipping export (--skip-export)
+2026-06-15T18:10:06 INFO     [8813b01f][__main__] Done.

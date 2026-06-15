@@ -67,9 +67,12 @@ class FetchResult:
         return len(self.changed_codes)
 
     def to_completeness(self) -> dict:
+        affected_cols = sorted({ev[3] for ev in self.changed_field_events})
         return {
             "ods_api_rows": self.api_rows,
             "ods_rows_written": self.rows_written,
             "ods_rows_unchanged": self.rows_unchanged,
             "changed_codes_count": self.changed_codes_count,
+            "changed_field_events_count": len(self.changed_field_events),
+            "affected_ods_columns": affected_cols,
         }

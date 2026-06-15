@@ -488,6 +488,56 @@ def test_cmd_run_pipeline_shortcut_skips_dwd_and_calc(monkeypatch):
     assert logged_steps[2][2] == 99
 
 
+def test_cmd_run_force_bypasses_pipeline_shortcut(monkeypatch):
+    """run --force: 0 ODS diff 仍进入 calc（L0 不短路），DWD 无 stale 时可跳过 rebuild。"""
+    import argparse
+    from backend import cli
+
+    calc_calls = []
+    rebuild_calls = []
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
+    monkeypatch.setattr(
+        "backend.fetch.ods_daily.fetch_by_date_range_parallel",
+        lambda *a, **k: _fr(0, rows_unchanged=5000, api_rows=5000),
+    )
+    monkeypatch.setattr("backend.etl.calc_gate.has_prior_calc_snapshot", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "backend.etl.calc_spec_gate.has_spec_stale_indicators", lambda *a, **k: False,
+    )
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "backend.etl.build_dwd.find_stocks_needing_qfq_refresh", lambda *a, **k: [],
+    )
+    monkeypatch.setattr(
+        "backend.etl.build_dwd.rebuild_dwd_for_stale",
+        lambda *a, **k: rebuild_calls.append(True) or {},
+    )
+
+    def fake_calc(_args, skip_stale_fetch=False):
+        calc_calls.append({"force": getattr(_args, "force", False), "skip_stale_fetch": skip_stale_fetch})
+
+    monkeypatch.setattr(cli, "cmd_calc", fake_calc)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: _export(1))
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260605", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=True, skip_export=False,
+    )
+    cli.cmd_run(args)
+
+    assert len(calc_calls) == 1
+    assert calc_calls[0]["force"] is True
+    assert calc_calls[0]["skip_stale_fetch"] is True
+    assert rebuild_calls == []
+
+
 def test_cmd_run_skip_export(monkeypatch):
     """--skip-export → 不调用 export_wide_to_excel。"""
     import argparse
@@ -654,3 +704,40 @@ def test_cmd_run_sets_preflight_context(monkeypatch):
     assert ctx.source == "refresh_state"
     assert "B.SZ" in ctx.stock_modes
     assert pop_run_preflight_context() is None
+
+
+def test_cmd_calc_refresh_spec_bypasses_run_calc(monkeypatch):
+    """--refresh-spec 走 cmd_refresh_spec，不调用 run_calc。"""
+    import argparse
+    from backend import cli
+
+    refresh_calls = []
+    run_calc_calls = []
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr(
+        cli, "_ensure_trade_date", lambda con, d: d or "20260612",
+    )
+    monkeypatch.setattr(
+        cli, "_resolve_trade_date", lambda con, d: d or "20260612",
+    )
+    monkeypatch.setattr(
+        "backend.etl.calc_spec_refresh.cmd_refresh_spec",
+        lambda con, calc_date, spec, ts_codes: refresh_calls.append(
+            (calc_date, spec, ts_codes),
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.etl.orchestrator.run_calc",
+        lambda *a, **k: run_calc_calls.append(True),
+    )
+    monkeypatch.setattr("backend.db.connection.run_checkpoint", lambda con: None)
+
+    args = argparse.Namespace(
+        date="20260612", ts_code=["000001.SZ"], force=False,
+        refresh_spec="ma,volume",
+    )
+    cli.cmd_calc(args)
+
+    assert refresh_calls == [("20260612", "ma,volume", ["000001.SZ"])]
+    assert run_calc_calls == []

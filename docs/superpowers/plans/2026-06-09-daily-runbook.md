@@ -37,6 +37,7 @@
 | 步骤 | 命令 | 验收 |
 |------|------|------|
 | 1 窄指标刷新（推荐） | `python3 -m backend.cli calc --date YYYYMMDD --refresh-spec ma` | `v_dq_spec_freshness` ma spec_stale=0 |
+| 1b 全链路 R1（含 fetch/DWD） | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | 同上 + ODS/DWD 审计 log |
 | 2 或全 calc HARD | `CALC_FORCE_HARD=1 python3 -m backend.cli calc --date YYYYMMDD --force` | 同上 |
 | 3 语义审计（MA） | `python3 -m scripts.audit_ma_alignment_fallback` | 前两项 = 0 |
 | 4 重导 Excel | `python3 -m backend.cli export --date YYYYMMDD` | export 在 calc **之后** |
@@ -55,6 +56,8 @@
 | 仅重新导出 Excel | `python -m backend.cli export --date YYYYMMDD` |
 
 同日复跑预期：fetch 0 行 → 跳过 rebuild；calc 幂等秒退；export 最快。
+
+**`run --force`（运维例外）：** 穿透 L0 `pipeline_shortcut`，同 day 0 ODS diff 仍进入 calc；DWD 仍仅 `changed∪stale` 窄重建。非日常命令。
 
 ## 验收 grep（日志 / progress）
 
