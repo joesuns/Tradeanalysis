@@ -11,10 +11,19 @@ _MUTATING_ETL_STEPS = (
     "cli_fetch",
     "fetch_market_data",
     "run_fetch",
+    "refresh_fetch",
     "build_dwd",
     "run_rebuild_dwd",
+    "refresh_rebuild_dwd",
     "run_refresh_state",
+    "refresh_refresh_state",
 )
+
+_FETCH_STEPS = frozenset({
+    "cli_fetch", "fetch_market_data", "run_fetch", "refresh_fetch",
+})
+_REBUILD_STEPS = frozenset({"build_dwd", "run_rebuild_dwd"})
+_REFRESH_STATE_STEPS = frozenset({"run_refresh_state"})
 
 
 def get_ods_max_trade_date(con) -> Optional[str]:
@@ -96,6 +105,27 @@ def has_prior_calc_snapshot(con, calc_date: str) -> bool:
     return n >= 4000
 
 
+def _step_caused_data_mutation(step_name: str, row_count: int, comp: Dict[str, Any]) -> bool:
+    """True when an ETL log step actually changed data (not compare-only fetch)."""
+    if step_name in _FETCH_STEPS:
+        if "ods_rows_written" in comp or "changed_codes_count" in comp:
+            written = int(comp.get("ods_rows_written") or 0)
+            changed = int(comp.get("changed_codes_count") or 0)
+            return written > 0 or changed > 0
+        return row_count > 0
+
+    if step_name in _REBUILD_STEPS:
+        if comp.get("skipped") is True or comp.get("pipeline_shortcut") is True:
+            return False
+        return row_count > 0
+
+    if step_name in _REFRESH_STATE_STEPS:
+        records = int(comp.get("records_written") or 0)
+        return records > 0 or row_count > 0
+
+    return row_count > 0
+
+
 def data_mutated_since_last_calc(con, calc_date: str) -> bool:
     """True when ODS tail or fetch/rebuild ran after the last calc for calc_date."""
     last = get_last_calc_log(con, calc_date)
@@ -107,9 +137,15 @@ def data_mutated_since_last_calc(con, calc_date: str) -> bool:
         return True
     started_at = last["started_at"]
     placeholders = ",".join(["?"] * len(_MUTATING_ETL_STEPS))
-    n = con.execute(f"""
-        SELECT COUNT(*) FROM ods_etl_log
+    rows = con.execute(f"""
+        SELECT step_name, row_count, data_completeness
+        FROM ods_etl_log
         WHERE started_at > ? AND status = 'success'
           AND step_name IN ({placeholders})
-    """, [started_at, *_MUTATING_ETL_STEPS]).fetchone()[0]
-    return n > 0
+        ORDER BY started_at
+    """, [started_at, *_MUTATING_ETL_STEPS]).fetchall()
+    for step_name, row_count, raw_comp in rows:
+        comp = _parse_calc_completeness(raw_comp)
+        if _step_caused_data_mutation(step_name, int(row_count or 0), comp):
+            return True
+    return False

@@ -122,7 +122,7 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
                 start or "20150101", end or "20991231", workers=3,
                 ts_codes=codes, con=con)
             log_etl_end(con, lid, "fetch_market_data", t0, "success",
-                        row_count=rows,
+                        row_count=int(rows),
                         min_trade_date=start, max_trade_date=end)
 
             # Concept detail LAST — per-stock calls, low priority, skip on failure
@@ -574,7 +574,7 @@ def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str) -> in
         lambda: rebuild_dwd_for_stale(con, stale_codes, analysis_date),
         stocks=len(stale_codes),
     )
-    return n_fetched
+    return int(n_fetched)
 
 
 def _compute_fetch_range(con, ts_code: str, calc_date: str,
@@ -1318,6 +1318,10 @@ def _should_skip_calc_idempotent(
             stale = find_stale_ods_codes(con, get_all_active_codes(con), calc_date)
             if stale:
                 return False
+
+    from backend.etl.calc_spec_gate import has_spec_stale_indicators
+    if has_spec_stale_indicators(con):
+        return False
     return True
 
 
@@ -1523,11 +1527,11 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                             client, con, bucket_codes,
                             start=seg_start, end=seg_end)
                     logger.info(
-                        "progress calc.auto_fetch: bucket done | rows=%d", rows,
+                        "progress calc.auto_fetch: bucket done | rows=%d", int(rows),
                     )
                     attempted_codes.update(bucket_codes)
-                    if rows > 0:
-                        n_fetched += rows
+                    if int(rows) > 0:
+                        n_fetched += int(rows)
                         consecutive_errors = 0
                 except Exception as e:
                     attempted_codes.update(bucket_codes)

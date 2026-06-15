@@ -36,6 +36,25 @@ python -m backend.cli run                        # 全市场，最近交易日
 python -m backend.cli run --date 20260605              # 同日复跑（rebuild 可能跳过）
 python -m backend.cli run --date 20260605 --skip-export  # 同日复跑不导 Excel
 
+# ===== 强制重算（refresh R1）=====
+python -m backend.cli refresh --date 20260612                    # 12 路由全 FULL
+python -m backend.cli refresh --date 20260612 --indicator ma     # 仅 ma 日+周
+python -m backend.cli refresh --from 20260610 --to 20260612 --dry-run  # 范围规模预估
+python -m backend.cli refresh --date 20260612 --export           # 重算后导 Excel
+
+# ===== 日期范围（run / export / refresh 共用 --from/--to，与 --date 互斥）=====
+python -m backend.cli run --from 20260610 --to 20260612
+python -m backend.cli export --from 20260610 --to 20260612       # 多文件 exports/analysis_{date}_*.xlsx
+python -m backend.cli run --from 20260610 --to 20260612 --continue-on-error  # 失败继续
+
+# ===== 运维 ops（顶层命令仍可用，会 DeprecationWarning）=====
+python -m backend.cli ops refresh-state --date 20260609
+python -m backend.cli ops backfill-state --date 20260608
+python -m backend.cli ops prune --keep 1
+python -m backend.cli ops repair-weekly --execute
+python -m backend.cli ops backfill-dde-meta --sync-dwd --recalc
+python -m backend.cli ops repair-dde-trend --date 20260612
+
 # ===== 数据拉取 =====
 python -m backend.cli fetch                        # 全市场增量拉取
 python -m backend.cli fetch --ts-code 000543.SZ 600580.SH  # 指定股票

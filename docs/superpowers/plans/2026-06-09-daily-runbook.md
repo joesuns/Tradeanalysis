@@ -8,20 +8,42 @@
 |------|------|
 | 标准日更 | `python -m backend.cli run --date YYYYMMDD` |
 | 指定最近交易日（默认 today） | `python -m backend.cli run` |
+| 同 day 仅导 Excel（不重算） | `python -m backend.cli export --date YYYYMMDD` |
+| 强制重算（不信检测 / spec 发版 / 修史） | `python -m backend.cli refresh --date YYYYMMDD [--indicator ma]` |
+| 历史范围 repair | `python -m backend.cli refresh --from A --to B --confirm` |
 
-`run` = fetch → rebuild DWD → calc → export（可用 `--skip-export` 跳过 Excel）。
+`run` = fetch → rebuild DWD → calc → export（可用 `--skip-export` 跳过 Excel）。**同 day 无 ODS 变更时** `run` 仍 fetch 比对，但可 skip DWD+calc（`pipeline_shortcut`），此时用 `export` 最快。
+
+**运维命令** 推荐 `python -m backend.cli ops <subcmd>`（顶层 `prune`/`refresh-state` 等仍可用，会 DeprecationWarning）。
 
 ## 禁止事项
 
 | 禁止 | 原因 |
 |------|------|
-| `CALC_FORCE_HARD=1` | 绕过幂等/批处理短路，人为全量重算 |
+| `CALC_FORCE_HARD=1` | 绕过幂等/批处理短路，人为全量重算（**spec 发布日除外**，见下节） |
 | `DWD_INCREMENTAL=0` | 回退全量 DWD rebuild，破坏增量路径 |
 | 日常无 `ts_codes` 全库 `rebuild_all_dwd` | 毒化 `history_fp`，导致 `chunk≈全市场` |
 | SLA 验收前全市场 DWD rebuild | 同上；验收用读库 `benchmark_run` 或真新日 `--run` |
 | 日常 `--force` calc/run | 同日复跑应走幂等快路径，非 FORCE 全量 |
 
 运维例外：除权/adj 回填后若未触发 fetch，需显式 `fetch` + `calc --force`（非日常）。
+
+## 算法 SPEC_VERSION 发布（运维例外）
+
+当 `Calculator.SPEC_VERSION` bump（算法/口径升级，DWD 输入未变）时，日常 `run/calc` **不会**自动刷新存量 DWS——须显式运维刷新。
+
+| 步骤 | 命令 | 验收 |
+|------|------|------|
+| 1 窄指标刷新（推荐） | `python3 -m backend.cli calc --date YYYYMMDD --refresh-spec ma` | `v_dq_spec_freshness` ma spec_stale=0 |
+| 2 或全 calc HARD | `CALC_FORCE_HARD=1 python3 -m backend.cli calc --date YYYYMMDD --force` | 同上 |
+| 3 语义审计（MA） | `python3 -m scripts.audit_ma_alignment_fallback` | 前两项 = 0 |
+| 4 重导 Excel | `python3 -m backend.cli export --date YYYYMMDD` | export 在 calc **之后** |
+
+**允许 `CALC_FORCE_HARD=1` 的场景：** spec 发布日、Gate 3 验收；**日常禁止**。
+
+**语义澄清：** `calc --date` = DWS 快照批次 `calc_date`；`export --date` = Excel 锚定 **trade_date** 截面（读 `v_*_latest`）。
+
+**PR checklist：** bump spec → pytest → refresh-spec/HARD calc → audit → export → health_check Section J。
 
 ## 同日复跑
 

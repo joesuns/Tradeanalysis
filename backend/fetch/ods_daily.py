@@ -13,6 +13,12 @@ from backend.config import DUCKDB_PATH
 import duckdb
 
 from backend.etl.progress import day_progress, stock_progress
+from backend.fetch.fetch_result import FetchResult
+from backend.fetch.ods_diff import (
+    partition_changed_daily,
+    partition_changed_daily_basic,
+    partition_changed_moneyflow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +131,72 @@ def _insert_ods_moneyflow(con, df, register_name: str = "_mf_batch"):
         SELECT {cols}, now() FROM {register_name}
     """)
     con.unregister(register_name)
+
+
+def _merge_fetch_partial(total: FetchResult, partial: FetchResult) -> FetchResult:
+    return total.merge(partial)
+
+
+def _write_ods_daily_diff(con, daily_data: list, register_name: str = "_daily_batch") -> FetchResult:
+    import pandas as pd
+
+    if not daily_data:
+        return FetchResult.empty()
+    changed, unchanged = partition_changed_daily(con, daily_data)
+    pairs = [(r["ts_code"], r["trade_date"]) for r in changed]
+    if changed:
+        df = pd.DataFrame(changed)
+        con.register(register_name, df)
+        con.execute("""
+            INSERT OR REPLACE INTO ods_daily
+            (ts_code, trade_date, open, high, low, close,
+             vol, amount, pct_chg, adj_factor, fetched_at)
+            SELECT ts_code, trade_date, open, high, low, close,
+                   vol, amount, pct_chg, adj_factor, now()
+            FROM """ + register_name)
+        con.unregister(register_name)
+    return FetchResult(
+        api_rows=len(daily_data),
+        rows_written=len(changed),
+        rows_unchanged=unchanged,
+        changed_pairs=pairs,
+    )
+
+
+def _write_ods_daily_basic_diff(con, basic_data: list, register_name: str = "_basic_batch") -> FetchResult:
+    import pandas as pd
+
+    if not basic_data:
+        return FetchResult.empty()
+    changed, unchanged = partition_changed_daily_basic(con, basic_data)
+    pairs = [(r["ts_code"], r["trade_date"]) for r in changed]
+    if changed:
+        df = pd.DataFrame(changed)
+        _insert_ods_daily_basic(con, df, register_name)
+    return FetchResult(
+        api_rows=len(basic_data),
+        rows_written=len(changed),
+        rows_unchanged=unchanged,
+        changed_pairs=pairs,
+    )
+
+
+def _write_ods_moneyflow_diff(con, mf_data: list, register_name: str = "_mf_batch") -> FetchResult:
+    import pandas as pd
+
+    if not mf_data:
+        return FetchResult.empty()
+    changed, unchanged = partition_changed_moneyflow(con, mf_data)
+    pairs = [(r["ts_code"], r["trade_date"]) for r in changed]
+    if changed:
+        df = pd.DataFrame(changed)
+        _insert_ods_moneyflow(con, df, register_name)
+    return FetchResult(
+        api_rows=len(mf_data),
+        rows_written=len(changed),
+        rows_unchanged=unchanged,
+        changed_pairs=pairs,
+    )
 
 
 def _apply_net_amount_dc_patch(con, df, register_name: str = "_dc_patch") -> int:
@@ -271,34 +343,34 @@ def _backfill_circ_mv_by_date(
 
 
 def fetch_by_date_range(client, con, start: str, end: str,
-                        ts_codes: list[str] = None) -> int:
+                        ts_codes: list[str] = None,
+                        skip_covered: bool = True) -> FetchResult:
     """Fetch daily + daily_basic + moneyflow for all stocks, batched by trade_date.
 
-    Returns total rows written across all three ODS tables.
-    Incremental: per-target-stock when ts_codes set (or auto-resolved from dim).
+    Returns FetchResult. Incremental skip when skip_covered=True (default).
     """
     import time
     if ts_codes is None and con is not None:
         ts_codes = get_all_active_codes(con)
-    days = _get_trading_days(client, start, end, con=con, ts_codes=ts_codes)
+    days = _get_trading_days(
+        client, start, end, con=con, ts_codes=ts_codes, skip_covered=skip_covered,
+    )
     if not days:
         logger.info("All dates already in DB — nothing to fetch (%s~%s)", start, end)
-        return 0
+        return FetchResult.empty()
     prog = day_progress("fetch.ods", len(days))
     prog.log_start(range=f"{start}~{end}")
 
     t0 = time.time()
-    total = 0
+    total = FetchResult.empty()
     failed_dates = []
     for trade_date in days:
         try:
-            import pandas as pd
             # 0. Fetch adj_factor FIRST — build lookup for daily INSERT
             adj_recs = client.call("adj_factor", trade_date=trade_date)
             adj_map = {a["ts_code"]: a.get("adj_factor") for a in adj_recs}
-            total += len(adj_recs)
 
-            # 1. Daily OHLCV — bulk INSERT via register + SELECT
+            # 1. Daily OHLCV — diff then bulk INSERT
             recs = client.call("daily", trade_date=trade_date)
             recs, _ = _validate_ods_batch(recs, "daily", trade_date)
             daily_data = [{"ts_code": r["ts_code"],
@@ -307,34 +379,26 @@ def fetch_by_date_range(client, con, start: str, end: str,
                 "vol": r["vol"], "amount": r["amount"],
                 "pct_chg": r["pct_chg"],
                 "adj_factor": adj_map.get(r["ts_code"])} for r in recs]
-            if daily_data:
-                df = pd.DataFrame(daily_data)
-                con.register("_daily_batch", df)
-                con.execute("""INSERT OR REPLACE INTO ods_daily
-                    (ts_code, trade_date, open, high, low, close,
-                     vol, amount, pct_chg, adj_factor, fetched_at)
-                    SELECT ts_code, trade_date, open, high, low, close,
-                           vol, amount, pct_chg, adj_factor, now()
-                    FROM _daily_batch""")
-                con.unregister("_daily_batch")
-                total += len(daily_data)
+            day_result = FetchResult(api_rows=len(adj_recs))
+            day_result = _merge_fetch_partial(
+                day_result, _write_ods_daily_diff(con, daily_data),
+            )
 
-            # 2. Daily basic — bulk INSERT via register + SELECT
+            # 2. Daily basic
             recs = client.call("daily_basic", trade_date=trade_date)
             basic_data = [_daily_basic_record(r) for r in recs]
-            if basic_data:
-                df = pd.DataFrame(basic_data)
-                _insert_ods_daily_basic(con, df)
-                total += len(basic_data)
+            day_result = _merge_fetch_partial(
+                day_result, _write_ods_daily_basic_diff(con, basic_data),
+            )
 
-            # 3. Moneyflow — bulk INSERT via register + SELECT
+            # 3. Moneyflow
             recs = client.call("moneyflow", trade_date=trade_date)
             mf_data = [_moneyflow_record(r) for r in recs]
             mf_data = _attach_moneyflow_dc(client, trade_date, mf_data)
-            if mf_data:
-                df = pd.DataFrame(mf_data)
-                _insert_ods_moneyflow(con, df)
-                total += len(mf_data)
+            day_result = _merge_fetch_partial(
+                day_result, _write_ods_moneyflow_diff(con, mf_data),
+            )
+            total = _merge_fetch_partial(total, day_result)
 
         except Exception:
             failed_dates.append(trade_date)
@@ -348,9 +412,12 @@ def fetch_by_date_range(client, con, start: str, end: str,
         logger.warning("fetch_by_date_range: %d/%d dates failed: %s",
                        len(failed_dates), len(days) if days else 0, display)
     elapsed = time.time() - t0
-    prog.log_done(rows=total, days=len(days))
-    logger.info("ODS fetch complete: %d rows in %.0fs (%.1f days/min)",
-                total, elapsed, len(days) / elapsed * 60 if elapsed > 0 else 0)
+    prog.log_done(rows=total.rows_written, days=len(days))
+    logger.info(
+        "ODS fetch complete: api=%d written=%d unchanged=%d in %.0fs (%.1f days/min)",
+        total.api_rows, total.rows_written, total.rows_unchanged, elapsed,
+        len(days) / elapsed * 60 if elapsed > 0 else 0,
+    )
     return total
 
 
@@ -383,7 +450,8 @@ def _local_trading_days(con, start: str, end: str):
 
 
 def _get_trading_days(client, start: str, end: str,
-                      con=None, ts_codes: list[str] = None) -> list[str]:
+                      con=None, ts_codes: list[str] = None,
+                      skip_covered: bool = True) -> list[str]:
     """Get list of trading days in date range from tushare trade_cal.
 
     When con + ts_codes: per-target-stock incremental — only skip dates
@@ -399,6 +467,9 @@ def _get_trading_days(client, start: str, end: str,
         recs = client.call("trade_cal", exchange="SSE", start_date=start,
                            end_date=end, is_open=1)
         days = sorted([r["cal_date"] for r in recs])
+
+    if not skip_covered:
+        return days
 
     if con and ts_codes:
         # Per-target-stock: date is "covered" only when ALL target stocks have it
@@ -694,18 +765,13 @@ def _backfill_circ_mv_stock(
 
 def fetch_stocks_incremental(client, con, ts_codes: list[str],
                               start: str = None,
-                              end: str = "20991231") -> int:
+                              end: str = "20991231",
+                              force_compare: bool = False) -> FetchResult:
     """Stock-batched 增量拉取：每只股票独立检测缺失日期。
 
-    对每只股票：
-      1. 查询 ods_daily 已有日期
-      2. 连续缺失段合并为 (start, end)
-      3. 调用 daily(ts_code=, start_date=, end_date=) 补拉
-
-    返回写入的总行数。
+    返回 FetchResult（rows_written = 实际写入行数）。
     """
     import time
-    import pandas as pd
 
     if start is None:
         # Default: 90 calendar-day lookback (~60 trading days) instead of 2015-01-01.
@@ -723,18 +789,21 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                               start_date=start, end_date=end, is_open=1)
         except Exception:
             logger.exception("fetch_stocks_incremental: trade_cal API failed")
-            return 0
+            return FetchResult.empty()
         all_days = sorted([r["cal_date"] for r in cal])
     if not all_days:
-        return 0
+        return FetchResult.empty()
 
     prog = stock_progress("fetch.stocks", len(ts_codes))
     prog.log_start(range=f"{start}~{end}")
 
-    total = 0
+    total = FetchResult.empty()
     t0 = time.time()
     for ts_code in ts_codes:
-        daily_ranges = _get_missing_ranges_per_stock(con, ts_code, all_days)
+        if force_compare and start == end:
+            daily_ranges = [(start, end)]
+        else:
+            daily_ranges = _get_missing_ranges_per_stock(con, ts_code, all_days)
         circ_ranges = _get_circ_mv_null_ranges(con, ts_code, all_days)
         dc_ranges = _get_net_amount_dc_null_ranges(con, ts_code, all_days)
         ranges = _merge_ranges([daily_ranges, circ_ranges, dc_ranges], all_days)
@@ -768,17 +837,12 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                                    "amount": r["amount"], "pct_chg": r["pct_chg"],
                                    "adj_factor": adj_map.get(r["trade_date"])}
                                   for r in recs]
-                    if daily_data:
-                        df = pd.DataFrame(daily_data)
-                        con.register("_inc_daily", df)
-                        con.execute("""INSERT OR REPLACE INTO ods_daily
-                            (ts_code, trade_date, open, high, low, close, vol,
-                             amount, pct_chg, adj_factor, fetched_at)
-                            SELECT ts_code, trade_date, open, high, low, close, vol,
-                                   amount, pct_chg, adj_factor, now()
-                            FROM _inc_daily""")
-                        con.unregister("_inc_daily")
-                        total += len(daily_data)
+                    seg_result = FetchResult(api_rows=len(adj_recs))
+                    seg_result = _merge_fetch_partial(
+                        seg_result,
+                        _write_ods_daily_diff(con, daily_data, "_inc_daily"),
+                    )
+                    total = _merge_fetch_partial(total, seg_result)
                 except Exception:
                     logger.exception("fetch_stocks_incremental %s [%s~%s]",
                                      ts_code, seg_start, seg_end)
@@ -788,10 +852,10 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                     recs = client.call("daily_basic", ts_code=ts_code,
                                        start_date=seg_start, end_date=seg_end)
                     basic_data = [_daily_basic_record(r) for r in recs]
-                    if basic_data:
-                        df = pd.DataFrame(basic_data)
-                        _insert_ods_daily_basic(con, df, "_inc_basic")
-                        total += len(basic_data)
+                    total = _merge_fetch_partial(
+                        total,
+                        _write_ods_daily_basic_diff(con, basic_data, "_inc_basic"),
+                    )
                 except Exception as e:
                     logger.warning(
                         "fetch_stocks_incremental %s [%s~%s] daily_basic skipped: %s",
@@ -806,24 +870,30 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                     mf_data = _attach_moneyflow_dc_stock(
                         client, ts_code, seg_start, seg_end, mf_data,
                     )
-                    if mf_data:
-                        df = pd.DataFrame(mf_data)
-                        _insert_ods_moneyflow(con, df, "_inc_mf")
-                        total += len(mf_data)
+                    total = _merge_fetch_partial(
+                        total,
+                        _write_ods_moneyflow_diff(con, mf_data, "_inc_mf"),
+                    )
                 except Exception as e:
                     logger.warning("fetch_stocks_incremental %s [%s~%s] moneyflow skipped: %s",
                                   ts_code, seg_start, seg_end, e)
             elif need_dc:
-                total += _backfill_net_amount_dc_stock(
+                n_dc = _backfill_net_amount_dc_stock(
                     con, client, ts_code, seg_start, seg_end,
                 )
+                if n_dc:
+                    total = _merge_fetch_partial(
+                        total, FetchResult(rows_written=n_dc, api_rows=n_dc),
+                    )
 
         prog.tick()
 
     elapsed = time.time() - t0
-    prog.log_done(rows=total, stocks=len(ts_codes))
-    logger.info("Stock fetch complete: %d stocks, %d rows, %.0fs",
-                len(ts_codes), total, elapsed)
+    prog.log_done(rows=total.rows_written, stocks=len(ts_codes))
+    logger.info(
+        "Stock fetch complete: %d stocks, written=%d unchanged=%d, %.0fs",
+        len(ts_codes), total.rows_written, total.rows_unchanged, elapsed,
+    )
     return total
 
 
@@ -836,7 +906,8 @@ def get_all_active_codes(con) -> list[str]:
 
 def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
                                  ts_codes: list[str] = None,
-                                 con=None) -> int:
+                                 con=None,
+                                 skip_covered: bool = True) -> FetchResult:
     """Multi-threaded version: each thread processes a chunk of trading days.
 
     Each thread has its own TushareClient + DuckDB connection.
@@ -856,10 +927,12 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
     client = TushareClient()
     if ts_codes is None and con is not None:
         ts_codes = get_all_active_codes(con)
-    days = _get_trading_days(client, start, end, con=con, ts_codes=ts_codes)
+    days = _get_trading_days(
+        client, start, end, con=con, ts_codes=ts_codes, skip_covered=skip_covered,
+    )
     if not days:
         logger.info("All dates already in DB — nothing to fetch (%s~%s)", start, end)
-        return 0
+        return FetchResult.empty()
     code_set = set(ts_codes) if ts_codes else None
     filter_msg = f" ({len(ts_codes)} stocks)" if ts_codes else ""
     t0 = time.time()
@@ -870,23 +943,16 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
     chunk_size = max(1, len(days) // workers)
     chunks = [days[i:i + chunk_size] for i in range(0, len(days), chunk_size)]
 
-    def _fetch_chunk(trade_dates: list[str]) -> int:
-        """Process one chunk of trading days in a thread.
-
-        Uses DuckDB register() + INSERT INTO SELECT for bulk insert
-        (~666x faster than executemany: 0.04s vs 28s per 5500 rows).
-        """
-        import pandas as pd
+    def _fetch_chunk(trade_dates: list[str]) -> FetchResult:
+        """Process one chunk of trading days in a thread."""
         thread_client = TushareClient()
         thread_con = duckdb.connect(DUCKDB_PATH)
-        total = 0
+        total = FetchResult.empty()
         for trade_date in trade_dates:
             try:
                 adj_recs = thread_client.call("adj_factor", trade_date=trade_date)
                 adj_map = {a["ts_code"]: a.get("adj_factor") for a in adj_recs}
-                total += len(adj_recs)
 
-                # --- ods_daily: bulk INSERT via register + SELECT ---
                 recs = thread_client.call("daily", trade_date=trade_date)
                 recs, _ = _validate_ods_batch(recs, "daily", trade_date)
                 daily_data = []
@@ -900,33 +966,23 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
                         "close": r["close"], "vol": r["vol"],
                         "amount": r["amount"], "pct_chg": r["pct_chg"],
                         "adj_factor": adj})
-                if daily_data:
-                    df = pd.DataFrame(daily_data)
-                    thread_con.register("_daily_batch", df)
-                    thread_con.execute("""
-                        INSERT OR REPLACE INTO ods_daily
-                        (ts_code, trade_date, open, high, low, close,
-                         vol, amount, pct_chg, adj_factor, fetched_at)
-                        SELECT ts_code, trade_date, open, high, low, close,
-                               vol, amount, pct_chg, adj_factor, now()
-                        FROM _daily_batch
-                    """)
-                    thread_con.unregister("_daily_batch")
-                    total += len(daily_data)
+                day_result = FetchResult(api_rows=len(adj_recs))
+                day_result = _merge_fetch_partial(
+                    day_result,
+                    _write_ods_daily_diff(thread_con, daily_data, "_daily_batch"),
+                )
 
-                # --- ods_daily_basic: bulk INSERT via register + SELECT ---
                 recs = thread_client.call("daily_basic", trade_date=trade_date)
                 basic_data = []
                 for r in recs:
                     if code_set and r["ts_code"] not in code_set:
                         continue
                     basic_data.append(_daily_basic_record(r))
-                if basic_data:
-                    df = pd.DataFrame(basic_data)
-                    _insert_ods_daily_basic(thread_con, df)
-                    total += len(basic_data)
+                day_result = _merge_fetch_partial(
+                    day_result,
+                    _write_ods_daily_basic_diff(thread_con, basic_data),
+                )
 
-                # --- ods_moneyflow: bulk INSERT via register + SELECT ---
                 recs = thread_client.call("moneyflow", trade_date=trade_date)
                 mf_data = []
                 for r in recs:
@@ -934,10 +990,11 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
                         continue
                     mf_data.append(_moneyflow_record(r))
                 mf_data = _attach_moneyflow_dc(thread_client, trade_date, mf_data)
-                if mf_data:
-                    df = pd.DataFrame(mf_data)
-                    _insert_ods_moneyflow(thread_con, df)
-                    total += len(mf_data)
+                day_result = _merge_fetch_partial(
+                    day_result,
+                    _write_ods_moneyflow_diff(thread_con, mf_data),
+                )
+                total = _merge_fetch_partial(total, day_result)
 
             except Exception:
                 logger.exception("Thread failed trade_date=%s", trade_date)
@@ -948,9 +1005,14 @@ def fetch_by_date_range_parallel(start: str, end: str, workers: int = 3,
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(_fetch_chunk, chunks))
 
-    total_rows = sum(results)
+    total_rows = FetchResult.empty()
+    for partial in results:
+        total_rows = _merge_fetch_partial(total_rows, partial)
     elapsed = time.time() - t0
-    prog.log_done(rows=total_rows, days=len(days))
-    logger.info("ODS fetch complete: %d rows in %.0fs (%.1f days/min)",
-                total_rows, elapsed, len(days) / elapsed * 60 if elapsed > 0 else 0)
+    prog.log_done(rows=total_rows.rows_written, days=len(days))
+    logger.info(
+        "ODS fetch complete: api=%d written=%d unchanged=%d in %.0fs (%.1f days/min)",
+        total_rows.api_rows, total_rows.rows_written, total_rows.rows_unchanged,
+        elapsed, len(days) / elapsed * 60 if elapsed > 0 else 0,
+    )
     return total_rows
