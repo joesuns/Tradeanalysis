@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import math
 
-FLOAT_ATOL = 1e-9
+FLOAT_ABS_TOL = 1e-4  # price / rate fields (yuan, %)
+FLOAT_LARGE_ABS_TOL = 1.0  # vol / amount / mv (hands, 万元)
+FLOAT_RTOL = 1e-5
 
 ODS_DAILY_DIFF_COLS = (
     "open", "high", "low", "close", "vol", "amount", "pct_chg", "adj_factor",
@@ -20,15 +23,34 @@ ODS_MONEYFLOW_DIFF_COLS = (
 )
 
 
-def values_equal(a, b, atol: float = FLOAT_ATOL) -> bool:
-    if a is None and b is None:
+def _is_missing(v) -> bool:
+    if v is None:
         return True
-    if a is None or b is None:
+    try:
+        return math.isnan(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def values_equal(a, b, atol: Optional[float] = None) -> bool:
+    """Compare ODS field values; tolerate DuckDB float32 vs tushare API roundtrip."""
+    if _is_missing(a) and _is_missing(b):
+        return True
+    if _is_missing(a) or _is_missing(b):
         return False
     try:
-        return abs(float(a) - float(b)) <= atol
+        fa, fb = float(a), float(b)
     except (TypeError, ValueError):
         return a == b
+    diff = abs(fa - fb)
+    if diff <= 1e-12:
+        return True
+    if atol is not None:
+        return diff <= atol
+    scale = max(abs(fa), abs(fb), 1.0)
+    if scale < 1000:
+        return diff <= FLOAT_ABS_TOL
+    return diff <= max(FLOAT_LARGE_ABS_TOL, scale * FLOAT_RTOL)
 
 
 def row_differs(incoming: dict, existing: dict, cols: Sequence[str]) -> bool:
