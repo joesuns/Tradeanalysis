@@ -78,12 +78,12 @@ def compute_skip_dwd_calc(
         return False
     from backend.etl.calc_gate import has_prior_calc_snapshot
     from backend.etl.calc_spec_gate import has_spec_stale_indicators
-    from backend.etl.orchestrator import find_stale_dwd_codes, find_stale_ods_codes
+    from backend.etl.orchestrator import find_stale_dwd_codes
 
     if has_spec_stale_indicators(con):
         return False
-    if find_stale_ods_codes(con, ts_codes, analysis_date):
-        return False
+    # rows_written==0: fetch already compared API vs ODS; persistent stale ODS
+    # (halt/suspend) is structural — calc skip_log handles them, not a rerun blocker.
     if find_stale_dwd_codes(con, ts_codes, analysis_date):
         return False
     if not has_prior_calc_snapshot(con, analysis_date):

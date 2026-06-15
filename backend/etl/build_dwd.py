@@ -139,6 +139,32 @@ def find_stocks_needing_full_daily_insert(
     return sorted({r[0] for r in rows})
 
 
+def find_stocks_missing_dwd_trade_date(
+    con, ts_codes: List[str], trade_date: str,
+) -> List[str]:
+    """Stocks with ODS on trade_date but DWD daily max strictly before it."""
+    if not ts_codes:
+        return []
+    placeholders = ",".join(["?" for _ in ts_codes])
+    rows = con.execute(
+        f"""
+        SELECT o.ts_code
+        FROM ods_daily o
+        LEFT JOIN (
+            SELECT ts_code, MAX(trade_date) AS mx
+            FROM dwd_daily_quote
+            WHERE ts_code IN ({placeholders})
+            GROUP BY ts_code
+        ) d ON o.ts_code = d.ts_code
+        WHERE o.trade_date = ?
+          AND o.ts_code IN ({placeholders})
+          AND (d.mx IS NULL OR d.mx < ?)
+        """,
+        list(ts_codes) + [trade_date] + list(ts_codes) + [trade_date],
+    ).fetchall()
+    return sorted({r[0] for r in rows})
+
+
 def find_stocks_needing_full_daily_rebuild(
     con, ts_codes: List[str], trade_date: str,
 ) -> List[str]:
@@ -219,8 +245,12 @@ def rebuild_dwd_incremental(con, ts_codes: List[str], trade_date: str) -> dict:
     insert_codes = find_stocks_needing_full_daily_insert(
         con, ts_codes, trade_date,
     )
+    missing_day = find_stocks_missing_dwd_trade_date(con, ts_codes, trade_date)
+    tail_daily_codes = [c for c in missing_day if c not in set(insert_codes)]
     full_weekly_codes = sorted(set(qfq_codes) | set(insert_codes))
-    tail_codes = [c for c in ts_codes if c not in set(full_weekly_codes)]
+    tail_weekly_codes = [
+        c for c in tail_daily_codes if c not in set(full_weekly_codes)
+    ]
 
     n_daily = 0
     if qfq_codes:
@@ -231,19 +261,19 @@ def rebuild_dwd_incremental(con, ts_codes: List[str], trade_date: str) -> dict:
             len(insert_codes),
         )
         n_daily += build_dwd_daily_quote(con, insert_codes)
-    if tail_codes:
+    if tail_daily_codes:
         logger.info(
             "dwd incremental: tail INSERT for %d stocks on %s",
-            len(tail_codes), trade_date,
+            len(tail_daily_codes), trade_date,
         )
         n_daily += build_dwd_daily_quote(
-            con, tail_codes, incremental_trade_date=trade_date,
+            con, tail_daily_codes, incremental_trade_date=trade_date,
         )
 
     n_weekly = 0
-    if tail_codes:
+    if tail_weekly_codes:
         n_weekly += build_dwd_weekly_quote(
-            con, tail_codes, incremental_trade_date=trade_date,
+            con, tail_weekly_codes, incremental_trade_date=trade_date,
         )
     if full_weekly_codes:
         n_weekly += build_dwd_weekly_quote(con, full_weekly_codes)
