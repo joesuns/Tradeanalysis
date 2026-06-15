@@ -1,7 +1,8 @@
 # 变更驱动 Refresh + CLI 场景化（整合定稿）
 
 **Date:** 2026-06-15  
-**Status:** 整合定稿 — 数据架构 + 系统架构评审已吸收；**待用户批准实施后动码**  
+**Status:** **已实施并合入 main** — Wave 1–5（PR #7 `c1b7649`）+ post-merge 验收补洞（PR #8 `8306575`）  
+**Acceptance:** [`2026-06-16-post-merge-acceptance-gates.md`](2026-06-16-post-merge-acceptance-gates.md) · 实库证据 [`evidence/2026-06-16-smoke/`](evidence/2026-06-16-smoke/README.md)  
 **Grill 定稿:** Q1=B+SOP · Q2=A+C₂ · Q3=A · Q4=A+combo→B · Q5a=A · Q5b=A · refresh=R1
 
 **评审结论:** 方向正确、增量改造；**P0 修订已并入本文**（短路仍 fetch、FetchResult/PipelineContext）。
@@ -18,16 +19,20 @@
 
 ### 1.1 用户 8 条要求 → 设计落点
 
-| # | 要求 | 落点 | 实施后 |
-|---|------|------|--------|
-| 1 | 源端变更 → 仅变更 ODS 重入库 | Task 1 比对 + REPLACE | ✅ |
-| 2 | ODS 变更 → 下游按范围重算 | changed_codes → DWD 窄链 → calc 路由 | ✅ |
-| 3 | 指标 logic 变更 → 该指标重算 | Task 3 spec 入口 + refresh R1 | ✅ |
-| 4 | 默认只刷指定交易日；全历史显式 | run/refresh 单日；combo→ops SOP | ✅ |
-| 5 | 历史数据自动补齐 | 复用 G1/G2 auto-fetch | ✅（已有） |
-| 6 | 分层只写相关表 | stale 子集 DWD；按指标 INSERT | ✅ |
-| 7 | 质量优先、不重复算 | run 短路 skip DWD+calc；refresh 显式强算 | ✅（P0 修订后） |
-| 8 | CLI 易用 | run / export / refresh + ops | ✅ |
+**验收基线（post-merge）：** [`2026-06-16-post-merge-acceptance-gates.md`](2026-06-16-post-merge-acceptance-gates.md) §4 · CI PR #8 绿 · 实库 [`evidence/2026-06-16-smoke/`](evidence/2026-06-16-smoke/README.md)
+
+| # | 要求 | 落点 | 验收 |
+|---|------|------|------|
+| 1 | 源端变更 → 仅变更 ODS 重入库 | Task 1 比对 + REPLACE | ✅ `test_ods_diff` + `changed_field_events_count`（PR #8） |
+| 2 | ODS 变更 → 下游按范围重算 | changed_codes → DWD 窄链 → calc 路由 | ✅ smoke §2 + `test_column_narrow_equivalence` |
+| 3 | 指标 logic 变更 → 该指标重算 | spec 入口 + refresh R1 + `calc --refresh-spec` | ✅ smoke §3 + `test_calc_spec_refresh` |
+| 4 | 默认只刷指定交易日；全历史显式 | run/refresh 单日；combo→ops SOP | ✅ `test_cli/test_date_range` + smoke dry-run |
+| 5 | 历史数据自动补齐 | 复用 G1/G2 auto-fetch | ✅ CI `pytest tests/ -v`（PR #8） |
+| 6 | 分层只写相关表 | stale 子集 DWD；按指标 INSERT | ✅ P0-3 narrow 等价 + Wave5 smoke |
+| 7 | 质量优先、不重复算 | pipeline_shortcut + `run --force` 穿透 L0 | ✅ smoke #1 + P0-1 force + 三层短路表 |
+| 8 | CLI 易用 | run / export / refresh / calc / ops | ✅ `--help` + refresh-spec 接线（PR #8） |
+
+**§10 双架构正式签字：** 见 post-merge plan §10（用户已批准实施与 merge；架构师签字 ⬜）。
 
 ### 1.2 现网差距（实施前）
 
@@ -397,7 +402,9 @@ pytest tests/ -v
 
 ## 12. 审批
 
-- [ ] 用户批准本整合定稿（回复「好 / 可以 / 同意实施」）
-- [ ] 实施从 **Wave 1 Task 1** 开始
+- [x] 用户批准本整合定稿（2026-06-15）
+- [x] Wave 1–5 实施并合入 main — **PR #7** `c1b7649`
+- [x] Post-merge 验收补洞合入 main — **PR #8** `8306575`（[`2026-06-16-post-merge-acceptance-gates.md`](2026-06-16-post-merge-acceptance-gates.md)）
+- [ ] 双架构 §10 正式签字（不阻塞 main 代码；见 post-merge plan）
 
 **Explicitly out of scope:** combo 全历史自动 backfill；content-aware mutation v2（etl_log 级，非 ODS diff）。
