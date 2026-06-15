@@ -134,6 +134,43 @@ def _export(n):
     return ExportResult(row_count=n, tradable_enrich={})
 
 
+def _fake_query_result(fetchone=("20260605",), fetchall=None):
+    if fetchall is None:
+        fetchall = []
+    return type(
+        "R",
+        (),
+        {
+            "fetchone": lambda self: fetchone,
+            "fetchall": lambda self: fetchall,
+        },
+    )()
+
+
+class FakeCon:
+    """Minimal DuckDB stand-in for cmd_run unit tests."""
+
+    def execute(self, *args, **kwargs):
+        sql = args[0] if args else ""
+        params = args[1] if len(args) > 1 else None
+        if not isinstance(sql, str):
+            return _fake_query_result()
+        upper = sql.upper()
+        if "COUNT(" in upper:
+            return _fake_query_result(fetchone=(0,))
+        if "ODS_ETL_LOG" in upper and "CALC_DWS" in upper:
+            return _fake_query_result(fetchone=None)
+        if "MAX(TRADE_DATE)" in upper and "DIM_DATE" in upper:
+            trade_date = params[0] if params else "20260605"
+            return _fake_query_result(fetchone=(trade_date,))
+        if "MAX(TRADE_DATE)" in upper and "ODS_DAILY" in upper:
+            return _fake_query_result(fetchone=("20260605",))
+        return _fake_query_result()
+
+    def close(self):
+        pass
+
+
 def test_cli_run_help_shows():
     """run 命令应有帮助信息。"""
     env = {**os.environ, "TUSHARE_TOKEN": "test"}
@@ -175,10 +212,7 @@ def test_cmd_run_closes_date_connection_before_calc(monkeypatch):
 
     events = []
 
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
-
+    class TrackingFakeCon(FakeCon):
         def close(self):
             events.append("con_closed")
 
@@ -194,7 +228,7 @@ def test_cmd_run_closes_date_connection_before_calc(monkeypatch):
         assert skip_stale_fetch is True
 
     monkeypatch.setattr(
-        "backend.db.connection.get_connection", lambda: FakeCon())
+        "backend.db.connection.get_connection", lambda: TrackingFakeCon())
     monkeypatch.setattr(
         "backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
     monkeypatch.setattr(
@@ -239,13 +273,6 @@ def test_cmd_run_skips_rebuild_when_fetch_zero_and_dwd_fresh(monkeypatch):
 
     rebuild_calls = []
 
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
-
-        def close(self):
-            pass
-
     def fake_fetch(*_a, **_k):
         return _fr(0)
 
@@ -284,13 +311,6 @@ def test_cmd_run_rebuilds_stale_subset_when_fetch_zero(monkeypatch):
 
     rebuild_calls = []
 
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
-
-        def close(self):
-            pass
-
     monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
     monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
     monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: _fr(0))
@@ -320,13 +340,6 @@ def test_cmd_run_n_fetch_zero_uses_full_when_dwd_incremental_disabled(monkeypatc
     from backend import cli
 
     rebuild_calls = []
-
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
-
-        def close(self):
-            pass
 
     monkeypatch.setattr("backend.config.DWD_INCREMENTAL", False)
     monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
@@ -359,13 +372,6 @@ def test_cmd_run_rebuilds_stale_when_fetch_gt_zero(monkeypatch):
 
     rebuild_calls = []
 
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
-
-        def close(self):
-            pass
-
     monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
     monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
     monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: _fr(100))
@@ -395,13 +401,6 @@ def test_cmd_run_logs_fetch_rebuild_export_steps(monkeypatch):
     from backend import cli
 
     logged_steps = []
-
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
-
-        def close(self):
-            pass
 
     def fake_log_end(con, lid, step_name, t0, status, row_count=0, **kw):
         logged_steps.append((step_name, status, row_count, kw.get("data_completeness")))
@@ -438,13 +437,6 @@ def test_cmd_run_pipeline_shortcut_skips_dwd_and_calc(monkeypatch):
     calc_calls = []
     rebuild_calls = []
     logged_steps = []
-
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
-
-        def close(self):
-            pass
 
     def fake_log_end(con, lid, step_name, t0, status, row_count=0, **kw):
         logged_steps.append((step_name, status, row_count, kw.get("data_completeness")))
@@ -503,13 +495,6 @@ def test_cmd_run_skip_export(monkeypatch):
 
     export_called = []
 
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260605",)})()
-
-        def close(self):
-            pass
-
     monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
     monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
     monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: _fr(0))
@@ -537,13 +522,6 @@ def test_cmd_run_refreshes_state_after_dwd_rebuild(monkeypatch):
     from backend import cli
 
     events = []
-
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260610",)})()
-
-        def close(self):
-            pass
 
     def fake_rebuild_incremental(con, codes, d):
         events.append(("rebuild", list(codes)))
@@ -593,13 +571,6 @@ def test_cmd_run_skips_refresh_when_dwd_skipped(monkeypatch):
 
     refresh_calls = []
 
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260610",)})()
-
-        def close(self):
-            pass
-
     monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
     monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ"])
     monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: _fr(0))
@@ -631,13 +602,6 @@ def test_cmd_run_sets_preflight_context(monkeypatch):
     from backend.etl.calc_preflight_context import pop_run_preflight_context
 
     captured = {}
-
-    class FakeCon:
-        def execute(self, *args, **kwargs):
-            return type("R", (), {"fetchone": lambda self: ("20260610",)})()
-
-        def close(self):
-            pass
 
     tails_bundle = {
         "daily_tails": {"B.SZ": "tail"},

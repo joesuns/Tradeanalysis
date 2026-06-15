@@ -348,6 +348,7 @@ def _cmd_run_single_day(args, date: str):
     skip_dwd_calc = False
     fetch_result = None
     dwd_meta = {"qfq_codes": [], "stale_extra_codes": []}
+    calc_handoff = None
     con = get_connection()
     try:
         codes = ts_codes or get_all_active_codes(con)
@@ -458,31 +459,22 @@ def _cmd_run_single_day(args, date: str):
             except Exception:
                 log_etl_end(con, lid2, "run_refresh_state", t02, "failed")
                 raise
-    finally:
-        con.close()
 
-    logger.info("=== Step 2/3: Computing indicators for %s ===", date)
-    args.date = date
-    if not skip_dwd_calc:
-        if fetch_result is not None:
-            from backend.etl.calc_preflight_context import RunCalcHandoff, set_run_calc_handoff
+        if not skip_dwd_calc and fetch_result is not None:
+            from backend.etl.calc_preflight_context import RunCalcHandoff
             from backend.etl.column_indicator_deps import (
                 active_route_keys,
                 calc_routes_narrowed,
                 resolve_run_calc_indicator_filter,
             )
 
-            con_handoff = get_connection()
-            try:
-                indicator_filter = resolve_run_calc_indicator_filter(
-                    con_handoff,
-                    fetch_result,
-                    changed_codes=fetch_result.changed_codes_for_date(date),
-                    stale_extra_codes=dwd_meta.get("stale_extra_codes", []),
-                    qfq_codes=dwd_meta.get("qfq_codes", []),
-                )
-            finally:
-                con_handoff.close()
+            indicator_filter = resolve_run_calc_indicator_filter(
+                con,
+                fetch_result,
+                changed_codes=fetch_result.changed_codes_for_date(date),
+                stale_extra_codes=dwd_meta.get("stale_extra_codes", []),
+                qfq_codes=dwd_meta.get("qfq_codes", []),
+            )
             narrowed = calc_routes_narrowed(indicator_filter)
             if narrowed:
                 logger.info(
@@ -490,11 +482,21 @@ def _cmd_run_single_day(args, date: str):
                     indicator_filter,
                     active_route_keys(indicator_filter),
                 )
-            set_run_calc_handoff(RunCalcHandoff(
+            calc_handoff = RunCalcHandoff(
                 indicator_filter=indicator_filter,
                 calc_routes_narrowed=narrowed,
                 active_routes=active_route_keys(indicator_filter),
-            ))
+            )
+    finally:
+        con.close()
+
+    logger.info("=== Step 2/3: Computing indicators for %s ===", date)
+    args.date = date
+    if not skip_dwd_calc:
+        if calc_handoff is not None:
+            from backend.etl.calc_preflight_context import set_run_calc_handoff
+
+            set_run_calc_handoff(calc_handoff)
         cmd_calc(args, skip_stale_fetch=True)
     else:
         logger.info("=== Step 2/3: Skipped calc (pipeline shortcut) ===")
