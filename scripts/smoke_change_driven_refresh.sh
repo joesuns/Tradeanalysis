@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# 实库 smoke：change-driven refresh Wave 1–4（plan 2026-06-15 §9）
+# 实库 smoke：change-driven refresh Wave 1–5（plan 2026-06-15 §9 + Wave5 §8）
 #
 # 用法:
 #   export ANALYSIS_DATE=20260612          # 已有 calc 快照的交易日
 #   export DUCKDB_PATH=data/tradeanalysis.duckdb
-#   ./scripts/smoke_change_driven_refresh.sh           # 只读检查 + 步骤 1/6
+#   ./scripts/smoke_change_driven_refresh.sh           # 只读检查 + dry-run
 #   ./scripts/smoke_change_driven_refresh.sh --run-all # 含 run/refresh（写库+API）
+#   ./scripts/smoke_change_driven_refresh.sh --run-wave5  # Wave5 circ_mv→dde narrow（写库）
 #
 # 前置: TUSHARE_TOKEN 已设；该日 ODS/DWS 已存在；非生产并发写。
 set -euo pipefail
@@ -15,10 +16,15 @@ cd "$ROOT"
 
 DATE="${ANALYSIS_DATE:-}"
 DB="${DUCKDB_PATH:-data/tradeanalysis.duckdb}"
+SMOKE_TS="${SMOKE_TS_CODE:-000543.SZ}"
 RUN_ALL=false
-if [[ "${1:-}" == "--run-all" ]]; then
-  RUN_ALL=true
-fi
+RUN_WAVE5=false
+for arg in "${@:-}"; do
+  case "$arg" in
+    --run-all) RUN_ALL=true ;;
+    --run-wave5) RUN_WAVE5=true ;;
+  esac
+done
 
 if [[ -z "$DATE" ]]; then
   echo "ERROR: 请设置 ANALYSIS_DATE=YYYYMMDD（建议选已有 calc 的快照日）" >&2
@@ -118,8 +124,92 @@ python3 -m backend.cli refresh --date "$DATE" --dry-run
 section "6. refresh 范围 dry-run"
 python3 -m backend.cli refresh --from "$DATE" --to "$DATE" --dry-run
 
-section "7. health_check（只读）"
+if $RUN_WAVE5; then
+  section "7. Wave5 列→指标收窄（circ_mv → 仅 dde）"
+  export ANALYSIS_DATE="$DATE"
+  export DUCKDB_PATH="$DB"
+  export SMOKE_TS_CODE="$SMOKE_TS"
+  python3 - <<'PY'
+import duckdb
+import json
+import os
+import subprocess
+import sys
+
+db = os.environ.get("DUCKDB_PATH", "data/tradeanalysis.duckdb")
+date = os.environ["ANALYSIS_DATE"]
+ts = os.environ.get("SMOKE_TS_CODE", "000543.SZ")
+
+con = duckdb.connect(db)
+row = con.execute(
+    """
+    SELECT circ_mv FROM ods_daily_basic
+    WHERE ts_code = ? AND trade_date = ?
+    """,
+    [ts, date],
+).fetchone()
+if not row or row[0] is None:
+    print(f"SKIP: {ts} 在 {date} 无 circ_mv，换 SMOKE_TS_CODE 或先 fetch", file=sys.stderr)
+    sys.exit(0)
+orig = float(row[0])
+new_val = orig * 1.0001 + 0.01
+con.execute(
+    "UPDATE ods_daily_basic SET circ_mv = ? WHERE ts_code = ? AND trade_date = ?",
+    [new_val, ts, date],
+)
+con.close()
+print(f"patched circ_mv {ts} {date}: {orig} -> {new_val}")
+
+subprocess.run(
+    [sys.executable, "-m", "backend.cli", "run", "--date", date, "--skip-export"],
+    check=True,
+)
+
+con = duckdb.connect(db, read_only=True)
+log_row = con.execute(
+    """
+    SELECT data_completeness
+    FROM ods_etl_log
+    WHERE step_name = 'calc_dws'
+    ORDER BY started_at DESC
+    LIMIT 1
+    """
+).fetchone()
+con.close()
+if not log_row or not log_row[0]:
+    print("FAIL: 无 calc_dws log", file=sys.stderr)
+    sys.exit(1)
+comp = json.loads(log_row[0])
+filt = comp.get("run_indicator_filter")
+narrowed = comp.get("calc_routes_narrowed")
+routes = comp.get("active_routes")
+full_by = comp.get("full_by_indicator") or {}
+print("calc_dws completeness:", json.dumps({
+    "run_indicator_filter": filt,
+    "calc_routes_narrowed": narrowed,
+    "active_routes": routes,
+    "full_by_indicator_keys": sorted(full_by.keys()),
+}, ensure_ascii=False))
+if not narrowed or filt != ["dde"]:
+    print("FAIL: 期望 calc_routes_narrowed=true, run_indicator_filter=[dde]", file=sys.stderr)
+    sys.exit(1)
+if any(k.startswith("macd_") for k in full_by):
+    print("FAIL: full_by_indicator 含 macd_*", file=sys.stderr)
+    sys.exit(1)
+print("Wave5 smoke OK")
+
+con = duckdb.connect(db)
+con.execute(
+    "UPDATE ods_daily_basic SET circ_mv = ? WHERE ts_code = ? AND trade_date = ?",
+    [orig, ts, date],
+)
+con.close()
+print(f"restored circ_mv {ts} {date} -> {orig}")
+PY
+fi
+
+section "8. health_check（只读）"
 python3 scripts/health_check.py || true
 
 echo
-echo "smoke 脚本完成。请人工核对 pipeline_shortcut / ods_rows_written / refresh dry-run 输出。"
+echo "smoke 脚本完成。请人工核对 pipeline_shortcut / ods_rows_written / refresh dry-run / Wave5 narrow 输出。"

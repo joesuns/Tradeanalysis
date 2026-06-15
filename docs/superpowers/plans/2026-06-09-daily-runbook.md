@@ -14,6 +14,8 @@
 
 `run` = fetch → rebuild DWD → calc → export（可用 `--skip-export` 跳过 Excel）。**同 day 无 ODS 变更时** `run` 仍 fetch 比对，但可 skip DWD+calc（`pipeline_shortcut`），此时用 `export` 最快。
 
+**Wave 5 列→指标收窄（run 路径）：** 小范围 ODS 列变更（如 `circ_mv`）时 calc 可仅跑 `dde` 等子集；`CALC_COLUMN_NARROW=0` 关闭。验收：`scripts/smoke_change_driven_refresh.sh --run-wave5`。
+
 **运维命令** 推荐 `python -m backend.cli ops <subcmd>`（顶层 `prune`/`refresh-state` 等仍可用，会 DeprecationWarning）。
 
 ## 禁止事项

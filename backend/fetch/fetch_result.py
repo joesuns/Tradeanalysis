@@ -13,6 +13,10 @@ class FetchResult:
     rows_written: int = 0
     rows_unchanged: int = 0
     changed_pairs: List[Tuple[str, str]] = field(default_factory=list)
+    # (ts_code, trade_date, ods_table, column, is_insert)
+    changed_field_events: List[Tuple[str, str, str, str, bool]] = field(
+        default_factory=list,
+    )
 
     def __int__(self) -> int:
         """Backward compat: int(fetch_result) == rows_written."""
@@ -29,11 +33,20 @@ class FetchResult:
             if pair not in seen:
                 seen.add(pair)
                 merged_pairs.append(pair)
+        seen_events: Set[Tuple[str, str, str, str, bool]] = set(
+            self.changed_field_events,
+        )
+        merged_events = list(self.changed_field_events)
+        for ev in other.changed_field_events:
+            if ev not in seen_events:
+                seen_events.add(ev)
+                merged_events.append(ev)
         return FetchResult(
             api_rows=self.api_rows + other.api_rows,
             rows_written=self.rows_written + other.rows_written,
             rows_unchanged=self.rows_unchanged + other.rows_unchanged,
             changed_pairs=merged_pairs,
+            changed_field_events=merged_events,
         )
 
     @property

@@ -334,6 +334,17 @@ python -m backend.cli ops backfill-state | refresh-state | repair-weekly | prune
 
 **Task 7 — 列→指标映射（run 路径）**
 
+> 详细实施计划：[`2026-06-15-wave5-column-indicator-deps.md`](2026-06-15-wave5-column-indicator-deps.md)
+
+- [x] Task 1–3：`ods_diff` 列事件 + `FetchResult` + D2 patch 事件
+- [x] Task 4：`column_indicator_deps.py` 映射 + 保守 fallback G1–G8
+- [x] Task 5：`PipelineContext` / run→calc handoff
+- [x] Task 6：`run_batch_append_phase` + `run_calc` 路由收窄
+- [x] Task 7：config / 观测 / CLAUDE.md
+- [x] Task 8：smoke #7 + 全量 pytest
+
+**refresh R1 不受 Task 7 影响。**
+
 ---
 
 ## 9. 测试与验收

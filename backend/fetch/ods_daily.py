@@ -18,6 +18,10 @@ from backend.fetch.ods_diff import (
     partition_changed_daily,
     partition_changed_daily_basic,
     partition_changed_moneyflow,
+    partition_changed_rows_detailed,
+    ODS_DAILY_DIFF_COLS,
+    ODS_DAILY_BASIC_DIFF_COLS,
+    ODS_MONEYFLOW_DIFF_COLS,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,7 +146,9 @@ def _write_ods_daily_diff(con, daily_data: list, register_name: str = "_daily_ba
 
     if not daily_data:
         return FetchResult.empty()
-    changed, unchanged = partition_changed_daily(con, daily_data)
+    changed, unchanged, events = partition_changed_rows_detailed(
+        con, "ods_daily", ODS_DAILY_DIFF_COLS, daily_data,
+    )
     pairs = [(r["ts_code"], r["trade_date"]) for r in changed]
     if changed:
         df = pd.DataFrame(changed)
@@ -160,6 +166,7 @@ def _write_ods_daily_diff(con, daily_data: list, register_name: str = "_daily_ba
         rows_written=len(changed),
         rows_unchanged=unchanged,
         changed_pairs=pairs,
+        changed_field_events=events,
     )
 
 
@@ -168,7 +175,9 @@ def _write_ods_daily_basic_diff(con, basic_data: list, register_name: str = "_ba
 
     if not basic_data:
         return FetchResult.empty()
-    changed, unchanged = partition_changed_daily_basic(con, basic_data)
+    changed, unchanged, events = partition_changed_rows_detailed(
+        con, "ods_daily_basic", ODS_DAILY_BASIC_DIFF_COLS, basic_data,
+    )
     pairs = [(r["ts_code"], r["trade_date"]) for r in changed]
     if changed:
         df = pd.DataFrame(changed)
@@ -178,6 +187,7 @@ def _write_ods_daily_basic_diff(con, basic_data: list, register_name: str = "_ba
         rows_written=len(changed),
         rows_unchanged=unchanged,
         changed_pairs=pairs,
+        changed_field_events=events,
     )
 
 
@@ -186,7 +196,9 @@ def _write_ods_moneyflow_diff(con, mf_data: list, register_name: str = "_mf_batc
 
     if not mf_data:
         return FetchResult.empty()
-    changed, unchanged = partition_changed_moneyflow(con, mf_data)
+    changed, unchanged, events = partition_changed_rows_detailed(
+        con, "ods_moneyflow", ODS_MONEYFLOW_DIFF_COLS, mf_data,
+    )
     pairs = [(r["ts_code"], r["trade_date"]) for r in changed]
     if changed:
         df = pd.DataFrame(changed)
@@ -196,23 +208,27 @@ def _write_ods_moneyflow_diff(con, mf_data: list, register_name: str = "_mf_batc
         rows_written=len(changed),
         rows_unchanged=unchanged,
         changed_pairs=pairs,
+        changed_field_events=events,
     )
 
 
-def _apply_net_amount_dc_patch(con, df, register_name: str = "_dc_patch") -> int:
+def _apply_net_amount_dc_patch(con, df, register_name: str = "_dc_patch") -> FetchResult:
     """Bulk UPDATE ods_moneyflow.net_amount_dc where currently NULL."""
     if df is None or df.empty:
-        return 0
+        return FetchResult.empty()
     con.register(register_name, df)
-    n = con.execute(
+    affected = con.execute(
         f"""
-        SELECT COUNT(*)
-        FROM ods_moneyflow o
-        JOIN {register_name} p
+        SELECT p.ts_code, p.trade_date
+        FROM {register_name} p
+        JOIN ods_moneyflow o
           ON o.ts_code = p.ts_code AND o.trade_date = p.trade_date
         WHERE o.net_amount_dc IS NULL AND p.net_amount_dc IS NOT NULL
         """
-    ).fetchone()[0]
+    ).fetchall()
+    if not affected:
+        con.unregister(register_name)
+        return FetchResult.empty()
     con.execute(
         f"""
         UPDATE ods_moneyflow AS o
@@ -225,55 +241,85 @@ def _apply_net_amount_dc_patch(con, df, register_name: str = "_dc_patch") -> int
         """
     )
     con.unregister(register_name)
-    return int(n)
+    pairs = [(r[0], r[1]) for r in affected]
+    events = [
+        (r[0], r[1], "ods_moneyflow", "net_amount_dc", False)
+        for r in affected
+    ]
+    n = len(affected)
+    return FetchResult(
+        api_rows=n,
+        rows_written=n,
+        changed_pairs=pairs,
+        changed_field_events=events,
+    )
 
 
-def _apply_circ_mv_patch(con, df, register_name: str = "_circ_patch") -> int:
+def _apply_circ_mv_patch(con, df, register_name: str = "_circ_patch") -> FetchResult:
     """Bulk upsert circ_mv (NULL-only update + missing row INSERT)."""
     if df is None or df.empty:
-        return 0
+        return FetchResult.empty()
     con.register(register_name, df)
-    insert_n = con.execute(
+    insert_rows = con.execute(
         f"""
-        SELECT COUNT(*)
+        SELECT p.ts_code, p.trade_date
         FROM {register_name} p
         LEFT JOIN ods_daily_basic b
           ON b.ts_code = p.ts_code AND b.trade_date = p.trade_date
         WHERE b.ts_code IS NULL AND p.circ_mv IS NOT NULL
         """
-    ).fetchone()[0]
-    con.execute(
+    ).fetchall()
+    if insert_rows:
+        con.execute(
+            f"""
+            INSERT INTO ods_daily_basic (ts_code, trade_date, circ_mv, fetched_at)
+            SELECT p.ts_code, p.trade_date, p.circ_mv, now()
+            FROM {register_name} p
+            LEFT JOIN ods_daily_basic b
+              ON b.ts_code = p.ts_code AND b.trade_date = p.trade_date
+            WHERE b.ts_code IS NULL AND p.circ_mv IS NOT NULL
+            """
+        )
+    update_rows = con.execute(
         f"""
-        INSERT INTO ods_daily_basic (ts_code, trade_date, circ_mv, fetched_at)
-        SELECT p.ts_code, p.trade_date, p.circ_mv, now()
-        FROM {register_name} p
-        LEFT JOIN ods_daily_basic b
-          ON b.ts_code = p.ts_code AND b.trade_date = p.trade_date
-        WHERE b.ts_code IS NULL AND p.circ_mv IS NOT NULL
-        """
-    )
-    update_n = con.execute(
-        f"""
-        SELECT COUNT(*)
+        SELECT b.ts_code, b.trade_date
         FROM ods_daily_basic b
         JOIN {register_name} p
           ON b.ts_code = p.ts_code AND b.trade_date = p.trade_date
         WHERE b.circ_mv IS NULL AND p.circ_mv IS NOT NULL
         """
-    ).fetchone()[0]
-    con.execute(
-        f"""
-        UPDATE ods_daily_basic AS b
-        SET circ_mv = p.circ_mv, fetched_at = now()
-        FROM {register_name} AS p
-        WHERE b.ts_code = p.ts_code
-          AND b.trade_date = p.trade_date
-          AND b.circ_mv IS NULL
-          AND p.circ_mv IS NOT NULL
-        """
-    )
+    ).fetchall()
+    if update_rows:
+        con.execute(
+            f"""
+            UPDATE ods_daily_basic AS b
+            SET circ_mv = p.circ_mv, fetched_at = now()
+            FROM {register_name} AS p
+            WHERE b.ts_code = p.ts_code
+              AND b.trade_date = p.trade_date
+              AND b.circ_mv IS NULL
+              AND p.circ_mv IS NOT NULL
+            """
+        )
     con.unregister(register_name)
-    return int(insert_n) + int(update_n)
+    n = len(insert_rows) + len(update_rows)
+    if n == 0:
+        return FetchResult.empty()
+    pairs = [(r[0], r[1]) for r in insert_rows + update_rows]
+    events = [
+        (r[0], r[1], "ods_daily_basic", "circ_mv", True)
+        for r in insert_rows
+    ]
+    events.extend(
+        (r[0], r[1], "ods_daily_basic", "circ_mv", False)
+        for r in update_rows
+    )
+    return FetchResult(
+        api_rows=n,
+        rows_written=n,
+        changed_pairs=pairs,
+        changed_field_events=events,
+    )
 
 
 def _backfill_net_amount_dc_by_date(
@@ -306,7 +352,7 @@ def _backfill_net_amount_dc_by_date(
     if not rows:
         return 0
     reg = f"_dc_patch_{trade_date}{register_suffix}"
-    return _apply_net_amount_dc_patch(con, pd.DataFrame(rows), register_name=reg)
+    return int(_apply_net_amount_dc_patch(con, pd.DataFrame(rows), register_name=reg))
 
 
 def _backfill_circ_mv_by_date(
@@ -339,7 +385,7 @@ def _backfill_circ_mv_by_date(
     if not rows:
         return 0
     reg = f"_circ_patch_{trade_date}{register_suffix}"
-    return _apply_circ_mv_patch(con, pd.DataFrame(rows), register_name=reg)
+    return int(_apply_circ_mv_patch(con, pd.DataFrame(rows), register_name=reg))
 
 
 def fetch_by_date_range(client, con, start: str, end: str,
@@ -699,7 +745,7 @@ def _get_net_amount_dc_null_ranges(con, ts_code: str,
 
 def _backfill_net_amount_dc_stock(
     con, client, ts_code: str, start: str, end: str,
-) -> int:
+) -> FetchResult:
     """UPDATE existing ods_moneyflow rows from moneyflow_dc (no full mf re-fetch)."""
     import pandas as pd
 
@@ -712,7 +758,7 @@ def _backfill_net_amount_dc_stock(
             "moneyflow_dc backfill %s [%s~%s] skipped: %s",
             ts_code, start, end, exc,
         )
-        return 0
+        return FetchResult.empty()
     rows = []
     for r in recs:
         amt = r.get("net_amount")
@@ -724,7 +770,7 @@ def _backfill_net_amount_dc_stock(
             "net_amount_dc": amt,
         })
     if not rows:
-        return 0
+        return FetchResult.empty()
     safe = ts_code.replace(".", "_")
     reg = f"_dc_stock_{safe}_{start}_{end}"
     return _apply_net_amount_dc_patch(con, pd.DataFrame(rows), register_name=reg)
@@ -732,7 +778,7 @@ def _backfill_net_amount_dc_stock(
 
 def _backfill_circ_mv_stock(
     con, client, ts_code: str, start: str, end: str,
-) -> int:
+) -> FetchResult:
     """UPDATE ods_daily_basic.circ_mv from daily_basic API (NULL rows only)."""
     import pandas as pd
 
@@ -745,7 +791,7 @@ def _backfill_circ_mv_stock(
             "daily_basic circ backfill %s [%s~%s] skipped: %s",
             ts_code, start, end, exc,
         )
-        return 0
+        return FetchResult.empty()
     rows = []
     for r in recs:
         circ = r.get("circ_mv")
@@ -757,7 +803,7 @@ def _backfill_circ_mv_stock(
             "circ_mv": circ,
         })
     if not rows:
-        return 0
+        return FetchResult.empty()
     safe = ts_code.replace(".", "_")
     reg = f"_circ_stock_{safe}_{start}_{end}"
     return _apply_circ_mv_patch(con, pd.DataFrame(rows), register_name=reg)
@@ -878,13 +924,11 @@ def fetch_stocks_incremental(client, con, ts_codes: list[str],
                     logger.warning("fetch_stocks_incremental %s [%s~%s] moneyflow skipped: %s",
                                   ts_code, seg_start, seg_end, e)
             elif need_dc:
-                n_dc = _backfill_net_amount_dc_stock(
+                dc_result = _backfill_net_amount_dc_stock(
                     con, client, ts_code, seg_start, seg_end,
                 )
-                if n_dc:
-                    total = _merge_fetch_partial(
-                        total, FetchResult(rows_written=n_dc, api_rows=n_dc),
-                    )
+                if int(dc_result):
+                    total = _merge_fetch_partial(total, dc_result)
 
         prog.tick()
 

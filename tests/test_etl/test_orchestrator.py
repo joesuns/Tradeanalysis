@@ -861,7 +861,7 @@ def test_run_calc_logs_batch_chunk_split(monkeypatch):
     monkeypatch.setattr("backend.etl.orchestrator.run_checkpoint", lambda *a: None)
     monkeypatch.setattr(
         "backend.etl.calc_batch_append.run_batch_append_phase",
-        lambda con, codes, calc_date, force=False, preflight_ctx=None: {
+        lambda con, codes, calc_date, force=False, preflight_ctx=None, indicator_filter=None: {
             "chunk_codes": ["C.SZ"],
             "completed_keys": set(),
             "agg_by_key": {},
@@ -1316,7 +1316,7 @@ def test_run_calc_stale_dwd_merge_preserves_preflight_ctx(temp_db, monkeypatch):
     )
     captured = {"preflight_ctx": None}
 
-    def capture_batch(con, codes, calc_date, force=False, preflight_ctx=None):
+    def capture_batch(con, codes, calc_date, force=False, preflight_ctx=None, indicator_filter=None):
         captured["preflight_ctx"] = preflight_ctx
         return {
             "chunk_codes": [],

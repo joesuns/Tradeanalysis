@@ -1080,6 +1080,11 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
 
         from backend.config import CALC_FAST_SKIP, CALC_APPEND
         from backend.etl.calc_indicators import CALC_ROUTE_SPECS, quote_tail_columns
+        from backend.etl.column_indicator_deps import (
+            active_route_specs,
+            needs_dde_tails,
+            needs_quote_tails,
+        )
         from backend.etl.calc_state import load_calc_state_batch
         from backend.etl.calc_fast_skip import (
             batch_load_quote_tails,
@@ -1090,8 +1095,13 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
         )
 
         completed_keys = set()
+        indicator_filter = None
         if batch_ctx:
             completed_keys = batch_ctx.get("completed_keys", set())
+            indicator_filter = batch_ctx.get("indicator_filter")
+
+        route_specs = active_route_specs(indicator_filter)
+        fallthrough_run_keys = {(ind, freq) for ind, freq, *_ in route_specs}
 
         agg_by_key = defaultdict(CalcResult)
         fast_on = CALC_FAST_SKIP and CALC_APPEND and incremental
@@ -1122,30 +1132,32 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                 "calc.chunk_tails", "state",
                 lambda: load_calc_state_batch(con, chunk), stocks=cn,
             )
-            daily_tails = log_timed_step(
-                "calc.chunk_tails", "quote_daily",
-                lambda: batch_load_quote_tails(
-                    con, chunk, "daily", quote_tail_columns("daily"),
-                ),
-                stocks=cn,
-            )
-            weekly_tails = log_timed_step(
-                "calc.chunk_tails", "quote_weekly",
-                lambda: batch_load_quote_tails(
-                    con, chunk, "weekly", quote_tail_columns("weekly"),
-                ),
-                stocks=cn,
-            )
-            dde_daily = log_timed_step(
-                "calc.chunk_tails", "dde_daily",
-                lambda: batch_load_dde_tails(con, chunk, "daily"),
-                stocks=cn,
-            )
-            dde_weekly = log_timed_step(
-                "calc.chunk_tails", "dde_weekly",
-                lambda: batch_load_dde_tails(con, chunk, "weekly"),
-                stocks=cn,
-            )
+            if needs_quote_tails(indicator_filter):
+                daily_tails = log_timed_step(
+                    "calc.chunk_tails", "quote_daily",
+                    lambda: batch_load_quote_tails(
+                        con, chunk, "daily", quote_tail_columns("daily"),
+                    ),
+                    stocks=cn,
+                )
+                weekly_tails = log_timed_step(
+                    "calc.chunk_tails", "quote_weekly",
+                    lambda: batch_load_quote_tails(
+                        con, chunk, "weekly", quote_tail_columns("weekly"),
+                    ),
+                    stocks=cn,
+                )
+            if needs_dde_tails(indicator_filter):
+                dde_daily = log_timed_step(
+                    "calc.chunk_tails", "dde_daily",
+                    lambda: batch_load_dde_tails(con, chunk, "daily"),
+                    stocks=cn,
+                )
+                dde_weekly = log_timed_step(
+                    "calc.chunk_tails", "dde_weekly",
+                    lambda: batch_load_dde_tails(con, chunk, "weekly"),
+                    stocks=cn,
+                )
 
         from backend.etl.calc_state import upsert_calc_state_batch
 
@@ -1166,6 +1178,7 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                     ts_code, state_map,
                     daily_tails.get(ts_code), weekly_tails.get(ts_code),
                     dde_daily.get(ts_code), dde_weekly.get(ts_code),
+                    specs=route_specs,
                     con=con,
                     dwd_fp_cache=dwd_fp_cache,
                 )
@@ -1210,14 +1223,25 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                 continue
 
             fallthrough_count += 1
-            for indicator_name, freq, result in calc_stock_pipeline(
-                    con, ts_code, calc_date, daily_recalc, weekly_recalc):
-                key = (indicator_name, freq)
-                agg = agg_by_key[key]
-                agg.calculated += result.calculated
-                for reason, items in result.skipped.items():
-                    for code, detail in items:
-                        agg.add_skip(reason, code, detail)
+            if indicator_filter is not None:
+                for indicator_name, freq, result in calc_stock_pipeline_selective(
+                        con, ts_code, calc_date, daily_recalc, weekly_recalc,
+                        run_keys=fallthrough_run_keys):
+                    key = (indicator_name, freq)
+                    agg = agg_by_key[key]
+                    agg.calculated += result.calculated
+                    for reason, items in result.skipped.items():
+                        for code, detail in items:
+                            agg.add_skip(reason, code, detail)
+            else:
+                for indicator_name, freq, result in calc_stock_pipeline(
+                        con, ts_code, calc_date, daily_recalc, weekly_recalc):
+                    key = (indicator_name, freq)
+                    agg = agg_by_key[key]
+                    agg.calculated += result.calculated
+                    for reason, items in result.skipped.items():
+                        for code, detail in items:
+                            agg.add_skip(reason, code, detail)
             _report_calc_progress()
 
         skip_state_records = build_skip_state_records(
@@ -1381,7 +1405,8 @@ def _merge_preflight_after_dwd_rebuild(
 def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
              batch_size: int = 100, calc_date: str = None,
              skip_stale_fetch: bool = False, force: bool = False,
-             preflight_ctx=None):
+             preflight_ctx=None, indicator_filter: list[str] = None,
+             calc_handoff=None):
     """执行 DWS 计算流程。
 
     1. 如果未指定 ts_codes，获取全市场活跃股票
@@ -1637,6 +1662,7 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         batch_ctx = run_batch_append_phase(
             con, codes_to_calc, calc_date, force=force,
             preflight_ctx=preflight_ctx,
+            indicator_filter=indicator_filter,
         )
         if batch_ctx:
             chunk_codes = batch_ctx["chunk_codes"]
@@ -1794,6 +1820,23 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
 
     chunk_stock_count = len({ts for ts, _ in full_items}) + len(fallthrough_codes)
     batch_obs = {}
+    narrow_obs = {}
+    if calc_handoff is not None:
+        narrow_obs = {
+            "run_indicator_filter": calc_handoff.indicator_filter,
+            "calc_routes_narrowed": calc_handoff.calc_routes_narrowed,
+            "active_routes": calc_handoff.active_routes,
+        }
+    elif indicator_filter is not None:
+        from backend.etl.column_indicator_deps import (
+            active_route_keys,
+            calc_routes_narrowed,
+        )
+        narrow_obs = {
+            "run_indicator_filter": indicator_filter,
+            "calc_routes_narrowed": calc_routes_narrowed(indicator_filter),
+            "active_routes": active_route_keys(indicator_filter),
+        }
     if batch_ctx:
         batch_obs = {
             "preflight_source": batch_ctx.get("preflight_source", "cold"),
@@ -1819,6 +1862,7 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 batch_ctx.get("full_by_indicator", {}) if batch_ctx else {}
             ),
             "spec_stale_counts": count_spec_stale_by_indicator(con),
+            **narrow_obs,
             **batch_obs,
         },
     )

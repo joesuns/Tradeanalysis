@@ -4,8 +4,11 @@ import pytest
 
 from backend.db.schema import create_all_tables
 from backend.fetch.ods_diff import (
+    diff_changed_columns,
     partition_changed_daily,
+    partition_changed_rows_detailed,
     values_equal,
+    ODS_DAILY_DIFF_COLS,
 )
 from backend.fetch.ods_daily import _write_ods_daily_diff
 from backend.fetch.fetch_result import FetchResult
@@ -83,6 +86,103 @@ def test_write_ods_daily_diff_adj_change(db_with_schema):
         "SELECT adj_factor FROM ods_daily WHERE ts_code='600831.SH'"
     ).fetchone()[0]
     assert adj == pytest.approx(1.05, abs=1e-6)
+
+
+def test_diff_changed_columns_insert_vs_update():
+    cols = ["vol", "close"]
+    row = {"ts_code": "000001.SZ", "trade_date": "20260612", "vol": 100, "close": 10.0}
+    assert diff_changed_columns(row, None, cols) == ["vol", "close"]
+    existing = {"vol": 100, "close": 10.0}
+    assert diff_changed_columns(row, existing, cols) == []
+    assert diff_changed_columns({**row, "vol": 200}, existing, cols) == ["vol"]
+
+
+def test_partition_changed_rows_detailed_vol_only(db_with_schema):
+    con = db_with_schema
+    con.execute("""
+        INSERT INTO ods_daily
+        (ts_code, trade_date, open, high, low, close, vol, amount, pct_chg, adj_factor)
+        VALUES ('000001.SZ', '20260612', 10, 11, 9, 10.5, 100, 1000, 1.0, 1.0)
+    """)
+    incoming = [{
+        "ts_code": "000001.SZ", "trade_date": "20260612",
+        "open": 10, "high": 11, "low": 9, "close": 10.5,
+        "vol": 200, "amount": 1000, "pct_chg": 1.0, "adj_factor": 1.0,
+    }]
+    changed, unchanged, events = partition_changed_rows_detailed(
+        con, "ods_daily", ODS_DAILY_DIFF_COLS, incoming,
+    )
+    assert len(changed) == 1
+    assert unchanged == 0
+    assert ("000001.SZ", "20260612", "ods_daily", "vol", False) in events
+    assert all(e[3] != "close" for e in events)
+
+
+def test_partition_changed_rows_detailed_insert_marks_is_insert(db_with_schema):
+    con = db_with_schema
+    incoming = [{
+        "ts_code": "000002.SZ", "trade_date": "20260612",
+        "open": 20, "high": 21, "low": 19, "close": 20.5,
+        "vol": 200, "amount": 2000, "pct_chg": 2.0, "adj_factor": 1.0,
+    }]
+    changed, unchanged, events = partition_changed_rows_detailed(
+        con, "ods_daily", ODS_DAILY_DIFF_COLS, incoming,
+    )
+    assert len(changed) == 1
+    assert all(e[4] is True for e in events)
+    assert len(events) == len(ODS_DAILY_DIFF_COLS)
+
+
+def test_write_ods_daily_diff_emits_field_events(db_with_schema):
+    con = db_with_schema
+    rows = [{
+        "ts_code": "600831.SH", "trade_date": "20260612",
+        "open": 10, "high": 11, "low": 9, "close": 10.5,
+        "vol": 100, "amount": 1000, "pct_chg": 1.0, "adj_factor": 1.0,
+    }]
+    result = _write_ods_daily_diff(con, rows)
+    assert result.rows_written == 1
+    assert ("600831.SH", "20260612", "ods_daily", "close", True) in result.changed_field_events
+
+
+def test_fetch_result_merge_field_events():
+    a = FetchResult(
+        rows_written=1,
+        changed_pairs=[("000001.SZ", "20260612")],
+        changed_field_events=[
+            ("000001.SZ", "20260612", "ods_daily_basic", "circ_mv", False),
+        ],
+    )
+    b = FetchResult(
+        rows_written=1,
+        changed_pairs=[("000001.SZ", "20260612")],
+        changed_field_events=[
+            ("000001.SZ", "20260612", "ods_moneyflow", "net_amount_dc", False),
+        ],
+    )
+    merged = a.merge(b)
+    assert len(merged.changed_field_events) == 2
+
+
+def test_net_amount_dc_patch_emits_field_events(db_with_schema):
+    from backend.fetch.ods_daily import _apply_net_amount_dc_patch
+    import pandas as pd
+
+    con = db_with_schema
+    con.execute("""
+        INSERT INTO ods_moneyflow
+        (ts_code, trade_date, buy_lg_vol, sell_lg_vol, net_mf_amount, net_amount_dc)
+        VALUES ('000001.SZ', '20260612', 100, 50, 1000, NULL)
+    """)
+    patch = pd.DataFrame([{
+        "ts_code": "000001.SZ", "trade_date": "20260612", "net_amount_dc": 123.45,
+    }])
+    result = _apply_net_amount_dc_patch(con, patch)
+    assert int(result) == 1
+    assert any(
+        e[3] == "net_amount_dc" and e[2] == "ods_moneyflow"
+        for e in result.changed_field_events
+    )
 
 
 @pytest.fixture

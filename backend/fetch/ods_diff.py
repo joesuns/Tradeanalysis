@@ -8,6 +8,9 @@ FLOAT_ABS_TOL = 1e-4  # price / rate fields (yuan, %)
 FLOAT_LARGE_ABS_TOL = 1.0  # vol / amount / mv (hands, 万元)
 FLOAT_RTOL = 1e-5
 
+# (ts_code, trade_date, ods_table, column, is_insert)
+ChangedFieldEvent = Tuple[str, str, str, str, bool]
+
 ODS_DAILY_DIFF_COLS = (
     "open", "high", "low", "close", "vol", "amount", "pct_chg", "adj_factor",
 )
@@ -82,6 +85,67 @@ def _load_existing_map(
     return {r[0]: dict(zip(col_names, r)) for r in rows}
 
 
+def diff_changed_columns(
+    incoming: dict,
+    existing: Optional[dict],
+    cols: Sequence[str],
+) -> List[str]:
+    """Return column names that differ; INSERT (no existing) → all diff cols."""
+    if existing is None:
+        return list(cols)
+    return [
+        col for col in cols
+        if not values_equal(incoming.get(col), existing.get(col))
+    ]
+
+
+def _field_events_for_row(
+    row: dict,
+    existing: Optional[dict],
+    table: str,
+    diff_cols: Sequence[str],
+) -> List[ChangedFieldEvent]:
+    ts_code = row["ts_code"]
+    trade_date = row["trade_date"]
+    is_insert = existing is None
+    changed_cols = diff_changed_columns(row, existing, diff_cols)
+    if not changed_cols and not is_insert:
+        return []
+    if is_insert:
+        changed_cols = list(diff_cols)
+    return [
+        (ts_code, trade_date, table, col, is_insert)
+        for col in changed_cols
+    ]
+
+
+def partition_changed_rows_detailed(
+    con,
+    table: str,
+    diff_cols: Sequence[str],
+    rows: List[dict],
+    trade_date: Optional[str] = None,
+) -> Tuple[List[dict], int, List[ChangedFieldEvent]]:
+    """Return (rows_to_write, unchanged_count, column-level change events)."""
+    if not rows:
+        return [], 0, []
+    td = trade_date or rows[0]["trade_date"]
+    codes = [r["ts_code"] for r in rows]
+    existing = _load_existing_map(con, table, diff_cols, td, codes)
+    changed: List[dict] = []
+    events: List[ChangedFieldEvent] = []
+    unchanged = 0
+    for row in rows:
+        ex = existing.get(row["ts_code"])
+        row_events = _field_events_for_row(row, ex, table, diff_cols)
+        if row_events:
+            changed.append(row)
+            events.extend(row_events)
+        else:
+            unchanged += 1
+    return changed, unchanged, events
+
+
 def partition_changed_rows(
     con,
     table: str,
@@ -90,19 +154,9 @@ def partition_changed_rows(
     trade_date: Optional[str] = None,
 ) -> Tuple[List[dict], int]:
     """Return (rows_to_write, unchanged_count) for one ODS table batch."""
-    if not rows:
-        return [], 0
-    td = trade_date or rows[0]["trade_date"]
-    codes = [r["ts_code"] for r in rows]
-    existing = _load_existing_map(con, table, diff_cols, td, codes)
-    changed: List[dict] = []
-    unchanged = 0
-    for row in rows:
-        ex = existing.get(row["ts_code"])
-        if ex is None or row_differs(row, ex, diff_cols):
-            changed.append(row)
-        else:
-            unchanged += 1
+    changed, unchanged, _ = partition_changed_rows_detailed(
+        con, table, diff_cols, rows, trade_date=trade_date,
+    )
     return changed, unchanged
 
 
