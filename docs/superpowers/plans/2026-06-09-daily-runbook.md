@@ -16,6 +16,8 @@
 
 **Wave 5 列→指标收窄（run 路径）：** 小范围 ODS 列变更（如 `circ_mv`）时 calc 可仅跑 `dde` 等子集；`CALC_COLUMN_NARROW=0` 关闭。验收：`scripts/smoke_change_driven_refresh.sh --run-wave5`。
 
+**Change-driven refresh 验收状态：** Wave 1–5 + post-merge gates 已合入 `main`（PR #7 `c1b7649`、PR #8 `8306575`）。实库 smoke 证据：[`evidence/2026-06-16-smoke/`](evidence/2026-06-16-smoke/README.md)。双架构正式签字见 [`2026-06-16-post-merge-acceptance-gates.md` §10](2026-06-16-post-merge-acceptance-gates.md#10-审批)。
+
 **运维命令** 推荐 `python -m backend.cli ops <subcmd>`（顶层 `prune`/`refresh-state` 等仍可用，会 DeprecationWarning）。
 
 ## 禁止事项
