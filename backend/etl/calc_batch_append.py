@@ -748,12 +748,20 @@ def batch_full_volume(
     state_map: Optional[dict] = None,
 ):
     from backend.etl.base import load_latest_fingerprints, load_latest_spec_versions
+    from backend.etl.calc_compute_domain import resolve_compute_indices
     from backend.etl.calc_volume import VolumeCalculator
 
     calc = VolumeCalculator(con, freq)
+
+    def _compute(c, _code, df):
+        idx = resolve_compute_indices(df, recalc_start, calc_date)
+        core = c._compute_volume_core(df)
+        return c._compute_volume_derived(
+            core, trend_target_indices=idx or None,
+        )
+
     return _batch_full_loop(
-        calc, ts_codes, calc_date, recalc_start, quote_groups,
-        lambda c, _code, df: c._compute_indicators(df),
+        calc, ts_codes, calc_date, recalc_start, quote_groups, _compute,
         VolumeCalculator.DWS_COLS, VolumeCalculator.FLOAT_COLS,
         _batch_label_zh("volume", freq), min_rows=5,
         spec_version=VolumeCalculator.SPEC_VERSION,
