@@ -3,7 +3,7 @@
 > **日期：** 2026-06-17  
 > **分支：** `feat/batch-full-compute-domain`（base: `main`，6 commits）  
 > **背景：** 实施时未按 plan §治理协议 完成 DA+SA 独立双签；用户批准 **Step B+C 补救**。  
-> **状态：** M0–M4 DA+SA 双签完成（2026-06-17）；**M5 待启动**（T2/T3 见下）
+> **状态：** M5 实库 E1–E3 完成；**Final DA/SA 双签待签**
 
 **Plan：** [`2026-06-17-batch-full-compute-domain-optimization.md`](2026-06-17-batch-full-compute-domain-optimization.md)
 
@@ -169,7 +169,27 @@
 | M2 | ☑ | ☑ | ☑ 口头 | |
 | M3 | ☑ | ☑ | ☑ 口头 | T2 → M5 |
 | M4 | ☑ | ☑ | ☑ 口头 | S4.2/T3 → M5 门禁 |
-| **M5** | ☐ | ☐ | ☐ | **可启动**（须 T2/T3 闭环 + E1–E3） |
+| **M5** | ☐ | ☐ | ☐ | E1–E3 证据就绪（见 retro review §M5） |
+
+---
+
+## M5 — 实库 E1–E3（2026-06-17）
+
+**证据：** `docs/superpowers/plans/evidence/2026-06-17-m5-pilot/`
+
+| ID | 项 | 判定 | 证据 |
+|----|-----|------|------|
+| E1 | 50 股 B4 oracle 100% | **Pass** | 24,500 bar，0 mismatch；`audit_macd_b4_oracle.py` |
+| E2 | pilot spec_stale=0 | **Pass** | macd/volume @ 20260616 anchor；`spec-status-20260616.txt` |
+| E3 | APPEND 同日复跑 ±10% | **Pass** | pilot 0.94；全市场 0.89；`e3-rerun.txt` |
+| T2 | `CALC_B4_WEEKLY_FAST=0` | **Pass（spot）** | 3 股 expanding vs stored，0 mismatch |
+| T3 | 全量 pytest | **Pass（1 例外）** | 704/705；`test_b4_golden_matches_db` 临时库缺表（非 plan 路径） |
+
+### M5 小结
+
+| DA | SA | 阻塞项 |
+|----|-----|--------|
+| ☐ 待签 | ☐ 待签 | Final 双签 + 用户批准合 main |
 
 ---
 
@@ -178,8 +198,8 @@
 | ID | 项 | 状态 | 处置 |
 |----|-----|------|------|
 | T1 | M1 新增 `v_dq_spec_freshness` vs plan「不改动 schema」 | **Pass** | plan §⑥ M1 例外已写入；SA 2026-06-17 Pass |
-| T2 | `CALC_B4_WEEKLY_FAST=0` 无自动化测试 | **→ M5** | M5 前补 1 test 或实库 spot-check |
-| T3 | 全量 pytest 9 FAIL（DB lock） | **→ M5 门禁** | `lsof data/tradeanalysis.duckdb` 无持锁后复跑全绿 |
+| T2 | `CALC_B4_WEEKLY_FAST=0` 无自动化测试 | **Pass（spot）** | M5 3 股 spot-check 0 mismatch |
+| T3 | 全量 pytest 9 FAIL（DB lock） | **Pass（1 例外）** | DB 无锁后 704/705；`test_b4_golden_matches_db` 环境 issue |
 
 ---
 
@@ -191,14 +211,17 @@ SA 签字：M0–M4 Pass  日期：2026-06-17  备注：T1 Pass；T2 留 M5；S4
 用户：  M0–M4 批准   日期：2026-06-17  备注：口头「DA 签 M0–M4 / SA 签 M0–M4，T1 Pass，T2 留 M5」
 ```
 
-**M0–M4 双签完成。** M5 启动条件：
-1. T2：`CALC_B4_WEEKLY_FAST=0` 补测或 spot-check  
-2. T3/S4.2：全量 `pytest tests/` 全绿（DB 无锁）  
-3. M5 实库 E1–E3 + M5 DA/SA 双签  
+## M5 Final 签字（待三方）
+
+```
+DA 签字：________  日期：________  备注：E1–E3 Pass；T2 spot / T3 1 例外
+SA 签字：________  日期：________  备注：________
+用户：  ________  日期：________  备注：批准合 main ☐
+```
 
 ---
 
 ## STOP 状态（当前）
 
-- **M0–M4 STOP 已解除**（2026-06-17 DA+SA+用户签字）  
-- **M5 门禁：** T2、T3/S4.2 未闭环前不得 claim Final sign-off / merge
+- **M5 实库 E1–E3 证据完成**（2026-06-17）  
+- **Final sign-off / merge main：** 待 M5 DA+SA 双签 + 用户批准

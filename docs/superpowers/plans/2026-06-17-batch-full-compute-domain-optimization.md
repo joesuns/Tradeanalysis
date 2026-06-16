@@ -9,7 +9,7 @@
 **Tech Stack:** Python 3.9+, DuckDB, numpy, pandas, pytest, `profile_macd_b4_weekly.py`, `profile_volume_trend_v2.py`
 
 **日期：** 2026-06-17  
-**状态：** M0–M4 DA+SA 双签完成；**M5 待启动**（T2/T3 见 retro review）  
+**状态：** M5 E1–E3 证据完成；**Final DA/SA 双签 + 合 main 待批**  
 **审批：** 用户同意 — 2026-06-17（DA+SA review 门禁 + 违规定停）  
 **ACCEPTANCE_DATE：** `20260616`（S2 实库 pilot 与 E1–E3 一致）
 
@@ -522,26 +522,26 @@ python3 -m backend.cli calc --refresh-spec macd --date 20260616 --dry-run
 
 **前置：** spec-gate hotfix 已合入；`v_dq_spec_freshness` 视图已 `CREATE OR REPLACE`。
 
-- [ ] **M5.1** 备份 DB
-- [ ] **M5.2** `CALC_AUTO_SPEC_REFRESH=0`
-- [ ] **M5.3** Pilot 50 股：
+- [x] **M5.1** 备份 DB
+- [x] **M5.2** `CALC_AUTO_SPEC_REFRESH=0`
+- [x] **M5.3** Pilot 50 股：
 
 ```bash
 python3 -m backend.cli calc --refresh-spec macd --date 20260616 \
   --ts-code $(head -50 codes.txt)  # 或用 --dry-run 先估
 ```
 
-- [ ] **M5.4** Oracle 脚本对比 B4 `trend`/`turning_point` + volume `trend`（stored vs recompute）
-- [ ] **M5.5** `ops spec-status` + `health_check` Section J
-- [ ] **M5.6** APPEND 同日复跑墙钟对比（E3）
+- [x] **M5.4** Oracle 脚本对比 B4 `trend`/`turning_point` + volume `trend`（stored vs recompute）
+- [x] **M5.5** `ops spec-status` + `health_check` Section J
+- [x] **M5.6** APPEND 同日复跑墙钟对比（E3）
 
 ### M5 Final DA+SA + User Sign-off
 
 | ID | 项 | Pass |
 |----|-----|------|
-| E1 | 50 股 oracle 100% | ☐ |
-| E2 | spec_stale=0（已刷指标） | ☐ |
-| E3 | APPEND 不退化 | ☐ |
+| E1 | 50 股 oracle 100% | ☑ |
+| E2 | spec_stale=0（已刷指标） | ☑ |
+| E3 | APPEND 不退化 | ☑ |
 | — | 用户批准合 main | ☐ |
 
 ---
@@ -561,7 +561,8 @@ python3 -m backend.cli calc --refresh-spec macd --date 20260616 \
 | `tests/test_etl/test_calc_compute_domain.py` | **新建** |
 | `tests/test_etl/test_b4_macd_weekly_append.py` | fast oracle |
 | `tests/test_cli/test_ops_spec_status.py` | **新建** |
-| `scripts/profile_macd_b4_weekly.py` | `--mode write_window` |
+| `scripts/audit_macd_b4_oracle.py` | M5 E1 stored vs expanding |
+| `scripts/health_check.py` | Section J spec_freshness @ export anchor |
 
 **不改动：** DWD、export_wide layout、orchestrator CALCULATORS 列表、DWS 基表 DDL。
 

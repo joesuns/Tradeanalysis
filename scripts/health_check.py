@@ -282,6 +282,65 @@ def run(con) -> int:
         minimum=fill_minimum,
     )
 
+    print("=== J. Spec 版本与 MA alignment 质检 ===")
+    c.expect_zero(
+        "ma_daily spec_stale @ ODS max anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='ma' AND freq='daily' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM ods_daily)",
+    )
+    c.expect_zero(
+        "ma_weekly spec_stale @ weekly anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='ma' AND freq='weekly' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM dim_date "
+        "WHERE is_trade_day=1 AND is_week_end=1 "
+        "AND trade_date <= (SELECT MAX(trade_date) FROM ods_daily))",
+    )
+    c.expect_zero(
+        "macd_daily spec_stale @ ODS max anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='macd' AND freq='daily' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM ods_daily)",
+    )
+    c.expect_zero(
+        "macd_weekly spec_stale @ weekly anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='macd' AND freq='weekly' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM dim_date "
+        "WHERE is_trade_day=1 AND is_week_end=1 "
+        "AND trade_date <= (SELECT MAX(trade_date) FROM ods_daily))",
+    )
+    c.expect_zero(
+        "volume_daily spec_stale @ ODS max anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='volume' AND freq='daily' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM ods_daily)",
+    )
+    c.expect_zero(
+        "volume_weekly spec_stale @ weekly anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='volume' AND freq='weekly' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM dim_date "
+        "WHERE is_trade_day=1 AND is_week_end=1 "
+        "AND trade_date <= (SELECT MAX(trade_date) FROM ods_daily))",
+    )
+    c.expect_zero(
+        "ma alignment bear_weakening+ma10_up",
+        """SELECT COUNT(*) FROM v_dws_ma_daily_latest a
+           JOIN dwd_daily_quote q ON a.ts_code=q.ts_code AND a.trade_date=q.trade_date
+           WHERE q.trade_date = (SELECT MAX(trade_date) FROM dwd_daily_quote WHERE is_suspended=0)
+             AND q.is_suspended=0 AND a.alignment='bear_weakening' AND a.ma10_slope > 0.08""",
+    )
+    c.expect_zero(
+        "ma alignment bull_strong+s5flat+s10up",
+        """SELECT COUNT(*) FROM v_dws_ma_daily_latest a
+           JOIN dwd_daily_quote q ON a.ts_code=q.ts_code AND a.trade_date=q.trade_date
+           WHERE q.trade_date = (SELECT MAX(trade_date) FROM dwd_daily_quote WHERE is_suspended=0)
+             AND q.is_suspended=0 AND a.alignment='bull_strong'
+             AND a.ma5_slope BETWEEN -0.08 AND 0.08 AND a.ma10_slope > 0.08""",
+    )
+
     print("=== K. DDE trend content oracle（日线最新 bar） ===")
     from scripts.audit_dde_trend_oracle import audit_oracle
 
