@@ -9,7 +9,7 @@
 **Tech Stack:** Python 3.9+, DuckDB, numpy, pandas, pytest, `profile_macd_b4_weekly.py`, `profile_volume_trend_v2.py`
 
 **日期：** 2026-06-17  
-**状态：** 已审批，M0 实施中  
+**状态：** M4 实施中（pytest + 文档）  
 **审批：** 用户同意 — 2026-06-17（DA+SA review 门禁 + 违规定停）  
 **ACCEPTANCE_DATE：** `20260616`（S2 实库 pilot 与 E1–E3 一致）
 
@@ -54,9 +54,9 @@
 | Milestone | DA 签字 | SA 签字 | 用户 |
 |-----------|---------|---------|------|
 | M0 | ☑ | ☑ | ☑ |
-| M1 | ☐ | ☐ | ☐ |
-| M2 | ☐ | ☐ | ☐ |
-| M3 | ☐ | ☐ | ☐ |
+| M1 | ☑ | ☑ | ☑ |
+| M2 | ☑ | ☑ | ☑ |
+| M3 | ☑ | ☑ | ☑ |
 | M4 | ☐ | ☐ | ☐ |
 | M5 | ☐ | ☐ | ☐ |
 

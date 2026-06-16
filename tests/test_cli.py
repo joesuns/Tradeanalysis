@@ -723,8 +723,8 @@ def test_cmd_calc_refresh_spec_bypasses_run_calc(monkeypatch):
     )
     monkeypatch.setattr(
         "backend.etl.calc_spec_refresh.cmd_refresh_spec",
-        lambda con, calc_date, spec, ts_codes: refresh_calls.append(
-            (calc_date, spec, ts_codes),
+        lambda con, calc_date, spec, ts_codes, dry_run=False: refresh_calls.append(
+            (calc_date, spec, ts_codes, dry_run),
         ),
     )
     monkeypatch.setattr(
@@ -739,5 +739,5 @@ def test_cmd_calc_refresh_spec_bypasses_run_calc(monkeypatch):
     )
     cli.cmd_calc(args)
 
-    assert refresh_calls == [("20260612", "ma,volume", ["000001.SZ"])]
+    assert refresh_calls == [("20260612", "ma,volume", ["000001.SZ"], False)]
     assert run_calc_calls == []
