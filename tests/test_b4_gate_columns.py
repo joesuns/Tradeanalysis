@@ -20,13 +20,16 @@ def test_b4_field_count():
     assert len(B4_ALL_FIELDS) == 14
 
 
-def test_b4_hard_gate_excludes_ma_alignment():
-    assert B4_SOFT_DAILY_FIELDS == ["ma_alignment"]
-    assert len(B4_HARD_DAILY_FIELDS) == 6
-    assert len(B4_HARD_ALL_FIELDS) == 12
+def test_b4_hard_gate_excludes_soft_fields():
+    assert B4_SOFT_DAILY_FIELDS == ["ma_alignment", "dde_alert"]
+    assert len(B4_HARD_DAILY_FIELDS) == 5
+    assert len(B4_HARD_ALL_FIELDS) == 10
     assert "ma_alignment" not in B4_HARD_ALL_FIELDS
+    assert "dde_alert" not in B4_HARD_ALL_FIELDS
     assert "w_ma_alignment" in B4_SOFT_ALL_FIELDS
+    assert "w_dde_alert" in B4_SOFT_ALL_FIELDS
     assert "w_ma_alignment" not in B4_HARD_ALL_FIELDS
+    assert "w_dde_alert" not in B4_HARD_ALL_FIELDS
 
 
 def test_123_daily_macd_trend_maps_to_macd_trend():

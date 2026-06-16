@@ -102,9 +102,9 @@ python -m backend.cli backfill-dde-meta --sync-dwd-only              # 中断恢
 python -m backend.cli backfill-dde-meta --recalc-only --date 20260612  # ODS/DWD 已就绪，仅 calc 闭环
 
 # ===== DDE trend 内容修复（Tier-0 DQ；repair 窗口禁并行 run/calc）=====
-python -m backend.cli repair-dde-trend --date 20260612 --freq daily --dry-run  # 预览 invalidate 范围
-python -m backend.cli repair-dde-trend --date 20260612 --freq daily --ts-code 600831.SH  # 六股 pilot
-python -m backend.cli repair-dde-trend --date 20260612 --freq daily              # 全市场 daily 修复
+python -m backend.cli ops repair-dde-trend --date 20260612 --freq daily --ts-code 600831.SH  # 六股 pilot
+python -m backend.cli ops repair-dde-trend --date 20260612 --freq daily              # 全市场 daily 修复
+python -m backend.cli ops repair-dde-trend --date 20260615 --freq daily --purge-history --ts-code 688120.SH  # 深度修复：清除该股全部 dde/daily 快照后重算
 python -m scripts.audit_dde_trend_oracle --date 20260612 --freq daily --sample 500  # stored vs recompute
 
 # 启动 API
@@ -124,7 +124,7 @@ python -m scripts.collect_divergence_golden smoke --indicator dde --count 25 --s
 python -m scripts.screen_divergence_tradable --date 20260612 --freq weekly --indicator macd
 python -m scripts.screen_divergence_tradable --date 20260612 --freq daily --indicator macd --tradable-only
 
-# ===== B4 硬门禁（12 列，不含 ma_alignment；过渡期对 123 diff）=====
+# ===== B4 硬门禁（10 列，不含 ma_alignment / dde_alert 软层；过渡期对 123 diff）=====
 python3 -m scripts.diff_vs_123 --date 20260609 --breakdown --summary
 python3 -m scripts.verify_b4_gate   # golden 冻结后
 pytest tests/test_b4_gate_regression.py tests/test_b4_gate_columns.py tests/test_b4_gate_diff.py -v
@@ -323,9 +323,10 @@ export（导出层）
 - **DDX2：** EMA(DDX, 5)
 - **背离：** `divergence_structure.compute_dde_structure_divergence` — 与 MACD 同构，`CROSS(DDX,DDX2)` 锚点 + 隔峰柱背 + TG 日标注（dedup=10）；顶区 DDX 峰邻域尖刺过滤；`RECALC_SPEC` lookback=250
 - **可交易背离：** 同 MACD L2 门槛；DDE 为辅信号，`.BJ` 无数据
-- **警惕（B4 `dde_alert` / `w_dde_alert`）：** 123 `_eval_ddx2_slope_reversal` — 相邻 5 窗 DDX2 线性回归斜率拐点（`eps=0`）；`b4_alerts.compute_ddx2_slope_alerts`。`DDECalculator.SPEC_VERSION=v2`
-- **趋势（B4 `dde_trend` / `w_dde_trend`）：** 日线 123 同构 `analyze_moneyflow_trend_optimized` — `moneyflow_dc`+`circ_mv` → DDX1/DDX3 + 5 日 polyfit；缺 dc/circ 日线可回退 `net_mf_amount`/`total_mv`。周线 B4 对齐 `analyze_weekly_dde_trend`：`resample('W')` 独立聚合 **仅 `net_amount_dc`** 与 `circ_mv` 再 inner merge（禁止日级 join 后 resample、周线 trend **禁止** `net_mf_amount`/`total_mv` 回退）、`ddx3.tail(4)` 在全序列 `iloc[-1]`（非 dim_date 周界）；`ddx3` 尾窗含 NaN → flat（不回退 `ddx`）。`ods_moneyflow.net_amount_dc` + `ods_daily_basic.circ_mv` 落库。`trend_strength` 仍基于 DDX2 加权回归
-- **Tier-0 内容 DQ：** 日线 `dde_trend` 须与 B4 moneyflow 重算一致；`scripts/audit_dde_trend_oracle.py` 为 oracle，`health_check` Section K 抽样 200 股（mismatch >0.1% WARN、>1% FAIL）；异常时 `repair-dde-trend` 窄窗 invalidate+`CALC_FORCE_HARD` 重算（见 plan `2026-06-14-dde-trend-repair.md`）
+- **警惕（`dde_alert` / `w_dde_alert`，B4 软层）：** TA-native 相邻 **2-bar** DDX2 线性回归斜率拐点（`eps=0`）；`b4_alerts.compute_ddx2_slope_alerts`；**不对齐** 123 5-bar。仍 export/Excel。
+- **趋势（B4 hard `dde_trend` / `w_dde_trend`）：** 日线 123 同构 `analyze_moneyflow_trend_optimized` — `moneyflow_dc`+`circ_mv` → DDX1/DDX3 + 5 日 polyfit；缺 dc/circ 日线可回退 `net_mf_amount`/`total_mv`。周线 B4 对齐 `analyze_weekly_dde_trend`：`resample('W')` 独立聚合 **仅 `net_amount_dc`** 与 `circ_mv` 再 inner merge（禁止日级 join 后 resample、周线 trend **禁止** `net_mf_amount`/`total_mv` 回退）、`ddx3.tail(4)` 在全序列 `iloc[-1]`（非 dim_date 周界）；`ddx3` 尾窗含 NaN → flat（不回退 `ddx`）。`ods_moneyflow.net_amount_dc` + `ods_daily_basic.circ_mv` 落库。
+- **趋势强度（`dde_trend_strength`，非 B4）：** DDX2 **5-bar** 指数加权回归斜率 / mean(|DDX2|)（decay=0.20）；与 MACD `trend_strength` 同窗。`DDECalculator.SPEC_VERSION=v3`（v3=alert 2-bar + strength 5-bar；v2=123 5-bar alert）
+- **Tier-0 内容 DQ：** 日线 `dde_trend` 须与 B4 moneyflow 重算一致；`scripts/audit_dde_trend_oracle.py` 为 oracle，`health_check` Section K 抽样 200 股（mismatch >0.1% WARN、>1% FAIL）；异常时 `ops repair-dde-trend` 窄窗 invalidate+`CALC_FORCE_HARD` 重算；指定 `--ts-code` 时可加 `--purge-history` 清除该股全部 dde/daily 历史快照（修复 v_*_latest 中旧 calc_date 脏 trend）
 - **数据源限制：** BSE 股票（.BJ）tushare 不提供 moneyflow，DDE 不可用
 - **warmup 周期：** 系统级 warmup = 250 个交易日（Price Position 250d 窗口，所有指标最大值）。补拉时按此窗口计算起始日期，不拉无用历史数据
 

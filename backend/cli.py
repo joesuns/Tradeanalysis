@@ -955,6 +955,7 @@ def cmd_repair_dde_trend(args):
         if args.freq in ("daily", "both"):
             stats["daily"] = prepare_dde_daily_recalc(
                 con, calc_date, ts_codes=args.ts_code, dry_run=args.dry_run,
+                purge_history=getattr(args, "purge_history", False),
             )
         if args.freq in ("weekly", "both"):
             stats["weekly"] = prepare_dde_weekly_recalc(
@@ -1124,6 +1125,11 @@ def _add_repair_dde_trend_args(p):
     p.add_argument("--freq", choices=["daily", "weekly", "both"], default="daily")
     p.add_argument("--ts-code", nargs="+")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--purge-history",
+        action="store_true",
+        help="With --ts-code: delete ALL dde/daily DWS rows for those stocks before recalc",
+    )
 
 
 def _add_backfill_dde_meta_args(p):

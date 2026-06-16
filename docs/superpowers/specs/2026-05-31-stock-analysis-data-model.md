@@ -766,14 +766,9 @@ CREATE TABLE dws_dde_daily (
 | **net_mf_amount** | 直接取自 `dwd_daily_moneyflow` | 万元 |
 | **DDX** | `(buy_lg + buy_elg - sell_lg - sell_elg) / total_vol`；`total_vol=0` → NULL | 大单+超大单净买入量占比 |
 | **DDX2** | EMA(DDX, 5) | SMA 种子 / APPEND `resolve_ema_seeds` |
-| **趋势（上升）** | DDX2 **8-bar** 指数加权回归斜率 > **0.0001** | decay=0.20 |
-| **趋势（下降）** | 加权斜率 < **-0.0001** | 同上 |
-| **趋势（走平）** | 斜率在 [-0.0001, 0.0001] | 同上 |
-| **trend_strength** | 加权斜率 / mean(\|DDX2\|) | 与 trend 同窗口 |
-| **上升拐头** | DDX2 连续 **2** 日上升 → 今日 < 昨日 | `upturn_reverse` |
-| **下降拐头** | DDX2 连续 **2** 日下降 → 今日 > 昨日 | `downturn_reverse` |
-| **上升走平** | 连涨 2 日后 \|变化\|/\|昨日\| ≤ **2%** | 拐头优先 |
-| **下降走平** | 连跌 2 日后 \|变化\|/\|昨日\| ≤ 2% | 同上 |
+| **trend（B4 `dde_trend`）** | DDX3 polyfit 方向 up/down/flat | 日线 5-bar；周线 4-bar；123 moneyflow 路径 |
+| **trend_strength** | DDX2 **5-bar** 加权斜率 / mean(\|DDX2\|) | decay=0.20；与 `dde_trend` 解耦 |
+| **alert（软层 `dde_alert`）** | 相邻 **2-bar** DDX2 回归斜率拐点 | `upturn_reverse` / `downturn_reverse`；**非** 123 5-bar |
 | **顶背离** | `compute_dde_structure_divergence`；锚点 `CROSS(DDX,DDX2)` + 尖刺过滤 | dedup=10；`RECALC_SPEC` lookback=250 |
 | **底背离** | 同上；锚点 `CROSS(DDX2,DDX)`，底区对称 | dedup=10 |
 
@@ -1539,10 +1534,9 @@ python -m backend.cli status
 | 基础 | DDX | (大单+超大单净买入)/total_vol；.BJ 无数据 |
 | | DDX2 | EMA(DDX,5) |
 | | net_mf_amount | 主力净流入额（万元） |
-| 趋势 | 上升/下降/走平 | DDX2 8-bar 加权回归(decay=0.20)，阈值 ±0.0001 |
-| | trend_strength | 加权斜率/mean(\|DDX2\|) |
-| 警惕点 | 上升/下降拐头 | DDX2 连涨/跌2日后逆转 |
-| | 上升/下降走平 | 连涨/跌2日后变化≤2% |
+| 趋势（B4 `dde_trend`） | up/down/flat | DDX3 polyfit；日线 5-bar；周线 4-bar（123 moneyflow 路径） |
+| | trend_strength | DDX2 **5-bar** 加权斜率/mean(\|DDX2\|)；decay=0.20；与 `dde_trend` 解耦 |
+| 警惕（软层 `dde_alert`） | upturn_reverse / downturn_reverse | 相邻 **2-bar** DDX2 回归斜率拐点；**非** 123 5-bar |
 | 背离 | 顶/底背离 | `compute_dde_structure_divergence`；DDX/DDX2 交叉锚点 + 柱背；顶区尖刺过滤；TG 日标注 |
 
 ### 9.5 量能
@@ -2529,6 +2523,14 @@ WHERE calc_date = (
 > - 新增 `backend/etl/divergence_structure.py`：`compute_macd_structure_divergence` / `compute_dde_structure_divergence`
 > - MACD/DDE `RECALC_SPEC` lookback 60→**250**、event_tail→**10**
 > - Volume 量价背离仍用 `base.compute_price_signal_divergence`（window=60, dedup=5）
+
+### 12.86 DDE alert/strength 调参 + B4 soft 层（2026-06-16）
+
+> §6.4 / §9.4 / CLAUDE.md 按 `DDECalculator.SPEC_VERSION=v3` 重对齐：
+> - **`dde_alert` / `w_dde_alert`**：相邻 **2-bar** DDX2 斜率拐点（TA-native）；移出 B4 hard gate（与 `ma_alignment` 同属 soft）
+> - **`dde_trend_strength`**：DDX2 **5-bar** 加权斜率/mean(|DDX2|)（decay=0.20）；与 MACD `trend_strength` 同窗
+> - **`dde_trend`**：不变（日线 DDX3 5-bar；周线 4-bar；仍 B4 hard）
+> - B4 hard gate：**10 列**（日周各 5；extract 仍 14 列）
 
 ---
 
