@@ -3,7 +3,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backend.etl.b4_macd import b4_weekly_series_from_daily
+from backend.etl.b4_macd import (
+    b4_weekly_series_from_daily,
+    b4_weekly_series_from_daily_fast,
+)
 
 
 def _synthetic_daily(n_days: int = 600, seed: int = 42) -> pd.DataFrame:
@@ -92,3 +95,39 @@ def test_b4_weekly_target_indices_multi_bar():
     for idx in targets:
         assert t_sub[idx] == full_t[idx]
         assert c_sub[idx] == full_c[idx]
+
+
+@pytest.mark.parametrize("seed", [42, 99, 2025])
+@pytest.mark.parametrize("n_weeks", [60, 120, 245])
+def test_b4_weekly_fast_path_matches_expanding_all_indices(seed, n_weeks):
+    """Q1: fast single-resample path equals expanding oracle on all indices."""
+    daily = _synthetic_daily(900, seed=seed)
+    week_ends = _week_ends_from_daily(daily, n_weeks)
+    exp_t, exp_c = b4_weekly_series_from_daily(daily, week_ends)
+    fast_t, fast_c = b4_weekly_series_from_daily_fast(daily, week_ends)
+    assert fast_t == exp_t
+    assert fast_c == exp_c
+
+
+@pytest.mark.parametrize("seed", [42, 99])
+def test_b4_weekly_fast_write_window_subset(seed):
+    """Q1: write-window target_indices subset matches expanding."""
+    daily = _synthetic_daily(900, seed=seed)
+    week_ends = _week_ends_from_daily(daily, 120)
+    recalc_start = week_ends[90]
+    calc_date = week_ends[-1]
+    from backend.etl.calc_compute_domain import resolve_compute_indices
+
+    df = pd.DataFrame({"trade_date": week_ends})
+    idx = resolve_compute_indices(df, recalc_start, calc_date)
+    targets = set(idx)
+
+    exp_t, exp_c = b4_weekly_series_from_daily(
+        daily, week_ends, target_indices=targets,
+    )
+    fast_t, fast_c = b4_weekly_series_from_daily_fast(
+        daily, week_ends, target_indices=targets,
+    )
+    for i in idx:
+        assert fast_t[i] == exp_t[i], f"trend idx={i}"
+        assert fast_c[i] == exp_c[i], f"cross idx={i}"

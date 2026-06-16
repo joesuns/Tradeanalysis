@@ -637,6 +637,7 @@ def batch_full_macd(
     state_map: Optional[dict] = None,
 ):
     from backend.etl.base import load_latest_fingerprints, load_latest_spec_versions
+    from backend.etl.calc_compute_domain import resolve_compute_indices
     from backend.etl.calc_macd import MACDCalculator
 
     calc = MACDCalculator(con, freq)
@@ -666,7 +667,20 @@ def batch_full_macd(
     def _compute(c, ts_code, df):
         seeds = seeds_by_code.get(ts_code)
         daily_b4 = daily_b4_groups.get(ts_code) if freq == "weekly" else None
-        return c._compute_indicators(df, ema_seeds=seeds, daily_for_b4=daily_b4)
+        b4_target = None
+        target_idx = None
+        if freq == "weekly":
+            idx = resolve_compute_indices(df, recalc_start, calc_date)
+            if idx:
+                b4_target = set(idx)
+                target_idx = b4_target
+        return c._compute_indicators(
+            df,
+            ema_seeds=seeds,
+            daily_for_b4=daily_b4,
+            target_indices=target_idx,
+            b4_target_indices=b4_target,
+        )
 
     return _batch_full_loop(
         calc, ts_codes, calc_date, recalc_start, quote_groups, _compute,
