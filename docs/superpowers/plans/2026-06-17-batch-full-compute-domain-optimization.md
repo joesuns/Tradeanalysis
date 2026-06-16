@@ -9,7 +9,7 @@
 **Tech Stack:** Python 3.9+, DuckDB, numpy, pandas, pytest, `profile_macd_b4_weekly.py`, `profile_volume_trend_v2.py`
 
 **日期：** 2026-06-17  
-**状态：** STOP — M0–M4 代码已落地；**DA/SA 追溯验收进行中**（见 `2026-06-17-compute-domain-da-sa-retro-review.md`）  
+**状态：** M0–M4 DA+SA 双签完成；**M5 待启动**（T2/T3 见 retro review）  
 **审批：** 用户同意 — 2026-06-17（DA+SA review 门禁 + 违规定停）  
 **ACCEPTANCE_DATE：** `20260616`（S2 实库 pilot 与 E1–E3 一致）
 
@@ -53,14 +53,14 @@
 
 | Milestone | DA 签字 | SA 签字 | 用户 |
 |-----------|---------|---------|------|
-| M0 | ☐ | ☐ | ☑（口头「M0 通过」；DA/SA 追溯验收见 `2026-06-17-compute-domain-da-sa-retro-review.md`） |
-| M1 | ☐ | ☐ | ☑（口头「M1 通过」） |
-| M2 | ☐ | ☐ | ☑（口头「M2 通过」） |
-| M3 | ☐ | ☐ | ☑（口头「M3 通过」） |
-| M4 | ☐ | ☐ | ☐ |
+| M0 | ☑ | ☑ | ☑ |
+| M1 | ☑ | ☑ | ☑ |
+| M2 | ☑ | ☑ | ☑ |
+| M3 | ☑ | ☑ | ☑ |
+| M4 | ☑ | ☑ | ☑ |
 | M5 | ☐ | ☐ | ☐ |
 
-**未双签通过 → 不得进入下一 Milestone。**（2026-06-17 流程补救：M0–M3 代码已落地但 DA/SA 追溯验收未完成，**STOP 至双签完成**。）
+**未双签通过 → 不得进入下一 Milestone。** M0–M4 追溯双签：2026-06-17（见 `2026-06-17-compute-domain-da-sa-retro-review.md`）。
 
 ---
 
@@ -563,7 +563,9 @@ python3 -m backend.cli calc --refresh-spec macd --date 20260616 \
 | `tests/test_cli/test_ops_spec_status.py` | **新建** |
 | `scripts/profile_macd_b4_weekly.py` | `--mode write_window` |
 
-**不改动：** schema DDL、DWD、export_wide layout、orchestrator CALCULATORS 列表。
+**不改动：** DWD、export_wide layout、orchestrator CALCULATORS 列表、DWS 基表 DDL。
+
+**M1 例外（SA T1 Pass，2026-06-17）：** 允许新增只读 DQ 视图 `v_dq_spec_freshness`（`backend/db/schema.py`），供 `ops spec-status` / `health_check` Section J；**非** DWS 语义或 `v_*_latest` 变更。
 
 ---
 

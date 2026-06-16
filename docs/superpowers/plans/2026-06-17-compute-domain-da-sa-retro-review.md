@@ -3,7 +3,7 @@
 > **日期：** 2026-06-17  
 > **分支：** `feat/batch-full-compute-domain`（base: `main`，6 commits）  
 > **背景：** 实施时未按 plan §治理协议 完成 DA+SA 独立双签；用户批准 **Step B+C 补救**。  
-> **状态：** 待 DA / SA / 用户 三方签字（**STOP — 双签完成前禁止 M5**）
+> **状态：** M0–M4 DA+SA 双签完成（2026-06-17）；**M5 待启动**（T2/T3 见下）
 
 **Plan：** [`2026-06-17-batch-full-compute-domain-optimization.md`](2026-06-17-batch-full-compute-domain-optimization.md)
 
@@ -56,7 +56,7 @@
 
 | DA | SA | 阻塞项 |
 |----|-----|--------|
-| ☐ 待签 | ☐ 待签 | 无 |
+| ☑ 2026-06-17 | ☑ 2026-06-17 | 无 |
 
 ---
 
@@ -76,13 +76,13 @@
 |---|--------|------|------|
 | S1.1 | 现有 `calc --refresh-spec` 非 dry-run 行为不变 | **Pass** | `dry_run=False` 默认；`test_run_refresh_spec_invokes_batch_full_when_stale` PASS |
 | S1.2 | 测试不依赖实库 | **Pass** | M1 测试均 `:memory:` DuckDB |
-| S1.3 | **scope：** plan §⑥ 写「不改动 schema」，M1 新增 `v_dq_spec_freshness` | **待议** | `backend/db/schema.py` +48 行 DQ 视图；spec §12 已文档化该视图；**建议 SA 裁定：M1 依赖只读 DQ 视图，不算 DWS/ADS 语义变更** |
+| S1.3 | **scope：** plan §⑥ 写「不改动 schema」，M1 新增 `v_dq_spec_freshness` | **Pass（T1）** | 只读 DQ 视图；plan §⑥ 已增 M1 例外；SA 2026-06-17 裁定 Pass |
 
 ### M1 小结
 
 | DA | SA | 阻塞项 |
 |----|-----|--------|
-| ☐ 待签 | ☐ 待签 | S1.3 待 SA 书面裁定（Pass 或写入 plan 例外） |
+| ☑ 2026-06-17 | ☑ 2026-06-17 | 无（T1 Pass） |
 
 ---
 
@@ -108,11 +108,7 @@
 
 | DA | SA | 阻塞项 |
 |----|-----|--------|
-| ☐ 待签 | ☐ 待签 | 无 |
-
----
-
-## M3 — MACD B4 fast path
+| ☑ 2026-06-17 | ☑ 2026-06-17 | 无 |
 
 ### DA 验收
 
@@ -129,13 +125,13 @@
 | S3.1 | Q5 ≥5× | **Pass** | 10.9×（100 股 × 245 bar） |
 | S3.2 | 未 bump `MACDCalculator.SPEC_VERSION`（仍 v3） | **Pass** | `calc_macd.py` `SPEC_VERSION = "v3"` 无 diff |
 | S3.3 | `CALC_B4_WEEKLY_FAST=0` 回退 expanding | **Pass（代码审查）** | `calc_macd._apply_b4_trend_and_zone` 分支 `b4_weekly_series_from_daily` |
-| S3.4 | **`CALC_B4_WEEKLY_FAST=0` 无集成测试** | **待议** | 建议补 1 条 env 切换 test 或 M5 实库 spot-check；**非 M3 阻塞** |
+| S3.4 | **`CALC_B4_WEEKLY_FAST=0` 无集成测试** | **Defer → M5（T2）** | M5 前补 1 test 或实库 spot-check；**不阻塞 M0–M4 双签** |
 
 ### M3 小结
 
 | DA | SA | 阻塞项 |
 |----|-----|--------|
-| ☐ 待签 | ☐ 待签 | S3.4 待议（可选补测） |
+| ☑ 2026-06-17 | ☑ 2026-06-17 | T2 → M5 |
 
 ---
 
@@ -160,7 +156,7 @@
 
 | DA | SA | 阻塞项 |
 |----|-----|--------|
-| ☐ 待签 | ☐ 待签 | S4.2 须 **DB 无锁后复跑全绿** 或用户书面接受环境例外 |
+| ☑ 2026-06-17 | ☑ 2026-06-17 | S4.2/T3 → **M5 门禁**（DB 无锁后全绿） |
 
 ---
 
@@ -168,40 +164,41 @@
 
 | Milestone | DA | SA | 用户 | 备注 |
 |-----------|----|----|------|------|
-| M0 | ☐ | ☐ | ☑ 口头 | |
-| M1 | ☐ | ☐ | ☑ 口头 | SA：S1.3 待议 |
-| M2 | ☐ | ☐ | ☑ 口头 | |
-| M3 | ☐ | ☐ | ☑ 口头 | SA：S3.4 待议 |
-| M4 | ☐ | ☐ | ☐ | SA：S4.2 待复跑 |
-| **M5** | — | — | — | **禁止启动** |
+| M0 | ☑ | ☑ | ☑ 口头 | |
+| M1 | ☑ | ☑ | ☑ 口头 | T1 Pass |
+| M2 | ☑ | ☑ | ☑ 口头 | |
+| M3 | ☑ | ☑ | ☑ 口头 | T2 → M5 |
+| M4 | ☑ | ☑ | ☑ 口头 | S4.2/T3 → M5 门禁 |
+| **M5** | ☐ | ☐ | ☐ | **可启动**（须 T2/T3 闭环 + E1–E3） |
 
 ---
 
-## 待议项处置（需用户 + SA/DA 裁定）
+## 待议项处置
 
-| ID | 项 | 建议 |
-|----|-----|------|
-| T1 | M1 新增 `v_dq_spec_freshness` vs plan「不改动 schema」 | 写入 plan §⑥ 例外：「只读 DQ 视图，M1 依赖」 |
-| T2 | `CALC_B4_WEEKLY_FAST=0` 无自动化测试 | M5 前补 1 test 或实库 spot-check |
-| T3 | 全量 pytest 9 FAIL（DB lock） | `lsof data/tradeanalysis.duckdb` 确认无持锁进程后复跑 |
+| ID | 项 | 状态 | 处置 |
+|----|-----|------|------|
+| T1 | M1 新增 `v_dq_spec_freshness` vs plan「不改动 schema」 | **Pass** | plan §⑥ M1 例外已写入；SA 2026-06-17 Pass |
+| T2 | `CALC_B4_WEEKLY_FAST=0` 无自动化测试 | **→ M5** | M5 前补 1 test 或实库 spot-check |
+| T3 | 全量 pytest 9 FAIL（DB lock） | **→ M5 门禁** | `lsof data/tradeanalysis.duckdb` 无持锁后复跑全绿 |
 
 ---
 
-## 三方签字（手写/回复）
+## 三方签字
 
 ```
-DA 签字：________  日期：________  备注：________
-SA 签字：________  日期：________  备注：________
-用户：  ________  日期：________  备注：________
+DA 签字：M0–M4 Pass  日期：2026-06-17  备注：数据契约/算域=写域/oracle 等价
+SA 签字：M0–M4 Pass  日期：2026-06-17  备注：T1 Pass；T2 留 M5；S4.2/T3 留 M5 门禁
+用户：  M0–M4 批准   日期：2026-06-17  备注：口头「DA 签 M0–M4 / SA 签 M0–M4，T1 Pass，T2 留 M5」
 ```
 
-**全部 Milestone DA+SA 双签 + 用户确认后**，方可：
-1. 更新 plan 总表 ☑  
-2. 启动 M5 实库 E1–E3  
+**M0–M4 双签完成。** M5 启动条件：
+1. T2：`CALC_B4_WEEKLY_FAST=0` 补测或 spot-check  
+2. T3/S4.2：全量 `pytest tests/` 全绿（DB 无锁）  
+3. M5 实库 E1–E3 + M5 DA/SA 双签  
 
 ---
 
 ## STOP 状态（当前）
 
-- **触发：** S7（DA/SA Review 未完成）+ 流程补救中  
-- **解除条件：** 上表 M0–M4 DA+SA ☐→☑，T1–T3 处置完毕，S4.2 全绿或书面例外  
+- **M0–M4 STOP 已解除**（2026-06-17 DA+SA+用户签字）  
+- **M5 门禁：** T2、T3/S4.2 未闭环前不得 claim Final sign-off / merge
