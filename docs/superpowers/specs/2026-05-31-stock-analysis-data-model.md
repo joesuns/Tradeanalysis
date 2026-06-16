@@ -1946,6 +1946,18 @@ CREATE INDEX idx_ods_moneyflow_date ON ods_moneyflow(trade_date);
 - **运维刷新：** `cli calc --refresh-spec ma[,volume]` 或 spec 发布日 `CALC_FORCE_HARD=1 calc --force`（窄窗 FULL，**非** DWD rebuild）。Runbook：`docs/superpowers/plans/2026-06-09-daily-runbook.md`「算法 SPEC_VERSION 发布」。
 - **质检视图：** `v_dq_spec_freshness`（按指标/freq 统计 latest 截面 spec_ok/spec_stale）；`health_check` Section J。
 
+**Batch FULL 三层域契约（2026-06-17，ADR）：**
+
+batch FULL / spec refresh 须对齐 **读域 / 算域 / 写域**，禁止「写窄窗、算全窗 expanding」：
+
+| 域 | 含义 | FULL / spec refresh |
+|----|------|---------------------|
+| **读域** | tail 245 bar（`batch_load_quote_tails`） | 不变 |
+| **算域** | `[recalc_start, calc_date]` 内 bar 索引（`resolve_compute_indices`） | **必须**只算这些 index |
+| **写域** | 同算域（`insert_dws_batch_multi` narrow write） | compute 须对齐 |
+
+实施与验收见 `docs/superpowers/plans/2026-06-17-batch-full-compute-domain-optimization.md`（Volume trend / MACD B4 weekly P2+；实库 `ACCEPTANCE_DATE=20260616`）。
+
 - **范围外后续项：** 端到端「秒级日更」仍受 ~320s 全市场 freshness-fetch 拖累，需单独立项。
 
 **P3 热路径优化（与全量 golden-master 等价）：**
