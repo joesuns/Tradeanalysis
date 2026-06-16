@@ -9,7 +9,7 @@
 **Tech Stack:** Python 3.9+, DuckDB, numpy, pandas, pytest, `profile_macd_b4_weekly.py`, `profile_volume_trend_v2.py`
 
 **日期：** 2026-06-17  
-**状态：** M4 实施中（pytest + 文档）  
+**状态：** STOP — M0–M4 代码已落地；**DA/SA 追溯验收进行中**（见 `2026-06-17-compute-domain-da-sa-retro-review.md`）  
 **审批：** 用户同意 — 2026-06-17（DA+SA review 门禁 + 违规定停）  
 **ACCEPTANCE_DATE：** `20260616`（S2 实库 pilot 与 E1–E3 一致）
 
@@ -53,14 +53,14 @@
 
 | Milestone | DA 签字 | SA 签字 | 用户 |
 |-----------|---------|---------|------|
-| M0 | ☑ | ☑ | ☑ |
-| M1 | ☑ | ☑ | ☑ |
-| M2 | ☑ | ☑ | ☑ |
-| M3 | ☑ | ☑ | ☑ |
+| M0 | ☐ | ☐ | ☑（口头「M0 通过」；DA/SA 追溯验收见 `2026-06-17-compute-domain-da-sa-retro-review.md`） |
+| M1 | ☐ | ☐ | ☑（口头「M1 通过」） |
+| M2 | ☐ | ☐ | ☑（口头「M2 通过」） |
+| M3 | ☐ | ☐ | ☑（口头「M3 通过」） |
 | M4 | ☐ | ☐ | ☐ |
 | M5 | ☐ | ☐ | ☐ |
 
-**未双签通过 → 不得进入下一 Milestone。**
+**未双签通过 → 不得进入下一 Milestone。**（2026-06-17 流程补救：M0–M3 代码已落地但 DA/SA 追溯验收未完成，**STOP 至双签完成**。）
 
 ---
 
