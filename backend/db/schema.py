@@ -511,6 +511,49 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
             ) = 1
         """)
 
+_DQ_SPEC_EXPECTED = {
+    "macd": "v3",
+    "ma": "v2",
+    "kpattern": "v1",
+    "dde": "v3",
+    "volume": "v2",
+    "price_position": "v1",
+}
+_DQ_ROUTE_INDICATOR = {
+    "macd": "macd",
+    "ma": "ma",
+    "kpattern": "kpattern",
+    "dde": "dde",
+    "volume": "volume",
+    "price_position": "priceposition",
+}
+
+_DQ_SPEC_FRESHNESS_PARTS = []
+for _table_ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
+    _expected = _DQ_SPEC_EXPECTED[_table_ind]
+    _route_ind = _DQ_ROUTE_INDICATOR[_table_ind]
+    for _freq in ["daily", "weekly"]:
+        _view = f"v_dws_{_table_ind}_{_freq}_latest"
+        _DQ_SPEC_FRESHNESS_PARTS.append(f"""
+            SELECT '{_route_ind}' AS indicator, '{_freq}' AS freq,
+                   trade_date AS anchor_trade_date,
+                   COUNT(*) AS total,
+                   COUNT(*) FILTER (
+                       WHERE COALESCE(spec_version, 'v1') = '{_expected}'
+                   ) AS spec_ok,
+                   COUNT(*) FILTER (
+                       WHERE COALESCE(spec_version, 'v1') <> '{_expected}'
+                   ) AS spec_stale,
+                   '{_expected}' AS expected_spec
+            FROM {_view}
+            GROUP BY trade_date
+        """)
+
+_V_DQ_SPEC_FRESHNESS_DDL = (
+    "CREATE OR REPLACE VIEW v_dq_spec_freshness AS\n"
+    + "\nUNION ALL\n".join(_DQ_SPEC_FRESHNESS_PARTS)
+)
+
 _V_INDICATOR_AVAILABILITY_DDL = """
 CREATE VIEW IF NOT EXISTS v_indicator_availability AS
 WITH latest_calc AS (
@@ -958,6 +1001,9 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     for ddl in _LATEST_VIEW_DDL:
         con.execute(ddl)
 
+    # Spec freshness DQ view (ops spec-status / health_check Section J)
+    con.execute(_V_DQ_SPEC_FRESHNESS_DDL)
+
     # ADS wide views (4)
     for ddl in _ADS_WIDE_VIEWS_DDL:
         con.execute(ddl)
@@ -1006,7 +1052,7 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
     """Drop all tables and views in reverse dependency order (for testing only)."""
     # Views first
     _all_views = (
-        ["v_indicator_availability",
+        ["v_indicator_availability", "v_dq_spec_freshness",
          "v_ads_index_wide_weekly", "v_ads_index_wide",
          "v_ads_analysis_wide_weekly", "v_ads_analysis_wide_daily",
          "v_data_freshness"]

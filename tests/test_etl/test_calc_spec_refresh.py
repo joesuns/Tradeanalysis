@@ -102,3 +102,30 @@ def test_cmd_refresh_spec_rejects_empty_indicator_list():
     with pytest.raises(ValueError, match="at least one indicator"):
         cmd_refresh_spec(con, "20260612", "  , ")
     con.close()
+
+
+def test_run_refresh_spec_dry_run_no_writes(monkeypatch):
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    ensure_calc_state_table(con)
+    upsert_calc_state(
+        con, "000001.SZ", "daily", "ma", "20260612", "fp", "20260612",
+        spec_version="v1",
+    )
+
+    batch_called = []
+
+    def fake_batch_full(*args, **kwargs):
+        batch_called.append(True)
+        return {}
+
+    monkeypatch.setattr(
+        "backend.etl.calc_spec_refresh.run_batch_full_phase", fake_batch_full,
+    )
+
+    summary = run_refresh_spec(con, "20260612", ["ma"], dry_run=True)
+    assert summary.get("dry_run") is True
+    assert summary.get("refreshed", 0) == 0
+    assert summary.get("stale_groups")
+    assert batch_called == []
+    con.close()

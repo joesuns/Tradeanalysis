@@ -170,7 +170,10 @@ def cmd_calc(args, skip_stale_fetch=False):
         if refresh_spec:
             from backend.etl.calc_spec_refresh import cmd_refresh_spec
 
-            cmd_refresh_spec(con, calc_date, refresh_spec, ts_codes)
+            cmd_refresh_spec(
+                con, calc_date, refresh_spec, ts_codes,
+                dry_run=getattr(args, "dry_run", False),
+            )
             run_checkpoint(con)
             return
 
@@ -1188,6 +1191,24 @@ def _register_ops_subparsers(ops_sp):
     )
     _add_repair_weekly_args(p)
 
+    p = ops_sp.add_parser(
+        "spec-status",
+        help="Show v_dq_spec_freshness for anchor date(s)",
+    )
+    p.add_argument("--date", required=True, help="Analysis anchor YYYYMMDD")
+
+
+def cmd_ops_spec_status(args):
+    from backend.db.connection import get_connection
+    from backend.etl.ops_spec_status import cmd_spec_status
+
+    con = get_connection()
+    try:
+        trade_date = _ensure_trade_date(con, _resolve_trade_date(con, args.date))
+        cmd_spec_status(con, trade_date)
+    finally:
+        con.close()
+
 
 def main():
     from backend.cli_dates import add_date_range_arguments
@@ -1221,6 +1242,11 @@ def main():
         "--refresh-spec",
         metavar="INDICATORS",
         help="Narrow FULL for stale spec_version only (e.g. ma or ma,volume); skips run_calc",
+    )
+    cp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --refresh-spec: report stale groups only; no DWS writes",
     )
 
     # export
@@ -1338,6 +1364,7 @@ def main():
         "refresh-state": cmd_refresh_state,
         "prune": cmd_prune,
         "repair-weekly": cmd_repair_weekly,
+        "spec-status": cmd_ops_spec_status,
         "query": cmd_query,
         "status": cmd_status,
     }
