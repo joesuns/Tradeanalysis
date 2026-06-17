@@ -1538,6 +1538,10 @@ python -m backend.cli status
 | | trend_strength | DDX2 **5-bar** 加权斜率/mean(\|DDX2\|)；decay=0.20；与 `dde_trend` 解耦 |
 | 警惕（软层 `dde_alert`） | upturn_reverse / downturn_reverse | 相邻 **2-bar** DDX2 回归斜率拐点；**非** 123 5-bar |
 | 背离 | 顶/底背离 | `compute_dde_structure_divergence`；DDX/DDX2 交叉锚点 + 柱背；顶区尖刺过滤；TG 日标注 |
+| 内容 DQ（Tier-0） | stored vs B4 oracle | `scripts/audit_dde_trend_oracle.py` 全历史重算；`health_check` Section K 抽样 200 股 |
+| 内容 stale 防复发（P0） | dc/circ patch → invalid | `net_amount_dc`/`circ_mv` ODS 补洞 + DWD rebuild 后，`run`/`refresh` 自动删 dde/daily @ calc_date DWS + state 再 calc |
+
+> **P0 根因（000550 类）：** dc 晚到 → 首次 calc trend 错 → `refresh_state` 对齐 fp 但不写 DWS → 无新 bar SKIP。Plan：`docs/superpowers/plans/2026-06-17-dde-content-invalidation-p0.md`。
 
 ### 9.5 量能
 

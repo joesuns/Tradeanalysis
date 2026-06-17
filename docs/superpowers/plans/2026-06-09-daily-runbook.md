@@ -158,8 +158,8 @@ python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date YYYYM
 | 步骤 | 命令 | 验收 |
 |------|------|------|
 | 1 Oracle 基线 | `python3 scripts/audit_dde_trend_oracle.py --date YYYYMMDD --freq daily --sample 500` | 记录 mismatch（repair 前） |
-| 2 六股 pilot | `python3 -m backend.cli repair-dde-trend --date YYYYMMDD --freq daily --ts-code 600831.SH ...` | oracle 6/6 |
-| 3 全市场 daily | `python3 -m backend.cli repair-dde-trend --date YYYYMMDD --freq daily` | sample 500 mismatch < 0.1% |
+| 2 六股 pilot | `python3 -m backend.cli ops repair-dde-trend --date YYYYMMDD --freq daily --ts-code 600831.SH ...` | oracle 6/6 |
+| 3 全市场 daily | `python3 -m backend.cli ops repair-dde-trend --date YYYYMMDD --freq daily` | sample 500 mismatch < 0.1% |
 | 4 验收 | `python3 scripts/audit_dde_trend_oracle.py --date YYYYMMDD --freq daily --sample 500` | exit 0 |
 
 **禁止：** `rebuild_all_dwd`、12 指标无差别 `--force`、repair 期间并行 `run`。
@@ -167,6 +167,18 @@ python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date YYYYM
 **反面教材：** 仅 `calc --refresh-spec dde` 无法修复（`find_spec_stale_codes` 返回 0）。
 
 **2026-06-14 实库 repair 已完成（calc_date=20260612）：** oracle sample 500 mismatch=0；health_check Section K PASS。
+
+**2026-06-17 P0 防复发（已接线）：** `net_amount_dc` / `circ_mv` ODS 补洞 + DWD rebuild 后，`cli run` / `cli refresh` 在 `refresh_state` 之后自动 `maybe_invalidate_dde_after_column_patch`（删 dde/daily @ calc_date DWS + state → calc 重算 trend）。Plan：`docs/superpowers/plans/2026-06-17-dde-content-invalidation-p0.md`。
+
+**2026-06-16 Anchor L2（实库）：** bulk repair 59 股 + oracle sample 500 mismatch=0；health_check PASS。证据：`docs/superpowers/plans/evidence/2026-06-17-anchor-l2/`。
+
+**Oracle 口径（2026-06-17）：** `audit_dde_trend_oracle` 默认**全历史**重算（非 tail255），避免 EMA60 暖机假阳性；单股全历史审计较慢（~7min/股）。
+
+| 场景 | 命令 |
+|------|------|
+| 日常抽检 | `python3 -m scripts.audit_dde_trend_oracle --date YYYYMMDD --freq daily --sample 500` |
+| 定点 repair（存量脏 trend） | `python3 -m backend.cli ops repair-dde-trend --date YYYYMMDD --freq daily --ts-code ...` |
+| repair 后 MA v2 副作用 | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma --ts-code ...` |
 
 ---
 
@@ -183,7 +195,7 @@ python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date YYYYM
 
 预览不写库：`python -m backend.cli refresh-state --date YYYYMMDD --dry-run`
 
-**禁止**：用 `refresh-state` 替代「DWD 尾窗数值真变且须重算 DWS」的场景——那种情况须 FULL chunk 或按股重算。
+**禁止**：用 `refresh-state` 替代「DWD 尾窗数值真变且须重算 DWS」的场景——那种情况须 FULL chunk 或按股重算。**例外（P0，2026-06-17）：** `net_amount_dc`/`circ_mv` 列 patch 触发的 dde trend 内容 stale，`run`/`refresh` 路径已自动 invalid dde/daily DWS+state（见上节 P0 防复发）。
 
 ## SLA 验收（M4 真新日）
 

@@ -33,4 +33,4 @@ python3 -m backend.cli refresh --date 20260616 --indicator ma \
 ## Follow-ups
 
 1. Fix `audit_dde_trend_oracle.py` — **done (2026-06-17):** default full history, not tail255
-2. P0: dde content invalidation after `net_amount_dc`/`circ_mv` patch + refresh_state — see `docs/superpowers/plans/2026-06-17-dde-content-invalidation-p0.md`
+2. P0: dde content invalidation after `net_amount_dc`/`circ_mv` patch + refresh_state — **done (2026-06-17):** commit `588d072`, plan M1–M3 closed
