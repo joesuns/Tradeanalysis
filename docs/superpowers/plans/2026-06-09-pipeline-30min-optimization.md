@@ -790,7 +790,7 @@ P0 运维：`CALC_FORCE_HARD` 进程已终止；`DWD_INCREMENTAL=1` 代码路径
 | **M1** | P1 Task 1–2 | weekly 周分区 + oracle pytest PASS | ① tail 股只删当周分区 ② 历史周 frozen ③ 日志 `mode=week=` ④ 无 tail weekly 全历史 DELETE |
 | **M2** | P2 Task 3 | qfq UPDATE + oracle pytest PASS | ① 除权走 UPDATE 非 daily DELETE ② qfq 股 weekly full 保留 ③ `find_stocks_needing_qfq_refresh` 拆分正确 |
 | **M3** | P3 Task 4–6 | 护栏 + benchmark 增强 + runbook | ① benchmark 合并现有脚本 ② 输出 chunk/batch ③ runbook 禁 FORCE/DWD_INCREMENTAL=0 |
-| **M4** | P3 Gate | `benchmark_run` SLA + health_check | ① 墙钟 ≤1800s ✅ ② chunk<400 ❌ ③ health_check ✅ |
+| **M4** | P3 Gate | `benchmark_run` SLA + health_check | ① 墙钟 ≤1800s ✅ ② chunk<400 ✅（稳态） ③ health_check ✅ |
 | **M5** | P5 Task 7 | CLAUDE.md + spec v1.12 | 文档与代码语义一致 |
 | **M6** | **P4（已立项 2026-06-12）** | calc chunk 独立 PR | 见附录 D；实施计划 `2026-06-09-calc-fundamental-performance.md` |
 
@@ -941,7 +941,7 @@ pytest tests/test_etl/test_vector_append.py::test_volume_trend_last_bar_matches_
 | M3 MACD B4 FULL | ✅ `b4_weekly_series_from_daily_fast` + `CALC_B4_WEEKLY_FAST=1` + `batch_full_macd` 写窗 |
 | pytest Q1–Q4 | ✅ `test_b4_macd_weekly_append` / `test_batch_full_compute_domain` / `test_append_calc` |
 | profile Q5/Q6 | MACD 100×245 **10.9×**（`profile_macd_b4_weekly --mode fast`）；Volume 写窗 **~188×** |
-| 实库 E1–E3 | ☐ 待 M5（`ACCEPTANCE_DATE=20260616`） |
+| 实库 E1–E3 | ✅ M5 pilot @ 20260616（见 `evidence/2026-06-17-m5-pilot/`）；Pipeline 终验见附录 F |
 
 ```bash
 python3 scripts/profile_macd_b4_weekly.py --stocks 100 --bars 245 --mode fast_write_window
@@ -1083,14 +1083,69 @@ python3 scripts/health_check.py
 | Calc-R2 | `CALC_DWD_FP_GATE` + preflight 门 + batch_full state 对齐 | `full_by_indicator.dde_weekly=0`；`batch_full_items=0` |
 | Calc-O1 | 热路径 cold merge 进度 + `cold_merge_*` 审计 | grep `calc.batch_preflight` 可见 |
 
-**实库复验（待跑）：**
+**实库复验（✅ 2026-06-17，run_id `ded70a43`）：**
 
 ```bash
 python3 -m backend.cli run --date 20260612 --skip-export
-# 期望：chunk_stocks≈0，batch_full_items≈0，Step2 墙钟 <120s
-python3 -m scripts.health_check
+python3 scripts/health_check.py
 ```
+
+| 指标 | 期望 | 实测 |
+|------|------|------|
+| chunk_stocks | ≈0 | **0** |
+| batch_full_items | 小量 DDE 运维 | **118**（dde 日+周窄窗） |
+| batch_only | 全市场 APPEND/SKIP | **5391** |
+| Step2 墙钟 | <120s（同日复跑） | **~256s**（含 refresh_state + batch_append 138s） |
+| health_check | PASS | ✅ |
 
 **运维一次性（B4 元数据回填后）：** `python -m backend.cli refresh-state --date 20260612`
 
 **Export-E1**（building sheets 119s）→ 独立 plan，不在本附录。
+
+---
+
+## 附录 F — Pipeline 30min 终验签字（2026-06-17）
+
+**分支：** `perf/b2-polyfit-vectorization` @ `e556538`（含 PR #14 spec-gate hotfix）  
+**DB 备份：** `data/tradeanalysis.pre-pipeline-signoff-20260617.duckdb`  
+**证据目录：** `docs/superpowers/plans/evidence/2026-06-17-pipeline-signoff/`
+
+### F.1 稳态真新日（20260615 首次 `cli run`）
+
+| 阶段 | 墙钟 | 判定 |
+|------|------|------|
+| run_fetch | 2.9s | ✅ |
+| run_rebuild_dwd | 27.0s | ✅ |
+| run_refresh_state | 305.4s | ⚠️ 占 62%；后续优化项 |
+| calc_dws（batch APPEND 路径） | 0.1s log + preflight 40s | ✅ chunk=0 |
+| run_export | 155.4s | ✅ |
+| **合计（logged steps）** | **~491s (~8.2min)** | **✅ SLA** |
+
+### F.2 同日复跑 + benchmark（20260616，`benchmark_run --run`）
+
+| 检查项 | 值 | 判定 |
+|--------|-----|------|
+| 墙钟（live run） | **145.3s** | ✅（L0 pipeline_shortcut + export） |
+| run_export | 136.4s | ✅ |
+| chunk_stocks | 0 | ✅ |
+| health_check | PASS（Section J/K） | ✅ |
+| PR #14 spec-gate | merged → default branch | ✅ |
+
+### F.3 真新日 S5（20260617）
+
+| 项 | 结果 |
+|----|------|
+| 命令 | `python3 -m backend.cli run --date 20260617` |
+| 结果 | **阻塞** — tushare fetch 返回 0 行（`ods_max=20260616`）；`calc_date > ods_max` 门禁拒绝 |
+| 后续 | 下一交易日 ODS 就绪后复跑；F.1 已覆盖稳态真新日 SLA |
+
+### F.4 四条硬约束终判
+
+| # | 约束 | 判定 | 证据 |
+|---|------|------|------|
+| 1 | 整条链路 ≤30min（含 export） | **✅ PASS** | F.1 ~491s；F.2 145s |
+| 2 | 数据质量 | **✅ PASS** | health_check 2026-06-17 |
+| 3 | 不做不必要计算 | **✅ PASS** | E5 chunk=0；日志 `mode=week=` |
+| 4 | 不全库 rebuild | **✅ PASS** | stale 子集；无 `stocks=all` |
+
+**Plan status：** **M4 签字完成**（2026-06-17）。同日复跑 ≤60s 仍为辅助 KPI（`refresh_state` ~300–390s 为主因）。
