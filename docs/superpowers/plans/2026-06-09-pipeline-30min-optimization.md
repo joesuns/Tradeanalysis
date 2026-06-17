@@ -1135,7 +1135,7 @@ python3 scripts/health_check.py
 
 | 项 | 结果 |
 |----|------|
-| fetch | `cli fetch --start 20260617 --end 20260617` → **5504** 行（前置；首次 run 时 ODS 未就绪） |
+| fetch | `cli fetch --start 20260617 --end 20260617` → **5504** 行（前置；仅 `ods_daily`；basic/mf 当时 API 空窗 — 见 **F.5.1**） |
 | 命令 | `python3 -m backend.cli run --date 20260617`（含 export） |
 | run_id | `82052935` |
 | **墙钟（Step1→Done）** | **1587s (~26.4min)** | ✅ SLA |
@@ -1160,4 +1160,58 @@ python3 scripts/health_check.py
 | 3 | 不做不必要计算 | **✅ PASS** | E5 chunk=0；日志 `mode=week=` |
 | 4 | 不全库 rebuild | **✅ PASS** | stale 子集；无 `stocks=all` |
 
-**Plan status：** **M4 签字完成**（2026-06-17）。同日复跑 ≤60s 辅助 KPI — **L0 已验收**（20260617 稳态 **7.6s**）；refresh_state 优化见 `docs/superpowers/plans/2026-06-17-refresh-state-same-day-60s.md`（**签字完成** @ `e8983b2`）。
+### F.5 脚注（2026-06-18 补记；不改 F.1–F.4 原签字数值）
+
+#### F.5.1 `run_fetch rows=10693`（20260617 10:19 UTC）— 非 diff 误报
+
+**现象：** 同日下午第二次 `run --date 20260617`，`ods_etl_log.run_fetch` 记 `ods_rows_written=10693`、`changed_codes_count=5504`，触发全链路 DWD+calc（~21min），易被误判为「假同日复跑回归」。
+
+**实库拆解（`ods_etl_log` + `fetched_at`）：**
+
+| 分量 | 行数 | 说明 |
+|------|------|------|
+| `ods_daily_basic` | **5502** | 首次写入（`fetched_at` 18:00 档） |
+| `ods_moneyflow` | **5189** | 首次写入（同上） |
+| `ods_daily` | **0** | 07:55 已写入 5504，diff 未变 |
+| **合计** | **10693** | 5502 + 5189 |
+
+**根因链（置信度：高，有 `fetched_at` 时间轴 + `affected_ods_columns` 交叉验证）：**
+
+1. **S5 前置 `cli fetch`（07:55 UTC）** 仅落库 **`ods_daily` 5504 行**（`affected_ods_columns` 仅 daily 8 列；`api_rows≈11034` ≈ adj+daily）。同期 tushare **`daily_basic` / `moneyflow` 接口对该交易日返回空**，故 basic/mf 未写 ODS。
+2. **S5 第一次 `run`（07:55 UTC，`skip_covered=False`）** 仍调 API，但 basic/mf 空窗 → **`run_fetch rows=0`**；calc+export 在 **缺 basic/mf** 的 ODS 上完成（`health_check` 仍 PASS，属已知门禁缺口）。
+3. **第二次 `run`（10:19 UTC）** basic/mf 就绪 → 10693 行为 **补洞首次 INSERT**（非 OHLCV 全市场漂移）。`changed_codes_count=5504` 为 basic/mf 并集股票数。
+4. **10:18 `run_fetch status=running` 孤儿行** — 中断/并发尝试，10:19 成功 run 覆盖；可忽略。
+
+**与 `rows=2`（turnover_rate）区分：** 10693 为 **calc-affecting 首次写入**（应重算）；2 行为装饰列 drift（见 F.5.3）。
+
+**搁置项（P1，未实施）：** ODS 三表完备门禁（有 daily 无 basic/mf 时 block calc）；真新日 runbook 建议 **单命令 `run --date X`**，避免「cli fetch 半拉 + 数小时后 run」。
+
+#### F.5.2 同日复跑 benchmark @ 20260617（Export-E1 后）
+
+| Run | 条件 | 墙钟 | 说明 |
+|-----|------|------|------|
+| **A** | `fetch rows=2`（turnover_rate） | **~1299s** | L0 未命中 → DDE batch_full ~836s；**非稳态 KPI** |
+| **B** | `fetch rows=0`，L0 命中 | **~68s** | skip DWD+calc；export **~59s**（building sheets **~28s**） |
+
+命令：`python3 -m backend.cli run --date 20260617 2>&1 | grep -E "progress \|pipeline L0|cosmetic"`
+
+Export-E1 实库签字：`docs/superpowers/plans/2026-06-14-export-sheet-perf.md`（building sheets ~105–140s → **~30s**；export 总 **~69s**）。
+
+#### F.5.3 L0 cosmetic drift fix（`e69569b`，2026-06-18）
+
+**问题：** `turnover_rate` 等 **无指标映射** 列 API 修订 → `rows_written=2` → L0/`data_mutated` 误阻断 → 触发 Run A 级联。
+
+**修复：** L0 / calc 幂等 / DWD rebuild 改看 **`fetch_blocks_dwd_calc`**（calc-affecting events），装饰列 drift 打 `cosmetic ODS drift ignored`。
+
+**验收：** `tests/test_etl/test_pipeline_context.py::test_compute_skip_dwd_calc_true_when_cosmetic_turnover_rate_only`；稳态复测期望 Run B（~68s）。
+
+#### F.5.4 辅助 KPI 更新（L0 含 export）
+
+| 场景 | 墙钟 | 证据 |
+|------|------|------|
+| L0 `--skip-export` | **7.6s** | R2b @ `e8983b2` |
+| L0 **含 export**（Export-E1 后） | **~68s** | F.5.2 Run B；Export-E1 签字 |
+
+---
+
+**Plan status：** **M4 签字完成**（2026-06-17）。同日复跑 ≤60s 辅助 KPI — L0 **`--skip-export` 7.6s**（R2b）；**含 export ~68s**（Export-E1 + F.5.2 Run B）。脚注 F.5 补记 fetch 10693 / cosmetic L0（`e69569b`）。refresh_state 优化见 `docs/superpowers/plans/2026-06-17-refresh-state-same-day-60s.md`（**签字完成** @ `e8983b2`）。**P1 搁置：** ODS 三表完备门禁（F.5.1）。
