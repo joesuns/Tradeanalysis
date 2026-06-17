@@ -498,6 +498,9 @@ def test_run_calc_skips_rebuild_when_only_weekly_fetch_and_ods_full(monkeypatch)
     """weekly_fetch + ODS 已满 + to_fetch 空 → 不得 rebuild_all_dwd。"""
     import duckdb
     from backend.etl import orchestrator as orch
+    from tests.test_etl.helpers import patch_run_calc_dim_deps
+
+    patch_run_calc_dim_deps(monkeypatch)
 
     con = duckdb.connect(":memory:")
     rebuild_calls = []
@@ -895,6 +898,9 @@ def test_run_calc_uses_thread_pool(monkeypatch):
     """run_calc should dispatch chunks via ThreadPoolExecutor (not multiprocessing)."""
     import duckdb
     from backend.etl.orchestrator import run_calc
+    from tests.test_etl.helpers import patch_run_calc_dim_deps
+
+    patch_run_calc_dim_deps(monkeypatch)
 
     con = duckdb.connect(":memory:")
     calls = []
@@ -1202,6 +1208,9 @@ def test_count_week_end_bars_respects_list_date_floor():
 def test_run_calc_refreshes_state_after_stale_dwd_rebuild(temp_db, monkeypatch):
     """G3 stale DWD rebuild 后应 refresh affected codes。"""
     from backend.etl import orchestrator as orch
+    from tests.test_etl.helpers import patch_run_calc_dim_deps
+
+    patch_run_calc_dim_deps(monkeypatch)
 
     refresh_calls = []
 
@@ -1297,6 +1306,9 @@ def test_run_calc_stale_dwd_merge_preserves_preflight_ctx(temp_db, monkeypatch):
     """G3 stale DWD path must pass merged preflight_ctx into batch_append."""
     from backend.etl import orchestrator as orch
     from backend.etl.calc_preflight_context import CalcPreflightContext
+    from tests.test_etl.helpers import patch_run_calc_dim_deps
+
+    patch_run_calc_dim_deps(monkeypatch)
 
     monkeypatch.setattr(
         "backend.fetch.ods_daily.get_all_active_codes", lambda con: ["A.SZ"],
