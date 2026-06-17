@@ -29,6 +29,36 @@ def _compute_slope_pct(series: np.ndarray, window: int = 5) -> np.ndarray:
     return result
 
 
+def _layer3_fallback_alignment(
+    above: bool,
+    s5_flat: bool,
+    s10_flat: bool,
+    s5_up: bool,
+    s5_dn: bool,
+    s10_up: bool,
+    s10_dn: bool,
+):
+    """Layer 3 eight-cell map (MACalculator.SPEC_VERSION=v2, data-model §6.3)."""
+    if above:
+        if s5_up and s10_flat:
+            return "bull_building"
+        if s5_flat and s10_up:
+            return "bull_building"
+        if s5_dn and s10_flat:
+            return "bull_weakening"
+        if s5_flat and s10_dn:
+            return "bull_weakening"
+    else:
+        if s5_dn and s10_flat:
+            return "bear_building"
+        if s5_flat and s10_up:
+            return "bear_building"
+        if s5_up and s10_flat:
+            return "bear_weakening"
+        if s5_flat and s10_dn:
+            return "bear_strong"
+    return None
+
 
 class MACalculator:
     """Moving Average indicator calculator. Computes MA5, MA10, bias, slope,
@@ -179,18 +209,13 @@ class MACalculator:
                 result[i] = "bear_weakening"
             elif not above and s5_up and s10_up:
                 result[i] = "bear_rolling"
-            # Layer 3: single-slope transitional (exactly one flat, one trending)
+            # Layer 3: single-slope transitional — v2 eight-cell lookup (spec §6.3)
             elif s5_flat != s10_flat:
-                if above:
-                    if s5_up or s10_up:
-                        result[i] = "bull_building" if s5_up else "bull_strong"
-                    elif s5_dn or s10_dn:
-                        result[i] = "bull_weakening"
-                else:
-                    if s5_dn or s10_dn:
-                        result[i] = "bear_building" if s5_dn else "bear_strong"
-                    elif s5_up or s10_up:
-                        result[i] = "bear_weakening"
+                fb = _layer3_fallback_alignment(
+                    above, s5_flat, s10_flat, s5_up, s5_dn, s10_up, s10_dn,
+                )
+                if fb is not None:
+                    result[i] = fb
 
         return result
 
