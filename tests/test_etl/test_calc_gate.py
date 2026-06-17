@@ -73,6 +73,38 @@ def test_data_mutated_since_last_calc_detects_fetch_after_calc():
     con.close()
 
 
+def test_data_mutated_since_last_calc_ignores_cosmetic_turnover_rate_drift():
+    import json
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.calc_gate import data_mutated_since_last_calc
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    comp = json.dumps({"calc_date": "20260608", "ods_max": "20260608"})
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('1', 'calc_dws', '2026-06-08T10:00:00', 't1', 'success', 1, '', ?)""",
+        [comp],
+    )
+    cosmetic = json.dumps({
+        "ods_rows_written": 2,
+        "changed_codes_count": 2,
+        "affected_ods_columns": ["turnover_rate"],
+    })
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('2', 'run_fetch', '2026-06-08T11:00:00', 't2', 'success', 2, '', ?)""",
+        [cosmetic],
+    )
+    assert data_mutated_since_last_calc(con, "20260608") is False
+    con.close()
+
+
 def test_data_mutated_since_last_calc_skipped_rebuild_not_mutation():
     import json
     import duckdb

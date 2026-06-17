@@ -254,8 +254,18 @@ def _rebuild_dwd_for_run(con, codes: list[str], date: str, fetch_result) -> tupl
     from backend.etl.orchestrator import find_stale_dwd_codes
     from backend.etl.pipeline_context import coerce_fetch_result
 
+    from backend.etl.column_indicator_deps import (
+        calc_affecting_changed_codes,
+        fetch_blocks_dwd_calc,
+    )
+
     fr = coerce_fetch_result(fetch_result)
-    changed = fr.changed_codes_for_date(date)
+    if fr.changed_field_events:
+        changed = calc_affecting_changed_codes(fr.changed_field_events, date)
+    elif fetch_blocks_dwd_calc(fr):
+        changed = fr.changed_codes_for_date(date)
+    else:
+        changed = []
     stale = find_stale_dwd_codes(con, codes, date)
     stale_extra = sorted(set(stale) - set(changed))
     to_rebuild = sorted(set(changed) | set(stale))

@@ -6,8 +6,11 @@ from backend.db.schema import create_all_tables
 from backend.etl.column_indicator_deps import (
     ALL_INDICATORS,
     QUOTE_INDICATORS,
+    affected_ods_column_names_block_calc,
+    calc_affecting_changed_codes,
     calc_routes_narrowed,
     dde_patch_ts_codes,
+    fetch_blocks_dwd_calc,
     resolve_affected_indicators,
     resolve_run_calc_indicator_filter,
 )
@@ -47,6 +50,33 @@ def test_close_only_is_full_indicator_set():
 def test_pe_ttm_only_returns_none():
     events = [("000001.SZ", "20260612", "ods_daily_basic", "pe_ttm", False)]
     assert resolve_affected_indicators(events) is None
+
+
+def test_turnover_rate_drift_does_not_block_l0():
+    events = [
+        ("600021.SH", "20260617", "ods_daily_basic", "turnover_rate", False),
+        ("603108.SH", "20260617", "ods_daily_basic", "turnover_rate", False),
+    ]
+    fr = FetchResult(
+        rows_written=2,
+        changed_pairs=[("600021.SH", "20260617"), ("603108.SH", "20260617")],
+        changed_field_events=events,
+    )
+    assert fetch_blocks_dwd_calc(fr) is False
+    assert calc_affecting_changed_codes(events, "20260617") == []
+    assert affected_ods_column_names_block_calc(["turnover_rate"]) is False
+
+
+def test_close_drift_blocks_l0():
+    events = [("000001.SZ", "20260612", "ods_daily", "close", False)]
+    fr = FetchResult(
+        rows_written=1,
+        changed_pairs=[("000001.SZ", "20260612")],
+        changed_field_events=events,
+    )
+    assert fetch_blocks_dwd_calc(fr) is True
+    assert calc_affecting_changed_codes(events, "20260612") == ["000001.SZ"]
+    assert affected_ods_column_names_block_calc(["close"]) is True
 
 
 def test_empty_events_returns_none():

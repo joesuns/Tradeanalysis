@@ -60,6 +60,56 @@ def _build_ods_column_map() -> Dict[Tuple[str, str], FrozenSet[str]]:
 ODS_COLUMN_TO_INDICATORS = _build_ods_column_map()
 
 
+def calc_affecting_changed_codes(
+    events: Sequence[ChangedFieldEvent],
+    trade_date: str,
+) -> List[str]:
+    """Return ts_codes whose ODS column changes affect at least one calc indicator."""
+    codes: Set[str] = set()
+    for ts_code, td, table, col, is_insert in events:
+        if td != trade_date:
+            continue
+        if col == "adj_factor":
+            codes.add(ts_code)
+            continue
+        if table == "ods_daily" and is_insert:
+            codes.add(ts_code)
+            continue
+        if ODS_COLUMN_TO_INDICATORS.get((table, col), frozenset()):
+            codes.add(ts_code)
+    return sorted(codes)
+
+
+def fetch_blocks_dwd_calc(fetch_result: FetchResult) -> bool:
+    """True when ODS fetch writes require DWD+calc (exclude cosmetic-only drift)."""
+    if fetch_result.rows_written <= 0:
+        return False
+    events = fetch_result.changed_field_events
+    if not events:
+        return True
+    if any(ev[3] == "adj_factor" for ev in events):
+        return True
+    if any(ev[2] == "ods_daily" and ev[4] for ev in events):
+        return True
+    for _code, _td, table, col, _ins in events:
+        if ODS_COLUMN_TO_INDICATORS.get((table, col), frozenset()):
+            return True
+    return False
+
+
+def affected_ods_column_names_block_calc(column_names: Sequence[str]) -> bool:
+    """True when fetch log affected_ods_columns require DWD/calc replay."""
+    if not column_names:
+        return True
+    for col in column_names:
+        if col == "adj_factor":
+            return True
+        for (_table, mapped_col), inds in ODS_COLUMN_TO_INDICATORS.items():
+            if mapped_col == col and inds:
+                return True
+    return False
+
+
 def dde_patch_ts_codes(events: Sequence[ChangedFieldEvent]) -> List[str]:
     """Return sorted unique ts_codes with net_amount_dc or circ_mv ODS patch events."""
     codes: Set[str] = set()
