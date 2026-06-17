@@ -615,6 +615,68 @@ def test_cmd_run_refreshes_state_after_dwd_rebuild(monkeypatch):
     assert events[-1] == "calc"
 
 
+def test_cmd_run_invalidates_dde_after_dc_patch(monkeypatch):
+    """net_amount_dc patch + DWD rebuild → dde invalidation before calc."""
+    import argparse
+    from backend import cli
+
+    events = []
+
+    def fake_rebuild_incremental(con, codes, d):
+        events.append(("rebuild", list(codes)))
+        return {"daily_quote": 10, "weekly_quote": 5, "moneyflow": 3}
+
+    def fake_refresh(con, codes, calc_date, dwd_result, return_artifacts=False):
+        events.append(("refresh", list(codes), calc_date))
+        return {"records_written": 12}
+
+    def fake_invalidate(con, calc_date, fetch_result, rebuilt_codes, dry_run=False):
+        events.append(("dde_invalidate", list(rebuilt_codes), calc_date))
+        return {"stocks": 1}
+
+    def fake_calc(_args, skip_stale_fetch=False):
+        events.append("calc")
+
+    patch_fr = _fr(
+        1,
+        changed_field_events=[
+            ("B.SZ", "20260610", "ods_moneyflow", "net_amount_dc", False),
+        ],
+    )
+
+    monkeypatch.setattr("backend.db.connection.get_connection", lambda: FakeCon())
+    monkeypatch.setattr("backend.fetch.ods_daily.get_all_active_codes", lambda _c: ["A.SZ", "B.SZ"])
+    monkeypatch.setattr("backend.fetch.ods_daily.fetch_by_date_range_parallel", lambda *a, **k: patch_fr)
+    monkeypatch.setattr("backend.etl.orchestrator.find_stale_dwd_codes",
+                        lambda con, codes, date: ["B.SZ"])
+    monkeypatch.setattr("backend.etl.build_dwd.rebuild_dwd_incremental", fake_rebuild_incremental)
+    monkeypatch.setattr(
+        "backend.etl.calc_state_refresh.maybe_refresh_state_after_dwd_rebuild",
+        fake_refresh,
+    )
+    monkeypatch.setattr(
+        "backend.etl.backfill_dde_recalc.maybe_invalidate_dde_after_column_patch",
+        fake_invalidate,
+    )
+    monkeypatch.setattr(cli, "cmd_calc", fake_calc)
+    monkeypatch.setattr("backend.export_wide.export_wide_to_excel", lambda *a, **k: _export(1))
+    monkeypatch.setattr(cli, "_warn_export_coverage", lambda *a, **k: None)
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_start",
+                        lambda *a, **k: ("lid", 0.0))
+    monkeypatch.setattr("backend.etl.error_handler.log_etl_end", lambda *a, **k: None)
+
+    args = argparse.Namespace(
+        date="20260610", ts_code=None, output="out.xlsx",
+        include_st=False, no_index=False, db_path=None,
+        force=False, skip_export=True,
+    )
+    cli.cmd_run(args)
+    assert ("rebuild", ["B.SZ"]) in events
+    assert ("refresh", ["B.SZ"], "20260610") in events
+    assert ("dde_invalidate", ["B.SZ"], "20260610") in events
+    assert events[-1] == "calc"
+
+
 def test_cmd_run_skips_refresh_when_dwd_skipped(monkeypatch):
     import argparse
     from backend import cli

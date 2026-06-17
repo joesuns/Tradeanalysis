@@ -199,6 +199,66 @@ def invalidate_dde_weekly_calc_state(
     return int(before)
 
 
+def invalidate_dde_for_column_patch(
+    con,
+    calc_date: str,
+    ts_codes: List[str],
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """Drop dde/daily DWS @ calc_date + calc state after dc/circ_mv ODS patch (P0)."""
+    stats = {
+        "calc_date": calc_date,
+        "stocks": len(ts_codes),
+        "dry_run": dry_run,
+        "dde_daily_rows_deleted": 0,
+        "dde_daily_state_deleted": 0,
+    }
+    if not ts_codes or dry_run:
+        return stats
+    stats["dde_daily_rows_deleted"] = invalidate_dde_daily_snapshots(
+        con, calc_date, ts_codes=ts_codes,
+    )
+    stats["dde_daily_state_deleted"] = invalidate_dde_daily_calc_state(
+        con, ts_codes=ts_codes,
+    )
+    return stats
+
+
+def maybe_invalidate_dde_after_column_patch(
+    con,
+    calc_date: str,
+    fetch_result,
+    rebuilt_codes: List[str],
+    *,
+    dry_run: bool = False,
+) -> Optional[dict]:
+    """After DWD rebuild + refresh_state, invalidate dde when dc/circ_mv was patched."""
+    from backend.etl.column_indicator_deps import dde_patch_ts_codes
+    from backend.etl.pipeline_context import coerce_fetch_result
+
+    if not rebuilt_codes or fetch_result is None:
+        return None
+    fr = coerce_fetch_result(fetch_result)
+    patch_codes = dde_patch_ts_codes(fr.changed_field_events)
+    if not patch_codes:
+        return None
+    rebuilt_set = set(rebuilt_codes)
+    affected = sorted(c for c in patch_codes if c in rebuilt_set)
+    if not affected:
+        return None
+    stats = invalidate_dde_for_column_patch(
+        con, calc_date, affected, dry_run=dry_run,
+    )
+    logger.info(
+        "dde column-patch invalidation: stocks=%d daily_rows=%d daily_state=%d",
+        stats["stocks"],
+        stats["dde_daily_rows_deleted"],
+        stats["dde_daily_state_deleted"],
+    )
+    return stats
+
+
 def prepare_dde_daily_recalc(
     con,
     calc_date: str,
