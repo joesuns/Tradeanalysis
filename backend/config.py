@@ -54,6 +54,8 @@ DWD_INCREMENTAL = os.getenv("DWD_INCREMENTAL", "1").strip() != "0"
 # DWD_REBUILD_REFRESH_STATE: after DWD rebuild, realign dws_calc_state history_fp
 # before calc routing (prevents new-day FULL/chunk explosion). =0 disables.
 DWD_REBUILD_REFRESH_STATE = os.getenv("DWD_REBUILD_REFRESH_STATE", "1").strip() != "0"
+# REFRESH_STATE_PARALLEL: cli refresh-state isolated phase uses parallel read-only SQL.
+REFRESH_STATE_PARALLEL = os.getenv("REFRESH_STATE_PARALLEL", "1").strip() != "0"
 # CALC_REUSE_REFRESH_CTX: cli run passes refresh tails+modes into calc (skip batch reload).
 CALC_REUSE_REFRESH_CTX = os.getenv("CALC_REUSE_REFRESH_CTX", "1").strip() != "0"
 # CALC_VECTOR_APPEND: cross-stock vectorized EMA batch in batch_append MACD/DDE paths.

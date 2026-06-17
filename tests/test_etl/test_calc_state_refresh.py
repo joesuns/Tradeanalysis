@@ -163,7 +163,7 @@ def test_maybe_refresh_runs_when_dwd_result_nonempty(monkeypatch):
 
     calls = []
 
-    def fake_refresh(con, codes, calc_date, dry_run=False, return_artifacts=False):
+    def fake_refresh(con, codes, calc_date, dry_run=False, return_artifacts=False, **kwargs):
         calls.append((list(codes), calc_date, dry_run, return_artifacts))
         return {"records_written": 3, "chunk_stocks": 0}
 
@@ -266,4 +266,77 @@ def test_refresh_return_artifacts_includes_modes(monkeypatch):
     )
     assert ctx.source == "refresh_state"
     assert ctx.stock_modes["SA.SZ"][("macd", "daily")][0] == "APPEND"
+    con.close()
+
+
+def test_refresh_without_artifacts_skips_preflight(monkeypatch):
+    """CLI refresh-state path must not run post-preflight (return_artifacts=False)."""
+    from backend.etl import calc_state_refresh as mod
+
+    last_td = "20260608"
+    tail = _make_tail(last_td, 10.0)
+    fp = state_signature(tail, last_td, ["close_qfq"])
+
+    import duckdb
+    con = duckdb.connect(":memory:")
+    ensure_calc_state_table(con)
+    con.execute("""
+        INSERT INTO dws_calc_state
+            (ts_code, freq, indicator, last_trade_date, history_fp,
+             quote_latest_adj, spec_version, updated_calc_date)
+        VALUES ('SA.SZ', 'daily', 'macd', ?, ?, NULL, 'v3', '20260608')
+    """, [last_td, fp])
+
+    preflight_calls = []
+    monkeypatch.setattr(
+        mod, "batch_load_quote_tails",
+        lambda *_a, **_k: {"SA.SZ": tail},
+    )
+    monkeypatch.setattr(mod, "batch_load_dde_tails", lambda *_a, **_k: {})
+
+    def _track_preflight(*args, **kwargs):
+        preflight_calls.append(1)
+        return None, {}
+
+    monkeypatch.setattr(mod, "preflight_stock_modes_with_fps", _track_preflight)
+    monkeypatch.setattr(
+        "backend.etl.calc_state_refresh.CALC_ROUTE_SPECS",
+        [("macd", "daily", type("C", (), {"SPEC_VERSION": "v3"}), ["close_qfq"], "quote")],
+    )
+
+    summary = refresh_calc_state_fingerprints(
+        con, ["SA.SZ"], "20260609", dry_run=False, return_artifacts=False,
+    )
+    assert summary["preflight_skip"] == 0
+    assert summary["preflight_append"] == 0
+    assert preflight_calls == []
+    con.close()
+
+
+def test_refresh_isolated_tail_load_uses_isolated_loader(monkeypatch):
+    """isolated_tail_load=True must not use inline _load_refresh_tails_sequential_on_con."""
+    from backend.etl import calc_state_refresh as mod
+
+    isolated_calls = []
+    inline_calls = []
+
+    monkeypatch.setattr(
+        mod, "_load_refresh_tails_isolated",
+        lambda ts_codes, n: isolated_calls.append((ts_codes, n)) or (
+            {}, {}, {}, {}, {},
+        ),
+    )
+    monkeypatch.setattr(
+        mod, "_load_refresh_tails_sequential_on_con",
+        lambda con, ts_codes, n: inline_calls.append(1) or ({}, {}, {}, {}, {}),
+    )
+
+    import duckdb
+    con = duckdb.connect(":memory:")
+    summary = mod.refresh_calc_state_fingerprints(
+        con, ["SA.SZ"], "20260609", dry_run=True, isolated_tail_load=True,
+    )
+    assert summary["tail_load_mode"] == "isolated"
+    assert len(isolated_calls) == 1
+    assert inline_calls == []
     con.close()

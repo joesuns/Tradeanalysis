@@ -799,6 +799,9 @@ def cmd_refresh_state(args):
 
     Use after one-off full-market DWD rebuild poisons append routing while DWS
     snapshots remain valid. Typical wall clock ~10-15 min for full market.
+
+    Tail load uses isolated read-only connections (parallel when
+    REFRESH_STATE_PARALLEL=1); write lock held only for upsert + checkpoint.
     """
     from datetime import datetime
 
@@ -810,58 +813,82 @@ def cmd_refresh_state(args):
     from backend.db.schema import ensure_calc_state_table
     from backend.fetch.ods_daily import get_all_active_codes
 
-    con = get_connection()
+    # Phase 1: resolve date/codes without holding a write lock through tail SQL.
+    setup_con = get_connection(read_only=True)
     try:
-        ensure_calc_state_table(con)
         calc_date = args.date
         if calc_date:
-            calc_date = _ensure_trade_date(con, _resolve_trade_date(con, calc_date))
+            calc_date = _ensure_trade_date(setup_con, _resolve_trade_date(setup_con, calc_date))
         else:
             calc_date = datetime.now().strftime("%Y%m%d")
         if CALC_STRICT_DATE:
-            assert_calc_date_ready(con, calc_date, strict=True)
+            assert_calc_date_ready(setup_con, calc_date, strict=True)
         else:
-            calc_date = resolve_effective_calc_date(con, calc_date, cap_to_ods=True)
-
-        ts_codes = args.ts_code if args.ts_code else get_all_active_codes(con)
-        logger.info(
-            "refresh-state: %d stocks, calc_date=%s, dry_run=%s",
-            len(ts_codes), calc_date, args.dry_run,
-        )
-        lid, t0 = log_etl_start(con, "cli_refresh_state")
-        try:
-            summary = refresh_calc_state_fingerprints(
-                con, ts_codes, calc_date, dry_run=args.dry_run,
-            )
-            if not args.dry_run:
-                run_checkpoint(con)
-            log_etl_end(
-                con, lid, "cli_refresh_state", t0, "success",
-                row_count=summary.get("records_written", 0),
-                data_completeness=summary,
-            )
-        except Exception:
-            log_etl_end(con, lid, "cli_refresh_state", t0, "failed")
-            raise
-
-        print(
-            f"refresh-state {'(dry-run) ' if args.dry_run else ''}complete: "
-            f"{summary['stocks']} stocks, "
-            f"updated={summary['keys_updated']}, "
-            f"unchanged={summary['keys_unchanged']}, "
-            f"skipped={summary['keys_skipped']}, "
-            f"written={summary['records_written']}, "
-            f"elapsed={summary['elapsed_sec']}s"
-        )
-        if not args.dry_run:
-            print(
-                f"Preflight after refresh: skip={summary['preflight_skip']}, "
-                f"full={summary['preflight_full']}, "
-                f"append={summary['preflight_append']}, "
-                f"chunk_stocks={summary['chunk_stocks']}"
-            )
+            calc_date = resolve_effective_calc_date(setup_con, calc_date, cap_to_ods=True)
+        ts_codes = args.ts_code if args.ts_code else get_all_active_codes(setup_con)
     finally:
-        con.close()
+        setup_con.close()
+
+    logger.info(
+        "refresh-state: %d stocks, calc_date=%s, dry_run=%s, tail_load=isolated",
+        len(ts_codes), calc_date, args.dry_run,
+    )
+
+    # Phase 2: etl audit row (short write connection).
+    audit_con = get_connection()
+    try:
+        ensure_calc_state_table(audit_con)
+        lid, t0 = log_etl_start(audit_con, "cli_refresh_state")
+    finally:
+        audit_con.close()
+
+    # Phase 3: isolated parallel read load + fingerprint scan (+ upsert if needed).
+    try:
+        summary = refresh_calc_state_fingerprints(
+            None,
+            ts_codes,
+            calc_date,
+            dry_run=args.dry_run,
+            isolated_tail_load=True,
+        )
+    except Exception:
+        audit_con = get_connection()
+        try:
+            log_etl_end(audit_con, lid, "cli_refresh_state", t0, "failed")
+        finally:
+            audit_con.close()
+        raise
+
+    # Phase 4: checkpoint + close audit (short write connection).
+    audit_con = get_connection()
+    try:
+        if not args.dry_run:
+            run_checkpoint(audit_con)
+        log_etl_end(
+            audit_con, lid, "cli_refresh_state", t0, "success",
+            row_count=summary.get("records_written", 0),
+            data_completeness=summary,
+        )
+    finally:
+        audit_con.close()
+
+    print(
+        f"refresh-state {'(dry-run) ' if args.dry_run else ''}complete: "
+        f"{summary['stocks']} stocks, "
+        f"updated={summary['keys_updated']}, "
+        f"unchanged={summary['keys_unchanged']}, "
+        f"skipped={summary['keys_skipped']}, "
+        f"written={summary['records_written']}, "
+        f"elapsed={summary['elapsed_sec']}s, "
+        f"tail_load={summary.get('tail_load_mode', 'isolated')}"
+    )
+    if not args.dry_run:
+        print(
+            f"Preflight after refresh: skip={summary['preflight_skip']}, "
+            f"full={summary['preflight_full']}, "
+            f"append={summary['preflight_append']}, "
+            f"chunk_stocks={summary['chunk_stocks']}"
+        )
 
 
 # ── backfill-dde-meta ──
