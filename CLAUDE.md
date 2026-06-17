@@ -266,6 +266,7 @@ export（导出层）
 ├── **Sheet：**「综合分析」（信号速览）+「个股分析」（全列）；`vol_signal` 与量能组相邻（`vol_zone→vol_trend→vol_divergence→量价信号`）；综合分析含可交易背离 + 量价信号，不含 MACD/DDE 结构/剔除背离
 ├── **样式：** 基础信息表头 `#1A1A1A`；Sheet 标签不设 tabColor（未选中为 Excel 默认灰，选中白底高亮）
 ├── 表头列注释：悬停表头查看指标说明；文案维护于 `docs/export/export-column-comments.yaml`（经 `export_column_comments.py` 加载）；改列须同步 spec §9 + YAML
+├── **Export-E1（2026-06-17）：** 单次 `_build_merged_display_df` transform + 批量写值 + CF 斑马纹；5271 行 building sheets ~140s→**27s**（plan `2026-06-14-export-sheet-perf.md`）
 ├── **`EXPORT_SPEC_GATE=1`（默认 0）：** export 前检测 state/DWS spec 落后并打 WARNING（非阻断）
 └── 默认路径: exports/analysis_{date}_gen{now}.xlsx
 ```

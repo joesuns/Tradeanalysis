@@ -2,7 +2,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import duckdb
 import pandas as pd
@@ -10,8 +10,10 @@ from openpyxl import Workbook
 from openpyxl.comments import Comment
 
 from backend.etl.divergence_tradable import TradableEnrichStats, enrich_tradable_columns
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,26 @@ _COL_NAMES = {
 }
 
 _BASIC_HEADER_FILL = "1A1A1A"
+
+_ID_COLS = [
+    "ts_code", "trade_date", "stock_code", "stock_name",
+    "exchange", "sector", "industry", "is_st",
+]
+_FUND_COLS = [
+    "close", "pct_chg", "vol", "amount", "total_mv",
+    "pe_ttm", "turnover_rate", "volume_ratio",
+]
+
+_GROUP_COLORS = {
+    "kpattern": "C0392B",
+    "price_position_": "E74C3C",
+    "ema_": "8E44AD", "macd_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
+    "ma_vol_": "27AE60",
+    "ma_": "2980B9", "bias_": "2980B9", "ma5_": "2980B9", "ma10_": "2980B9",
+    "dde_": "D35400", "ddx": "D35400", "net_mf": "D35400",
+    "vol_": "27AE60", "pct_vol": "27AE60",
+}
+_DEFAULT_GROUP_COLOR = "7F8C8D"
 
 # 综合分析 sheet：可交易背离 + 量价信号；不含 MACD/DDE 结构/剔除背离
 _SIGNAL_ONLY = [
@@ -313,8 +335,6 @@ def export_wide_to_excel(
     weekly_cols = list(weekly.columns)
 
     # Basic info columns (for both sheets)
-    _ID_COLS = ["ts_code", "trade_date", "stock_code", "stock_name", "exchange", "sector", "industry", "is_st"]
-    _FUND_COLS = ["close", "pct_chg", "vol", "amount", "total_mv", "pe_ttm", "turnover_rate", "volume_ratio"]
     basic_cols_outer = _ID_COLS + [c for c in _FUND_COLS if c in daily_cols]
 
     # Add __w__ prefix to weekly indicator columns (not ts_code — needed for merge)
@@ -343,10 +363,15 @@ def export_wide_to_excel(
         c for c in daily_cols if c in basic_cols_outer and c not in _signal_set
     ]
     weekly_signal_only = [c for c in _SIGNAL_ONLY if c in weekly_cols]
-    _write_sheet_merged(wb, "综合分析", merged, daily_signal_only, weekly_signal_only)
 
-    # ---- Full analysis sheet ----
-    _write_sheet_merged(wb, "个股分析", merged, daily_cols, weekly_cols)
+    display_full, layout_full = _build_merged_display_df(merged, daily_cols, weekly_cols)
+    layout_signal = _resolve_sheet_layout(
+        daily_signal_only, weekly_signal_only, merged.columns,
+    )
+    display_signal = display_full[layout_signal.display_cols]
+
+    _write_sheet_from_display(wb, "综合分析", display_signal, layout_signal)
+    _write_sheet_from_display(wb, "个股分析", display_full, layout_full)
 
     # ---- SH Index ----
     if include_index:
@@ -425,127 +450,168 @@ def _translate_df(df: "pd.DataFrame") -> "pd.DataFrame":
     return df
 
 
-def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
-    """Write merged daily+weekly DataFrame with two-row header and zebra-striped data rows."""
-    ws = wb.create_sheet(title=sheet_name)
+def _chinese_name_for_col(col: str) -> str:
+    if col.startswith("__w__"):
+        eng = col[5:]
+        return _WEEKLY_OVERRIDE.get(eng, _COL_NAMES.get(eng, eng))
+    return _COL_NAMES.get(col, col)
 
-    # ── Build display column names ──
-    # Identity columns: pure identification
-    id_cols = ["ts_code", "trade_date", "stock_code", "stock_name", "exchange", "sector", "industry", "is_st"]
-    # Fundamental columns (price/volume/valuation — not technical indicators)
-    fund_cols = ["close", "pct_chg", "vol", "amount", "total_mv", "pe_ttm", "turnover_rate", "volume_ratio"]
-    basic_cols = id_cols + [c for c in fund_cols if c in daily_cols]
-    basic_names = [_COL_NAMES.get(c, c) for c in basic_cols if c in df.columns]
 
-    # Daily technical indicator columns (same order as weekly — K-line first)
-    daily_signal = [c for c in daily_cols if c not in basic_cols and c != "freq"]
+def _color_for_indicator(col_eng: str) -> str:
+    for prefix, color in _GROUP_COLORS.items():
+        if col_eng.startswith(prefix):
+            return color
+    return _DEFAULT_GROUP_COLOR
+
+
+@dataclass
+class SheetLayout:
+    """Resolved column layout for merged daily+weekly export sheets."""
+
+    display_cols: List[str]
+    chinese_names: List[str]
+    basic_cols: List[str]
+    daily_signal: List[str]
+    weekly_signal: List[str]
+    basic_names: List[str]
+    daily_names: List[str]
+    weekly_names: List[str]
+    n_basic: int
+    n_daily: int
+    n_weekly: int
+
+
+def _resolve_sheet_layout(
+    daily_cols: List[str],
+    weekly_cols: List[str],
+    available_columns,
+) -> SheetLayout:
+    avail = set(available_columns)
+    basic_cols = [
+        c for c in _ID_COLS + _FUND_COLS
+        if c in daily_cols and c in avail
+    ]
+    basic_set = set(basic_cols)
+    daily_signal = [
+        c for c in daily_cols
+        if c not in basic_set and c != "freq" and c in avail
+    ]
+    weekly_signal = [
+        c for c in weekly_cols if f"__w__{c}" in avail
+    ]
+    display_cols = (
+        basic_cols
+        + daily_signal
+        + [f"__w__{c}" for c in weekly_signal]
+    )
+    basic_names = [_COL_NAMES.get(c, c) for c in basic_cols]
     daily_names = [_COL_NAMES.get(c, c) for c in daily_signal]
+    weekly_names = [_chinese_name_for_col(f"__w__{c}") for c in weekly_signal]
+    chinese_names = [_chinese_name_for_col(c) for c in display_cols]
+    return SheetLayout(
+        display_cols=display_cols,
+        chinese_names=chinese_names,
+        basic_cols=basic_cols,
+        daily_signal=daily_signal,
+        weekly_signal=weekly_signal,
+        basic_names=basic_names,
+        daily_names=daily_names,
+        weekly_names=weekly_names,
+        n_basic=len(basic_cols),
+        n_daily=len(daily_signal),
+        n_weekly=len(weekly_signal),
+    )
 
-    # Weekly technical indicator columns (with weekly-specific name overrides)
-    weekly_signal = weekly_cols
-    weekly_names = [_WEEKLY_OVERRIDE.get(c, _COL_NAMES.get(c, c)) for c in weekly_signal]
 
-    # ── Translate data values (enum + NULL) ──
-    # Daily enum translation
+def _transform_display_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Enum translation + export null semantics on English/__w__ columns."""
+    out = df.copy()
     for col, mapping in _ENUM_VALUES.items():
-        if col in df.columns:
-            df[col] = df[col].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
-    # Weekly enum translation (columns have __w__ prefix in df)
-    for col, mapping in _ENUM_VALUES.items():
+        if col in out.columns:
+            out[col] = out[col].replace(mapping)
         wcol = f"__w__{col}"
-        if wcol in df.columns:
-            df[wcol] = df[wcol].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
-    df = apply_display_nulls(df)
+        if wcol in out.columns:
+            out[wcol] = out[wcol].replace(mapping)
+    return apply_display_nulls(out)
 
-    # Build final display column order: basic → daily_signal → weekly_signal
-    display_order = [c for c in basic_cols if c in df.columns] \
-                  + [c for c in daily_signal if c in df.columns] \
-                  + [f"__w__{c}" for c in weekly_signal if f"__w__{c}" in df.columns]
-    df = df[display_order]
 
-    # Column positions in the worksheet
-    n_basic = len([c for c in basic_cols if c in df.columns])
-    n_daily = len([c for c in daily_signal if c in df.columns])
-    n_weekly = len([c for c in weekly_signal if f"__w__{c}" in df.columns])
+def _build_merged_display_df(
+    source: pd.DataFrame,
+    daily_cols: List[str],
+    weekly_cols: List[str],
+) -> Tuple[pd.DataFrame, SheetLayout]:
+    layout = _resolve_sheet_layout(daily_cols, weekly_cols, source.columns)
+    english = source[layout.display_cols]
+    display = _transform_display_values(english)
+    return display, layout
 
-    # ── UED Styles ──
-    # Row 1 group labels
+
+def _set_column_widths(ws, display_df: pd.DataFrame, layout: SheetLayout) -> None:
+    for col_idx, col_eng in enumerate(layout.display_cols, 1):
+        col_name = layout.chinese_names[col_idx - 1]
+        header_len = sum(2.2 if "一" <= c <= "鿿" else 1.0 for c in str(col_name))
+        width = max(header_len + 2, 8)
+        for val in display_df.iloc[:20, col_idx - 1]:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            val_len = sum(2.2 if "一" <= c <= "鿿" else 1.0 for c in str(val))
+            width = max(width, min(val_len + 2, 30))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(width, 22)
+
+
+def _write_sheet_headers(ws, layout: SheetLayout) -> None:
     group_font = Font(name="微软雅黑", color="FFFFFF", size=11)
     group_fill_daily = PatternFill(start_color="1A5276", end_color="1A5276", fill_type="solid")
     group_fill_weekly = PatternFill(start_color="0D6B6B", end_color="0D6B6B", fill_type="solid")
-    # Row 2 column names
     col_font = Font(name="微软雅黑", color="FFFFFF", size=10)
-    # Data
-    data_font = Font(name="微软雅黑", size=10, color="1D1D1F")
-    # Basic info header
     basic_fill = PatternFill(
         start_color=_BASIC_HEADER_FILL, end_color=_BASIC_HEADER_FILL, fill_type="solid",
     )
-    # Separator between groups
-    sep_left = Side(style="medium", color="FFFFFF")
-    # Data borders
-    thin_border = Border(
-        left=Side(style="thin", color="E5E5EA"), right=Side(style="thin", color="E5E5EA"),
-        top=Side(style="thin", color="E5E5EA"), bottom=Side(style="thin", color="E5E5EA"),
-    )
     header_bottom = Border(bottom=Side(style="thin", color="5D6D7E"))
-    white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-    stripe_fill = PatternFill(start_color="F7F8FA", end_color="F7F8FA", fill_type="solid")
 
-    # Indicator group colors — precise prefix match on English column names
-    _GROUP_COLORS = {
-        "kpattern": "C0392B",
-        "price_position_": "E74C3C",
-        "ema_": "8E44AD", "macd_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
-        "ma_vol_": "27AE60",  # before ma_ to avoid false match
-        "ma_": "2980B9", "bias_": "2980B9", "ma5_": "2980B9", "ma10_": "2980B9",
-        "dde_": "D35400", "ddx": "D35400", "net_mf": "D35400",
-        "vol_": "27AE60", "pct_vol": "27AE60",
-    }
-    _DEFAULT_COLOR = "7F8C8D"
-
-    def _color_for(col_eng: str) -> str:
-        for prefix, color in _GROUP_COLORS.items():
-            if col_eng.startswith(prefix):
-                return color
-        return _DEFAULT_COLOR
-
-    # ── Row 1: Group labels ──
+    n_basic = layout.n_basic
+    n_daily = layout.n_daily
+    n_weekly = layout.n_weekly
     daily_start = n_basic + 1
     weekly_start = n_basic + n_daily + 1
     weekly_end = n_basic + n_daily + n_weekly
 
-    # Daily group label
     if n_daily > 0:
-        ws.merge_cells(start_row=1, start_column=daily_start, end_row=1, end_column=daily_start + n_daily - 1)
+        ws.merge_cells(
+            start_row=1, start_column=daily_start,
+            end_row=1, end_column=daily_start + n_daily - 1,
+        )
         c = ws.cell(row=1, column=daily_start, value="日 线 指 标")
-        c.fill = group_fill_daily; c.font = group_font
+        c.fill = group_fill_daily
+        c.font = group_font
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = header_bottom
 
-    # Weekly group label
     if n_weekly > 0:
-        ws.merge_cells(start_row=1, start_column=weekly_start, end_row=1, end_column=weekly_end)
+        ws.merge_cells(
+            start_row=1, start_column=weekly_start,
+            end_row=1, end_column=weekly_end,
+        )
         c = ws.cell(row=1, column=weekly_start, value="周 线 指 标")
-        c.fill = group_fill_weekly; c.font = group_font
+        c.fill = group_fill_weekly
+        c.font = group_font
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = header_bottom
 
-    # Basic info columns: merged rows 1-2 with dark header
     for i in range(1, n_basic + 1):
         ws.merge_cells(start_row=1, start_column=i, end_row=2, end_column=i)
-        ws.cell(row=1, column=i, value=basic_names[i - 1])
+        ws.cell(row=1, column=i, value=layout.basic_names[i - 1])
         for r in (1, 2):
             c2 = ws.cell(row=r, column=i)
-            c2.fill = basic_fill; c2.font = col_font
+            c2.fill = basic_fill
+            c2.font = col_font
             c2.alignment = Alignment(horizontal="center", vertical="center")
             c2.border = header_bottom
 
-    # ── Row 2: Indicator column names ──
-    for i, name in enumerate(daily_names):
+    for i, name in enumerate(layout.daily_names):
         c = daily_start + i
-        eng = daily_signal[i]  # original English name for precise color matching
-        tint = _color_for(eng)
+        eng = layout.daily_signal[i]
+        tint = _color_for_indicator(eng)
         cell = ws.cell(row=2, column=c, value=name)
         cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
@@ -553,10 +619,10 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         cell.border = header_bottom
         _attach_header_comment(cell, eng, weekly=False)
 
-    for i, name in enumerate(weekly_names):
+    for i, name in enumerate(layout.weekly_names):
         c = weekly_start + i
-        eng = weekly_signal[i]  # original English name for precise color matching
-        tint = _color_for(eng)
+        eng = layout.weekly_signal[i]
+        tint = _color_for_indicator(eng)
         cell = ws.cell(row=2, column=c, value=name)
         cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
@@ -564,32 +630,51 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         cell.border = header_bottom
         _attach_header_comment(cell, eng, weekly=True)
 
-    # ── Freeze: 股票名称 column + 2 header rows ──
+
+def _write_sheet_from_display(
+    wb,
+    sheet_name: str,
+    display_df: pd.DataFrame,
+    layout: SheetLayout,
+) -> None:
+    """Write pre-transformed display DataFrame with two-row header."""
+    ws = wb.create_sheet(title=sheet_name)
+    _write_sheet_headers(ws, layout)
+
     stock_name_idx = 1
-    for i, c in enumerate(basic_cols):
-        if c == "stock_name" and c in df.columns:
-            stock_name_idx = i + 2  # +1 for 1-indexed, +1 for next column
+    for i, c in enumerate(layout.basic_cols):
+        if c == "stock_name":
+            stock_name_idx = i + 2
             break
-    freeze_letter = get_column_letter(stock_name_idx)
-    ws.freeze_panes = f"{freeze_letter}3"
+    ws.freeze_panes = f"{get_column_letter(stock_name_idx)}3"
 
-    # ── Auto-fit column widths ──
-    for col_idx in range(1, len(df.columns) + 1):
-        header_name = ws.cell(row=2, column=col_idx).value or ""
-        header_len = sum(2.2 if '一' <= c <= '鿿' else 1.0 for c in str(header_name))
-        width = max(header_len + 2, 8)
-        for row_idx in range(3, min(len(df) + 3, 23)):
-            val = ws.cell(row=row_idx, column=col_idx).value
-            if val is not None:
-                val_len = sum(2.2 if '一' <= c <= '鿿' else 1.0 for c in str(val))
-                width = max(width, min(val_len + 2, 30))
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(width, 22)
+    _set_column_widths(ws, display_df, layout)
 
-    # ── Data rows ──
-    for row_idx, row in enumerate(df.itertuples(index=False), 3):
-        row_fill = stripe_fill if row_idx % 2 == 1 else white_fill
+    data_font = Font(name="微软雅黑", size=10, color="1D1D1F")
+    stripe_fill = PatternFill(start_color="F7F8FA", end_color="F7F8FA", fill_type="solid")
+
+    for row_idx, row in enumerate(
+        dataframe_to_rows(display_df, index=False, header=False), 3,
+    ):
         for col_idx, value in enumerate(row, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.font = data_font
-            cell.border = thin_border
-            cell.fill = row_fill
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    n_cols = len(display_df.columns)
+    if ws.max_row >= 3 and n_cols > 0:
+        last_col = get_column_letter(n_cols)
+        data_range = f"A3:{last_col}{ws.max_row}"
+        ws.conditional_formatting.add(
+            data_range,
+            FormulaRule(formula=["MOD(ROW(),2)=1"], fill=stripe_fill),
+        )
+        for row in ws.iter_rows(
+            min_row=3, max_row=ws.max_row, min_col=1, max_col=n_cols,
+        ):
+            for cell in row:
+                cell.font = data_font
+
+
+def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
+    """Write merged daily+weekly DataFrame with two-row header and zebra-striped data rows."""
+    display, layout = _build_merged_display_df(df, daily_cols, weekly_cols)
+    _write_sheet_from_display(wb, sheet_name, display, layout)

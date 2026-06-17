@@ -1100,7 +1100,7 @@ python3 scripts/health_check.py
 
 **运维一次性（B4 元数据回填后）：** `python -m backend.cli refresh-state --date 20260612`
 
-**Export-E1**（building sheets 119s）→ 独立 plan，不在本附录。
+**Export-E1**（building sheets）→ ✅ `2026-06-14-export-sheet-perf.md`；5271 行 **27s**（原 ~105–140s）。
 
 ---
 
