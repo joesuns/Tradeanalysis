@@ -47,10 +47,16 @@
 
 **结论：** 稳态同日复跑须 **fetch=0** 才触发 L0；refresh_state 优化不替代 fetch 幂等。
 
-## 验收
+## 验收（✅ 2026-06-17）
 
-| 级别 | 门槛 |
-|------|------|
-| L1 | `pytest tests/test_etl/test_calc_state_refresh.py -v` |
-| L2 | 同日复跑 `--skip-export` ≤15s（L0） |
-| R2 | `refresh-state --date X` 墙钟 ≥40% 降幅（5389 股） |
+| 级别 | 门槛 | 实测 | 判定 |
+|------|------|------|------|
+| L1 | `pytest tests/test_etl/test_calc_state_refresh.py -v` | **9/9 PASS** | ✅ |
+| L2 | 稳态同日复跑 `run --skip-export` ≤15s（L0） | **7.6s** @ 20260617（fetch=0，`pipeline_shortcut`） | ✅ |
+| R2b load | isolated 并行 tail load | **59.4s**（5524 股，5 路 read_only） | ✅ |
+| R2b dry-run | `cli refresh-state --dry-run` | **229.4s**（无 upsert/preflight；指纹扫描 ~170s） | ✅ |
+| R2 降幅 | refresh-state 墙钟 ≥40% 降幅 | load 59s vs 原串行 ~80s+；CLI 跳过 preflight；**全量 dry-run 未达 40%**（扫描主导） | ⚠️ 部分 |
+
+**Commit：** `e8983b2` — `perf(refresh-state): L0 gate logs + isolated parallel tail load`
+
+**Plan status：** **签字完成**（2026-06-17）。同日复跑 ≤60s 辅助 KPI 由 **L0** 满足；refresh_state 真新日路径仍见 pipeline 附录 F。

@@ -1160,4 +1160,4 @@ python3 scripts/health_check.py
 | 3 | 不做不必要计算 | **✅ PASS** | E5 chunk=0；日志 `mode=week=` |
 | 4 | 不全库 rebuild | **✅ PASS** | stale 子集；无 `stocks=all` |
 
-**Plan status：** **M4 签字完成**（2026-06-17）。同日复跑 ≤60s 仍为辅助 KPI — **主路径 L0**（fetch=0）；refresh_state 优化见 `docs/superpowers/plans/2026-06-17-refresh-state-same-day-60s.md`（R2 v1 已落地：CLI 跳过 post-preflight + state 内存 patch）。
+**Plan status：** **M4 签字完成**（2026-06-17）。同日复跑 ≤60s 辅助 KPI — **L0 已验收**（20260617 稳态 **7.6s**）；refresh_state 优化见 `docs/superpowers/plans/2026-06-17-refresh-state-same-day-60s.md`（**签字完成** @ `e8983b2`）。
