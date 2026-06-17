@@ -36,6 +36,14 @@ def test_run_calc_passes_indicator_filter_to_auto_refresh(monkeypatch):
     )
     monkeypatch.setattr("backend.config.CALC_AUTO_SPEC_REFRESH", True)
     monkeypatch.setattr("backend.config.CALC_BATCH_APPEND", False)
+    monkeypatch.setattr(
+        "backend.etl.calc_spec_gate.count_dws_spec_stale_on_trade_date",
+        lambda *a, **k: {},
+    )
+    monkeypatch.setattr(
+        "backend.etl.orchestrator.resolve_recalc_start",
+        lambda *a, **k: "20250601",
+    )
 
     from backend.etl.orchestrator import run_calc
 
