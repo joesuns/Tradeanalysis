@@ -1106,7 +1106,7 @@ python3 scripts/health_check.py
 
 ## 附录 F — Pipeline 30min 终验签字（2026-06-17）
 
-**分支：** `perf/b2-polyfit-vectorization` @ `e556538`（含 PR #14 spec-gate hotfix）  
+**分支：** `perf/b2-polyfit-vectorization`（含 PR #14 + 附录 F 签字 commit）  
 **DB 备份：** `data/tradeanalysis.pre-pipeline-signoff-20260617.duckdb`  
 **证据目录：** `docs/superpowers/plans/evidence/2026-06-17-pipeline-signoff/`
 
@@ -1155,8 +1155,8 @@ python3 scripts/health_check.py
 
 | # | 约束 | 判定 | 证据 |
 |---|------|------|------|
-| 1 | 整条链路 ≤30min（含 export） | **✅ PASS** | F.1 ~491s；F.2 145s |
-| 2 | 数据质量 | **✅ PASS** | health_check 2026-06-17 |
+| 1 | 整条链路 ≤30min（含 export） | **✅ PASS** | F.1 ~491s；F.2 145s（同日复跑）；**F.3 1587s（真新日）** |
+| 2 | 数据质量 | **✅ PASS** | health_check 2026-06-17（含 S5 跑后） |
 | 3 | 不做不必要计算 | **✅ PASS** | E5 chunk=0；日志 `mode=week=` |
 | 4 | 不全库 rebuild | **✅ PASS** | stale 子集；无 `stocks=all` |
 

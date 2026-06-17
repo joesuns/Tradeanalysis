@@ -1,7 +1,7 @@
 # Pipeline 30min 终验证据（2026-06-17）
 
 **Plan：** `docs/superpowers/plans/2026-06-09-pipeline-30min-optimization.md` 附录 F  
-**分支：** `perf/b2-polyfit-vectorization` @ `e556538`  
+**分支：** `perf/b2-polyfit-vectorization`（含 PR #14 + 附录 F/S5 签字 commit）  
 **DB 备份：** `data/tradeanalysis.pre-pipeline-signoff-20260617.duckdb`
 
 ## S1 — PR #14
@@ -47,3 +47,12 @@ python3 scripts/health_check.py
 ```
 
 - ✅ PASS (2026-06-17), Section J spec_stale=0, K oracle 200/200
+
+## F.4 四条硬约束
+
+| # | 判定 | 证据 |
+|---|------|------|
+| 1 ≤30min | ✅ | F.1 ~491s；F.2 145s；**F.3 1587s** |
+| 2 质量 | ✅ | health_check（含 S5 跑后） |
+| 3 最小计算 | ✅ | E5 chunk=0；`mode=week=` |
+| 4 无全库 rebuild | ✅ | stale 子集 only |
