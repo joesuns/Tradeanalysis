@@ -199,7 +199,7 @@
 |----|-----|------|------|
 | T1 | M1 新增 `v_dq_spec_freshness` vs plan「不改动 schema」 | **Pass** | plan §⑥ M1 例外已写入；SA 2026-06-17 Pass |
 | T2 | `CALC_B4_WEEKLY_FAST=0` 无自动化测试 | **Pass（spot）** | M5 3 股 spot-check 0 mismatch |
-| T3 | 全量 pytest 9 FAIL（DB lock） | **Pass（1 例外）** | DB 无锁后 704/705；`test_b4_golden_matches_db` 环境 issue |
+| T3 | 全量 pytest 9 FAIL（DB lock） | **Pass** | 704 pass / 6 skip；`test_b4_golden_matches_db` 改读实库，CI 无 DB 时 skip |
 
 ---
 
