@@ -167,3 +167,90 @@ def test_prepare_dde_daily_recalc_purge_history_requires_ts_codes(db_with_schema
         prepare_dde_daily_recalc(
             con, "20260612", ts_codes=None, dry_run=False, purge_history=True,
         )
+
+
+def test_invalidate_dde_for_column_patch(db_with_schema):
+    from backend.etl.backfill_dde_recalc import invalidate_dde_for_column_patch
+
+    con = db_with_schema
+    con.execute(
+        """
+        INSERT INTO dws_dde_daily
+        (ts_code, trade_date, calc_date, net_mf_amount, ddx, ddx2, trend,
+         trend_strength, alert, divergence, input_fingerprint, spec_version)
+        VALUES
+        ('A.SZ','20260612','20260612',1.0,0.1,0.1,'down',0.1,NULL,NULL,'fp1','v3'),
+        ('B.SZ','20260612','20260612',1.0,0.1,0.1,'up',0.1,NULL,NULL,'fp2','v3')
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO dws_calc_state
+        (ts_code, freq, indicator, last_trade_date, history_fp,
+         quote_latest_adj, spec_version, updated_calc_date)
+        VALUES
+        ('A.SZ','daily','dde','20260612','fp_old',NULL,'v3','20260612'),
+        ('B.SZ','daily','dde','20260612','fp_old',NULL,'v3','20260612')
+        """
+    )
+    stats = invalidate_dde_for_column_patch(
+        con, "20260612", ["A.SZ"],
+    )
+    assert stats["stocks"] == 1
+    assert stats["dde_daily_rows_deleted"] == 1
+    assert stats["dde_daily_state_deleted"] == 1
+    assert con.execute(
+        "SELECT COUNT(*) FROM dws_dde_daily WHERE ts_code='A.SZ'"
+    ).fetchone()[0] == 0
+    assert con.execute(
+        "SELECT COUNT(*) FROM dws_dde_daily WHERE ts_code='B.SZ'"
+    ).fetchone()[0] == 1
+    assert con.execute(
+        "SELECT COUNT(*) FROM dws_calc_state WHERE ts_code='A.SZ' AND indicator='dde'"
+    ).fetchone()[0] == 0
+
+
+def test_maybe_invalidate_dde_after_column_patch_intersects_rebuilt(db_with_schema):
+    from backend.etl.backfill_dde_recalc import maybe_invalidate_dde_after_column_patch
+    from backend.fetch.fetch_result import FetchResult
+
+    con = db_with_schema
+    con.execute(
+        """
+        INSERT INTO dws_dde_daily
+        (ts_code, trade_date, calc_date, net_mf_amount, ddx, ddx2, trend,
+         trend_strength, alert, divergence, input_fingerprint, spec_version)
+        VALUES
+        ('A.SZ','20260612','20260612',1.0,0.1,0.1,'down',0.1,NULL,NULL,'fp1','v3')
+        """
+    )
+    fr = FetchResult(
+        rows_written=1,
+        changed_field_events=[
+            ("A.SZ", "20260612", "ods_moneyflow", "net_amount_dc", False),
+            ("C.SZ", "20260612", "ods_daily_basic", "circ_mv", False),
+        ],
+    )
+    stats = maybe_invalidate_dde_after_column_patch(
+        con, "20260612", fr, ["A.SZ", "B.SZ"],
+    )
+    assert stats is not None
+    assert stats["stocks"] == 1
+    assert stats["dde_daily_rows_deleted"] == 1
+    assert con.execute("SELECT COUNT(*) FROM dws_dde_daily").fetchone()[0] == 0
+
+
+def test_maybe_invalidate_dde_after_column_patch_no_events(db_with_schema):
+    from backend.etl.backfill_dde_recalc import maybe_invalidate_dde_after_column_patch
+    from backend.fetch.fetch_result import FetchResult
+
+    con = db_with_schema
+    fr = FetchResult(
+        rows_written=1,
+        changed_field_events=[
+            ("A.SZ", "20260612", "ods_daily", "vol", False),
+        ],
+    )
+    assert maybe_invalidate_dde_after_column_patch(
+        con, "20260612", fr, ["A.SZ"],
+    ) is None

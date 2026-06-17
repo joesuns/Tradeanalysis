@@ -68,7 +68,7 @@ python -m backend.cli fetch --ts-code 000543.SZ 600580.SH  # 指定股票
 python -m backend.cli calc                         # 全市场（analysis_date=今天）
 python -m backend.cli calc --date 20260605         # 指定分析日
 python -m backend.cli calc --ts-code 000543.SZ 600580.SH  # 指定股票
-python -m backend.cli calc --date 20260612 --refresh-spec ma  # spec 落后时窄窗 FULL（仅 ma）
+python -m backend.cli calc --date 20260612 --refresh-spec ma  # 应急：单指标窄窗 FULL（日常 run/calc 已 auto）
 python3 -m backend.cli calc --refresh-spec macd --date 20260616 --dry-run  # 零 DWS 写，仅报 stale 规模
 
 # ===== Excel 导出 =====
@@ -145,7 +145,8 @@ python scripts/benchmark_run.py --date 20260609 --run
 backend/
 ├── config.py              # 环境变量加载（TUSHARE_TOKEN/DUCKDB_PATH/LOG_LEVEL）
 ├── cli.py                 # CLI 入口（check/fetch/calc/export/query/status 6 子命令）
-├── export_wide.py         # Excel 导出（中文列名、分组着色、日线+周线水平合并）
+├── export_wide.py         # Excel 导出（中文列名、分组着色、日线+周线水平合并、表头列注释）
+├── export_column_comments.py  # 从 docs/export/export-column-comments.yaml 加载表头注释
 ├── db/
 │   ├── connection.py      # DuckDB 连接、自检、WAL checkpoint
 │   └── schema.py          # 完整 DDL（26 表 + 16 视图 + 31 索引，含 input_fingerprint/spec_version）
@@ -229,8 +230,7 @@ fetch（数据拉取层）
 
 calc（计算层）
 ├── `--date` 指定 analysis_date（默认 today），与 export/run 对齐
-├── **`--refresh-spec ma[,volume]`** — 仅 `find_spec_stale_codes` 子集窄窗 FULL；**不走** `run_calc` 全路由、**不 rebuild DWD**。加 **`--dry-run`** 仅报 stale 规模、零 DWS 写。与 `cli refresh --indicator` 分工：refresh=全链路 R1（fetch→DWD→calc）；refresh-spec=轻量 spec 运维（见 runbook「算法 SPEC_VERSION 发布」）
-├── **`cli ops spec-status --date`** — 读 `v_dq_spec_freshness`（daily + weekly anchor）；migration SOP 见 runbook
+├── **`--refresh-spec ma[,volume]`** — 应急窄窗 FULL（state∪DWS stale 子集）；日常 `run/calc` 在 batch APPEND 前 **`CALC_AUTO_SPEC_REFRESH=1`（默认）** 自动执行同等逻辑。**不走** rebuild DWD。加 **`--dry-run`** 仅报 stale 规模、零 DWS 写。与 `cli refresh --indicator` 分工：refresh=全链路 R1；`cli ops spec-status --date` 读 `v_dq_spec_freshness`（见 runbook「算法 SPEC_VERSION 发布」）
 ├── 退市股过滤：delist_date < calc_date 且 DWS 已有 → 跳过
 ├── G1 warmup：`check_data_completeness()` — calc 准入 `dwd_rows≥250`；成熟股 `week_end_bars`（120 周窗口内）不足 → `weekly_fetch` 仅 fetch 不拦 calc
 ├── G2 fresh：find_stale_ods_codes() — ODS max < calc_date → date/stock-batched 补 tail（run 内 skip）
@@ -263,6 +263,10 @@ export（导出层）
 ├── 从 latest 视图直接导出（不重算）
 ├── 默认 filter_st 排除 ST；`--include-st` 含 ST
 ├── 日线+周线水平合并（无 freq 参数）；周线为空时（无 week-end≤date）仅输出日线，不崩溃
+├── **Sheet：**「综合分析」（信号速览）+「个股分析」（全列）；`vol_signal` 与量能组相邻（`vol_zone→vol_trend→vol_divergence→量价信号`）；综合分析含可交易背离 + 量价信号，不含 MACD/DDE 结构/剔除背离
+├── **样式：** 基础信息表头 `#1A1A1A`；Sheet 标签不设 tabColor（未选中为 Excel 默认灰，选中白底高亮）
+├── 表头列注释：悬停表头查看指标说明；文案维护于 `docs/export/export-column-comments.yaml`（经 `export_column_comments.py` 加载）；改列须同步 spec §9 + YAML
+├── **`EXPORT_SPEC_GATE=1`（默认 0）：** export 前检测 state/DWS spec 落后并打 WARNING（非阻断）
 └── 默认路径: exports/analysis_{date}_gen{now}.xlsx
 ```
 
@@ -330,7 +334,7 @@ export（导出层）
 - **警惕（`dde_alert` / `w_dde_alert`，B4 软层）：** TA-native 相邻 **2-bar** DDX2 线性回归斜率拐点（`eps=0`）；`b4_alerts.compute_ddx2_slope_alerts`；**不对齐** 123 5-bar。仍 export/Excel。
 - **趋势（B4 hard `dde_trend` / `w_dde_trend`）：** 日线 123 同构 `analyze_moneyflow_trend_optimized` — `moneyflow_dc`+`circ_mv` → DDX1/DDX3 + 5 日 polyfit；缺 dc/circ 日线可回退 `net_mf_amount`/`total_mv`。周线 B4 对齐 `analyze_weekly_dde_trend`：`resample('W')` 独立聚合 **仅 `net_amount_dc`** 与 `circ_mv` 再 inner merge（禁止日级 join 后 resample、周线 trend **禁止** `net_mf_amount`/`total_mv` 回退）、`ddx3.tail(4)` 在全序列 `iloc[-1]`（非 dim_date 周界）；`ddx3` 尾窗含 NaN → flat（不回退 `ddx`）。`ods_moneyflow.net_amount_dc` + `ods_daily_basic.circ_mv` 落库。
 - **趋势强度（`dde_trend_strength`，非 B4）：** DDX2 **5-bar** 指数加权回归斜率 / mean(|DDX2|)（decay=0.20）；与 MACD `trend_strength` 同窗。`DDECalculator.SPEC_VERSION=v3`（v3=alert 2-bar + strength 5-bar；v2=123 5-bar alert）
-- **Tier-0 内容 DQ：** 日线 `dde_trend` 须与 B4 moneyflow 重算一致；`scripts/audit_dde_trend_oracle.py` 为 oracle，`health_check` Section K 抽样 200 股（mismatch >0.1% WARN、>1% FAIL）；异常时 `ops repair-dde-trend` 窄窗 invalidate+`CALC_FORCE_HARD` 重算；指定 `--ts-code` 时可加 `--purge-history` 清除该股全部 dde/daily 历史快照（修复 v_*_latest 中旧 calc_date 脏 trend）
+- **Tier-0 内容 DQ：** 日线 `dde_trend` 须与 B4 moneyflow 重算一致；`scripts/audit_dde_trend_oracle.py` 为 oracle（**全历史** `_compute_indicators`，非 tail255 — EMA60 暖机），`health_check` Section K 抽样 200 股（mismatch >0.1% WARN、>1% FAIL）；异常时 `ops repair-dde-trend` 窄窗 invalidate+`CALC_FORCE_HARD` 重算；指定 `--ts-code` 时可加 `--purge-history` 清除该股全部 dde/daily 历史快照（修复 v_*_latest 中旧 calc_date 脏 trend）。**P0 防复发（已接线）：** `net_amount_dc`/`circ_mv` ODS patch + DWD rebuild 后，`cli run`/`refresh` 在 `refresh_state` 之后自动 `maybe_invalidate_dde_after_column_patch`（删 dde/daily @ calc_date DWS + state，再 calc FULL）；见 `docs/superpowers/plans/2026-06-17-dde-content-invalidation-p0.md`
 - **数据源限制：** BSE 股票（.BJ）tushare 不提供 moneyflow，DDE 不可用
 - **warmup 周期：** 系统级 warmup = 250 个交易日（Price Position 250d 窗口，所有指标最大值）。补拉时按此窗口计算起始日期，不拉无用历史数据
 
@@ -374,7 +378,7 @@ export（导出层）
   `check_dwd_unchanged(..., latest_fps=...)`，把 ~6.6 万次单股 SELECT 降到每组一次。
 - **同日复跑短路（CALC_FAST_SKIP v1）:** 实库同日复跑 **834s→630s**（24%）；12 指标全 SKIP 才短路。未达 60s → v2 partial skip 见 `docs/superpowers/plans/2026-06-08-calc-partial-skip-v2.md`。
 - **同日复跑 partial skip（v2）:** `preflight_stock_modes_v2` 按指标分区；SKIP 直接记 skip，APPEND/FULL 走 `calc_stock_pipeline_selective`（按 `(freq,source)` 窄加载，APPEND 复用 chunk 尾窗）；BSE DDE 空帧视为 SKIP。`write_calc_state_from_df` 在 SKIP/写后统一刷新 `dws_calc_state`；`repair-weekly --execute` 自动清空 weekly state。
-- **同日复跑幂等闸门:** 全市场同 `calc_date` 已成功 calc 且无 stale ODS → `run_calc` 秒级退出（`calc idempotent skip`）。**`--force` 智能短路：** 若 ODS 未变且上次 calc 后无 fetch/rebuild → 同 day `--force` 亦秒退（`force_same_day_skip`）；**spec 落后时 force 不短路**（`has_spec_stale_indicators`）；`CALC_FORCE_HARD=1` 可强制真重算。**spec 发布运维：** `calc --refresh-spec ma` 或 `CALC_FORCE_HARD=1 calc --force`（见 runbook「算法 SPEC_VERSION 发布」）。
+- **同日复跑幂等闸门:** 全市场同 `calc_date` 已成功 calc 且无 stale ODS → `run_calc` 秒级退出（`calc idempotent skip`）。**spec 检测（fast gate）：** `dws_calc_state` 聚合 **+ 当日/当周 anchor `trade_date` 截面**（`v_*_latest @ trade_date`，非全库 per-stock 扫描）；**`--force` 智能短路** 与幂等同理。**`CALC_AUTO_SPEC_REFRESH=1`（默认）** 在 batch APPEND 前对 stale 子集窄窗 FULL（respect `indicator_filter`）；应急 `calc --refresh-spec`；迁移期见 runbook S2。
 - **同 day `--force` batch 短路（`CALC_FORCE_BATCH_REUSE=1` 默认）：** 若 run 级未短路但数据未变，`run_batch_append_phase` 跳过 5388×245 tail SQL，仅读 `dws_calc_state` 路由 SKIP（~489s→秒级）。
 - **新日追算（CALC_APPEND，append-only calc）:** 新交易日 calc 不再对每股窄写 255 窗，
   而由 `classify_calc_mode()` 按 `dws_calc_state`（PK `(ts_code, freq, indicator)`）+ 各计算器

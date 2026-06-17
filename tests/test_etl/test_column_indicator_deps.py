@@ -7,6 +7,7 @@ from backend.etl.column_indicator_deps import (
     ALL_INDICATORS,
     QUOTE_INDICATORS,
     calc_routes_narrowed,
+    dde_patch_ts_codes,
     resolve_affected_indicators,
     resolve_run_calc_indicator_filter,
 )
@@ -50,6 +51,19 @@ def test_pe_ttm_only_returns_none():
 
 def test_empty_events_returns_none():
     assert resolve_affected_indicators([]) is None
+
+
+def test_dde_patch_ts_codes_net_amount_dc_and_circ_mv():
+    events = [
+        ("000001.SZ", "20260612", "ods_moneyflow", "net_amount_dc", False),
+        ("000002.SZ", "20260612", "ods_daily_basic", "circ_mv", False),
+        ("000003.SZ", "20260612", "ods_moneyflow", "buy_lg_vol", False),
+    ]
+    assert dde_patch_ts_codes(events) == ["000001.SZ", "000002.SZ"]
+
+
+def test_dde_patch_ts_codes_empty():
+    assert dde_patch_ts_codes([]) == []
 
 
 def test_quote_indicators_constant():

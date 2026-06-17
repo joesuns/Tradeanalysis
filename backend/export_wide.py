@@ -7,6 +7,7 @@ from typing import Dict, Optional
 import duckdb
 import pandas as pd
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 
 from backend.etl.divergence_tradable import TradableEnrichStats, enrich_tradable_columns
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -102,6 +103,50 @@ _COL_NAMES = {
     "vol_signal": "量价信号",
 }
 
+_BASIC_HEADER_FILL = "1A1A1A"
+
+# 综合分析 sheet：可交易背离 + 量价信号；不含 MACD/DDE 结构/剔除背离
+_SIGNAL_ONLY = [
+    "kpattern", "kpattern_strength",
+    "price_position_60d", "price_position_120d", "price_position_250d",
+    "macd_divergence_tradable",
+    "macd_zone", "macd_turning_point", "macd_alert", "macd_trend", "macd_trend_strength",
+    "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
+    "dde_divergence_tradable",
+    "dde_trend", "dde_trend_strength", "dde_alert",
+    "vol_zone", "vol_trend", "vol_divergence", "vol_signal",
+]
+
+
+def _reorder_vol_signal(cols):
+    """Place vol_signal adjacent to vol_divergence (fallback: after vol_trend)."""
+    if "vol_signal" not in cols:
+        return cols
+    out = list(cols)
+    out.remove("vol_signal")
+    if "vol_divergence" in out:
+        out.insert(out.index("vol_divergence") + 1, "vol_signal")
+    elif "vol_trend" in out:
+        out.insert(out.index("vol_trend") + 1, "vol_signal")
+    else:
+        out.append("vol_signal")
+    return out
+
+
+def _attach_header_comment(cell, col_key, weekly=False):
+    """Attach YAML glossary comment to a header cell (row 2)."""
+    from backend.export_column_comments import (
+        comment_author,
+        comment_box_size,
+        format_column_comment,
+    )
+
+    text = format_column_comment(col_key, weekly=weekly)
+    if not text:
+        return
+    width, height = comment_box_size()
+    cell.comment = Comment(text, comment_author(), width=width, height=height)
+
 # Enum value translations (English → Chinese). NULL = no signal, shown as "-"
 _ENUM_VALUES = {
     "kpattern": {"yang_bao_yin": "阳包阴", "yang_ke_yin": "阳克阴",
@@ -192,6 +237,13 @@ def export_wide_to_excel(
     t0 = time.monotonic()
     con = duckdb.connect(db_path)
 
+    from backend.config import EXPORT_SPEC_GATE
+    if EXPORT_SPEC_GATE:
+        from backend.etl.calc_spec_gate import export_spec_freshness_warnings
+
+        for msg in export_spec_freshness_warnings(con, trade_date):
+            logger.warning("export spec gate: %s", msg)
+
     # ---- Daily data ----
     daily = con.execute(
         f"SELECT * FROM {VIEW_MAP['daily']} WHERE trade_date = ?"
@@ -257,7 +309,7 @@ def export_wide_to_excel(
     weekly = weekly.drop(columns=[c for c in id_cols_drop if c in weekly.columns], errors="ignore")
 
     # Track which columns are daily vs weekly
-    daily_cols = [c for c in daily.columns if c != "freq"]
+    daily_cols = _reorder_vol_signal([c for c in daily.columns if c != "freq"])
     weekly_cols = list(weekly.columns)
 
     # Basic info columns (for both sheets)
@@ -286,16 +338,6 @@ def export_wide_to_excel(
     wb = Workbook()
     wb.remove(wb.active)
     # ---- Signal-only analysis sheet (first sheet) ----
-    _SIGNAL_ONLY = [
-        "kpattern", "kpattern_strength",
-        "price_position_60d", "price_position_120d", "price_position_250d",
-        "macd_divergence_tradable", "macd_divergence_reject", "macd_divergence",
-        "macd_zone", "macd_turning_point", "macd_alert", "macd_trend", "macd_trend_strength",
-        "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
-        "dde_divergence_tradable", "dde_divergence_reject", "dde_divergence",
-        "dde_trend", "dde_trend_strength", "dde_alert",
-        "vol_zone", "vol_trend",
-    ]
     _signal_set = set(_SIGNAL_ONLY)
     daily_signal_only = [c for c in _SIGNAL_ONLY if c in daily_cols] + [
         c for c in daily_cols if c in basic_cols_outer and c not in _signal_set
@@ -436,7 +478,9 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     # Data
     data_font = Font(name="微软雅黑", size=10, color="1D1D1F")
     # Basic info header
-    basic_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    basic_fill = PatternFill(
+        start_color=_BASIC_HEADER_FILL, end_color=_BASIC_HEADER_FILL, fill_type="solid",
+    )
     # Separator between groups
     sep_left = Side(style="medium", color="FFFFFF")
     # Data borders
@@ -507,6 +551,7 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = header_bottom
+        _attach_header_comment(cell, eng, weekly=False)
 
     for i, name in enumerate(weekly_names):
         c = weekly_start + i
@@ -517,6 +562,7 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = header_bottom
+        _attach_header_comment(cell, eng, weekly=True)
 
     # ── Freeze: 股票名称 column + 2 header rows ──
     stock_name_idx = 1
@@ -526,7 +572,6 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
             break
     freeze_letter = get_column_letter(stock_name_idx)
     ws.freeze_panes = f"{freeze_letter}3"
-    ws.sheet_properties.tabColor = "1A5276"
 
     # ── Auto-fit column widths ──
     for col_idx in range(1, len(df.columns) + 1):

@@ -13,6 +13,12 @@ from backend.fetch.ods_diff import (
 # (ts_code, trade_date, ods_table, column, is_insert)
 ChangedFieldEvent = Tuple[str, str, str, str, bool]
 
+# P0: ODS column patches that change DDE trend inputs without new quote bars.
+DDE_PATCH_TABLE_COLUMNS = frozenset({
+    ("ods_moneyflow", "net_amount_dc"),
+    ("ods_daily_basic", "circ_mv"),
+})
+
 QUOTE_INDICATORS = frozenset({
     "macd", "ma", "kpattern", "volume", "priceposition",
 })
@@ -52,6 +58,15 @@ def _build_ods_column_map() -> Dict[Tuple[str, str], FrozenSet[str]]:
 
 
 ODS_COLUMN_TO_INDICATORS = _build_ods_column_map()
+
+
+def dde_patch_ts_codes(events: Sequence[ChangedFieldEvent]) -> List[str]:
+    """Return sorted unique ts_codes with net_amount_dc or circ_mv ODS patch events."""
+    codes: Set[str] = set()
+    for ts_code, _td, table, col, _ins in events:
+        if (table, col) in DDE_PATCH_TABLE_COLUMNS:
+            codes.add(ts_code)
+    return sorted(codes)
 
 
 def resolve_affected_indicators(

@@ -132,6 +132,7 @@ def run_refresh_calc(
         "dde_daily": dde_daily,
         "dde_weekly": dde_weekly,
         "state_map": state_map,
+        "force_recompute": True,
     }
 
     lid, t0 = log_etl_start(con, "calc_dws")
@@ -289,6 +290,15 @@ def run_refresh_pipeline(
         except Exception:
             log_etl_end(con, lid2, "refresh_refresh_state", t02, "failed")
             raise
+
+    if dwd_result and stale_rebuilt and fetch_result is not None:
+        from backend.etl.backfill_dde_recalc import (
+            maybe_invalidate_dde_after_column_patch,
+        )
+
+        maybe_invalidate_dde_after_column_patch(
+            con, analysis_date, fetch_result, stale_rebuilt,
+        )
 
     logger.info("=== refresh calc for %s ===", analysis_date)
     calc_summary = run_refresh_calc(

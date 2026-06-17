@@ -1560,3 +1560,103 @@ def test_batch_append_state_uses_batch_upsert(monkeypatch):
     assert upsert_calls["n"] >= 1
     assert upsert_calls["records"] >= 1
     con.close()
+
+
+def test_batch_append_macd_passes_spec_version(monkeypatch):
+    """batch_append_macd insert_dws_batch_multi must pass MACDCalculator.SPEC_VERSION."""
+    import pandas as pd
+
+    from backend.etl.calc_batch_append import batch_append_macd
+    from backend.etl.calc_macd import MACDCalculator
+
+    captured = {}
+
+    def spy_multi(*args, **kwargs):
+        captured["spec_version"] = kwargs.get("spec_version")
+        return 1
+
+    monkeypatch.setattr(
+        "backend.etl.calc_batch_append.load_ema_seeds_batch",
+        lambda *a, **k: {c: {"ema_12": 1.0, "ema_26": 2.0, "dea": 0.1} for c in a[2]},
+    )
+    monkeypatch.setattr("backend.etl.calc_batch_append.insert_dws_batch_multi", spy_multi)
+    monkeypatch.setattr("backend.config.CALC_VECTOR_APPEND", False)
+
+    codes = ["T.SZ"]
+    df = pd.DataFrame({"trade_date": ["20260607", "20260608"], "close_qfq": [10.0, 10.1]})
+    batch_append_macd(
+        None, "daily", codes, "20260608",
+        {c: df for c in codes}, {c: ["20260608"] for c in codes},
+    )
+    assert captured.get("spec_version") == MACDCalculator.SPEC_VERSION
+
+
+def test_batch_append_volume_passes_spec_version(monkeypatch):
+    """batch_append_volume insert_dws_batch_multi must pass VolumeCalculator.SPEC_VERSION."""
+    import pandas as pd
+
+    from backend.etl.calc_batch_append import batch_append_volume
+    from backend.etl.calc_volume import VolumeCalculator
+
+    captured = {}
+
+    def spy_multi(*args, **kwargs):
+        captured["spec_version"] = kwargs.get("spec_version")
+        return 1
+
+    monkeypatch.setattr(
+        "backend.etl.calc_batch_append.load_zone_seeds_batch",
+        lambda *a, **k: {c: {"zone": "normal"} for c in a[2]},
+    )
+    monkeypatch.setattr("backend.etl.calc_batch_append.insert_dws_batch_multi", spy_multi)
+    monkeypatch.setattr("backend.config.CALC_VECTOR_APPEND", False)
+
+    codes = ["T.SZ"]
+    df = pd.DataFrame({
+        "trade_date": ["20260607", "20260608"],
+        "close_qfq": [10.0, 10.1],
+        "vol": [100.0, 110.0],
+    })
+    batch_append_volume(
+        None, "daily", codes, "20260608",
+        {c: df for c in codes}, {c: ["20260608"] for c in codes},
+    )
+    assert captured.get("spec_version") == VolumeCalculator.SPEC_VERSION
+
+
+def test_batch_append_dde_passes_spec_version(monkeypatch):
+    """batch_append_dde insert_dws_batch_multi must pass DDECalculator.SPEC_VERSION."""
+    import pandas as pd
+
+    from backend.etl.calc_batch_append import batch_append_dde
+    from backend.etl.calc_dde import DDECalculator
+
+    captured = {}
+
+    def spy_multi(*args, **kwargs):
+        captured["spec_version"] = kwargs.get("spec_version")
+        return 1
+
+    monkeypatch.setattr(
+        "backend.etl.calc_batch_append.load_ema_seeds_batch",
+        lambda *a, **k: {c: {"ddx2": 0.01} for c in a[2]},
+    )
+    monkeypatch.setattr("backend.etl.calc_batch_append.insert_dws_batch_multi", spy_multi)
+    monkeypatch.setattr("backend.config.CALC_VECTOR_APPEND", False)
+
+    codes = ["T.SZ"]
+    dde_df = pd.DataFrame({
+        "trade_date": ["20260607", "20260608"],
+        "buy_lg_vol": [1.0, 1.0],
+        "sell_lg_vol": [1.0, 1.0],
+        "buy_elg_vol": [1.0, 1.0],
+        "sell_elg_vol": [1.0, 1.0],
+        "total_vol": [100.0, 100.0],
+        "net_mf_amount": [0.0, 0.0],
+        "close_qfq": [10.0, 10.1],
+    })
+    batch_append_dde(
+        None, "daily", codes, "20260608",
+        {c: dde_df for c in codes}, {c: ["20260608"] for c in codes},
+    )
+    assert captured.get("spec_version") == DDECalculator.SPEC_VERSION

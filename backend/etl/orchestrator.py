@@ -1331,7 +1331,7 @@ def _should_skip_calc_idempotent(
     # handled on the next fetch/calc cycle and must not block the whole market.
     if force:
         from backend.etl.calc_spec_gate import has_spec_stale_indicators
-        if has_spec_stale_indicators(con):
+        if has_spec_stale_indicators(con, calc_date):
             return False
         return True
 
@@ -1344,7 +1344,7 @@ def _should_skip_calc_idempotent(
                 return False
 
     from backend.etl.calc_spec_gate import has_spec_stale_indicators
-    if has_spec_stale_indicators(con):
+    if has_spec_stale_indicators(con, calc_date):
         return False
     return True
 
@@ -1649,6 +1649,26 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         logger.warning("No stocks with sufficient data to calculate")
         return
 
+    # 3a. Auto spec refresh — narrow FULL for state/DWS spec_version lag (before batch APPEND).
+    auto_spec_summary = {}
+    from backend.config import CALC_AUTO_SPEC_REFRESH
+    if CALC_AUTO_SPEC_REFRESH:
+        from backend.etl.calc_spec_refresh import run_auto_spec_refresh_if_needed
+
+        auto_spec_summary = run_auto_spec_refresh_if_needed(
+            con, calc_date, codes_to_calc,
+            indicator_filter=indicator_filter,
+        )
+        if auto_spec_summary.get("refreshed", 0) > 0:
+            logger.info(
+                "auto spec refresh done: refreshed=%s full_by_indicator=%s",
+                auto_spec_summary.get("refreshed", 0),
+                auto_spec_summary.get("full_by_indicator", {}),
+            )
+            # DWS changed — discard hot preflight to avoid duplicate FULL routing.
+            if preflight_ctx is not None:
+                preflight_ctx = None
+
     # 3b. Cross-stock batch APPEND (full market only; FULL stocks defer to chunk workers).
     from backend.config import CALC_APPEND, CALC_BATCH_APPEND, CALC_INCREMENTAL
     from backend.etl.calc_batch_append import run_batch_append_phase
@@ -1816,7 +1836,10 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 "WHERE calc_date='%s' GROUP BY reason", calc_date)
     from backend.etl.calc_gate import get_ods_max_trade_date
 
-    from backend.etl.calc_spec_gate import count_spec_stale_by_indicator
+    from backend.etl.calc_spec_gate import (
+        count_dws_spec_stale_on_trade_date,
+        count_spec_stale_by_indicator,
+    )
 
     chunk_stock_count = len({ts for ts, _ in full_items}) + len(fallthrough_codes)
     batch_obs = {}
@@ -1862,6 +1885,10 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 batch_ctx.get("full_by_indicator", {}) if batch_ctx else {}
             ),
             "spec_stale_counts": count_spec_stale_by_indicator(con),
+            "dws_spec_stale_counts": count_dws_spec_stale_on_trade_date(
+                con, calc_date, codes_to_calc,
+            ),
+            "auto_spec_refresh": auto_spec_summary or None,
             **narrow_obs,
             **batch_obs,
         },

@@ -20,9 +20,18 @@ from backend.config import DUCKDB_PATH
 from backend.etl.calc_dde import DDECalculator
 
 
-def recompute_daily_trend(calc: DDECalculator, df, tail_bars: int = 255) -> Optional[str]:
+def recompute_daily_trend(
+    calc: DDECalculator, df, tail_bars: Optional[int] = None,
+) -> Optional[str]:
+    """Recompute last-bar daily trend using the same domain as production FULL calc.
+
+    Default ``tail_bars=None`` uses the full loaded history. Do **not** default to
+    255: DDE trend uses EMA(60) on DDX1 — truncating the series shifts the oracle
+    away from ``DDECalculator.calculate()`` / ``_compute_indicators(full_df)``.
+    Pass an explicit ``tail_bars`` only for narrow diagnostics.
+    """
     work = df.copy()
-    if tail_bars and len(work) > tail_bars:
+    if tail_bars is not None and len(work) > tail_bars:
         work = work.tail(tail_bars).reset_index(drop=True)
     out = calc._compute_indicators(work)
     if out.empty or out["trend"].isna().all():

@@ -32,23 +32,33 @@
 
 运维例外：除权/adj 回填后若未触发 fetch，需显式 `fetch` + `calc --force`（非日常）。
 
-## 算法 SPEC_VERSION 发布（运维例外）
+## 算法 SPEC_VERSION 发布
 
-当 `Calculator.SPEC_VERSION` bump（算法/口径升级，DWD 输入未变）时，日常 `run/calc` **不会**自动刷新存量 DWS——须显式运维刷新。
+**默认（`CALC_AUTO_SPEC_REFRESH=1`）：** `run/calc` 在 batch APPEND 前自动检测 **state ∪ DWS** spec 落后并窄窗 FULL，无需日常手动 `refresh-spec`。
 
-| 步骤 | 命令 | 验收 |
+| 步骤 | 命令 | 验收 / 何时用 |
 |------|------|------|
-| 1 窄指标刷新（推荐） | `python3 -m backend.cli calc --date YYYYMMDD --refresh-spec ma` | `v_dq_spec_freshness` ma spec_stale=0 |
-| 1b 全链路 R1（含 fetch/DWD） | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | 同上 + ODS/DWD 审计 log |
+| 日常 | `python -m backend.cli run --date YYYYMMDD` | 自动 spec refresh（观测 `calc_dws.data_completeness.auto_spec_refresh`） |
+| 1 窄指标刷新（应急） | `python3 -m backend.cli calc --date YYYYMMDD --refresh-spec ma` | `v_dq_spec_freshness` ma spec_stale=0 |
+| 1b dry-run 预览 | `python3 -m backend.cli calc --refresh-spec macd --date YYYYMMDD --dry-run` | 零 DWS 写，仅报 stale 规模 |
+| 1c 全链路 R1（含 fetch/DWD） | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | 同上 + ODS/DWD 审计 log |
+| 1d **v2 实现 bugfix（stay v2）** | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | state 已 v2 但 alignment 语义错时；**勿用** refresh-spec |
 | 2 或全 calc HARD | `CALC_FORCE_HARD=1 python3 -m backend.cli calc --date YYYYMMDD --force` | 同上 |
 | 3 语义审计（MA） | `python3 -m scripts.audit_ma_alignment_fallback` | 前两项 = 0 |
-| 4 重导 Excel | `python3 -m backend.cli export --date YYYYMMDD` | export 在 calc **之后** |
+| 4 重导 Excel | `python3 -m backend.cli export --date YYYYMMDD` | export 在 calc **之后**；`EXPORT_SPEC_GATE=1` 非阻断 WARNING |
 
-**允许 `CALC_FORCE_HARD=1` 的场景：** spec 发布日、Gate 3 验收；**日常禁止**。
+**验收：** `calc_dws.data_completeness.dws_spec_stale_counts` 全 0（scoped @ calc_date）；`v_dq_spec_freshness` / `health_check` Section J；或 `EXPORT_SPEC_GATE=1` export 无 WARNING。
+
+**首次启用 auto refresh 前（S2，一次性）：**
+
+```bash
+python -m backend.cli calc --refresh-spec dde --date 20260616
+# 迁移窗口可选：CALC_AUTO_SPEC_REFRESH=0 python -m backend.cli run --date YYYYMMDD
+```
 
 **语义澄清：** `calc --date` = DWS 快照批次 `calc_date`；`export --date` = Excel 锚定 **trade_date** 截面（读 `v_*_latest`）。
 
-**PR checklist：** bump spec → pytest → refresh-spec/HARD calc → audit → export → health_check Section J。
+**PR checklist：** bump spec → pytest → run/calc（auto refresh）→ export → health_check Section J。
 
 ### Spec migration（一次性，禁并行 run/calc）
 
@@ -157,8 +167,8 @@ python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date YYYYM
 | 步骤 | 命令 | 验收 |
 |------|------|------|
 | 1 Oracle 基线 | `python3 scripts/audit_dde_trend_oracle.py --date YYYYMMDD --freq daily --sample 500` | 记录 mismatch（repair 前） |
-| 2 六股 pilot | `python3 -m backend.cli repair-dde-trend --date YYYYMMDD --freq daily --ts-code 600831.SH ...` | oracle 6/6 |
-| 3 全市场 daily | `python3 -m backend.cli repair-dde-trend --date YYYYMMDD --freq daily` | sample 500 mismatch < 0.1% |
+| 2 六股 pilot | `python3 -m backend.cli ops repair-dde-trend --date YYYYMMDD --freq daily --ts-code 600831.SH ...` | oracle 6/6 |
+| 3 全市场 daily | `python3 -m backend.cli ops repair-dde-trend --date YYYYMMDD --freq daily` | sample 500 mismatch < 0.1% |
 | 4 验收 | `python3 scripts/audit_dde_trend_oracle.py --date YYYYMMDD --freq daily --sample 500` | exit 0 |
 
 **禁止：** `rebuild_all_dwd`、12 指标无差别 `--force`、repair 期间并行 `run`。
@@ -166,6 +176,18 @@ python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date YYYYM
 **反面教材：** 仅 `calc --refresh-spec dde` 无法修复（`find_spec_stale_codes` 返回 0）。
 
 **2026-06-14 实库 repair 已完成（calc_date=20260612）：** oracle sample 500 mismatch=0；health_check Section K PASS。
+
+**2026-06-17 P0 防复发（已接线）：** `net_amount_dc` / `circ_mv` ODS 补洞 + DWD rebuild 后，`cli run` / `cli refresh` 在 `refresh_state` 之后自动 `maybe_invalidate_dde_after_column_patch`（删 dde/daily @ calc_date DWS + state → calc 重算 trend）。Plan：`docs/superpowers/plans/2026-06-17-dde-content-invalidation-p0.md`。
+
+**2026-06-16 Anchor L2（实库）：** bulk repair 59 股 + oracle sample 500 mismatch=0；health_check PASS。证据：`docs/superpowers/plans/evidence/2026-06-17-anchor-l2/`。
+
+**Oracle 口径（2026-06-17）：** `audit_dde_trend_oracle` 默认**全历史**重算（非 tail255），避免 EMA60 暖机假阳性；单股全历史审计较慢（~7min/股）。
+
+| 场景 | 命令 |
+|------|------|
+| 日常抽检 | `python3 -m scripts.audit_dde_trend_oracle --date YYYYMMDD --freq daily --sample 500` |
+| 定点 repair（存量脏 trend） | `python3 -m backend.cli ops repair-dde-trend --date YYYYMMDD --freq daily --ts-code ...` |
+| repair 后 MA v2 副作用 | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma --ts-code ...` |
 
 ---
 
@@ -182,7 +204,7 @@ python -m backend.cli backfill-dde-meta --days 900 --since 20230911 --date YYYYM
 
 预览不写库：`python -m backend.cli refresh-state --date YYYYMMDD --dry-run`
 
-**禁止**：用 `refresh-state` 替代「DWD 尾窗数值真变且须重算 DWS」的场景——那种情况须 FULL chunk 或按股重算。
+**禁止**：用 `refresh-state` 替代「DWD 尾窗数值真变且须重算 DWS」的场景——那种情况须 FULL chunk 或按股重算。**例外（P0，2026-06-17）：** `net_amount_dc`/`circ_mv` 列 patch 触发的 dde trend 内容 stale，`run`/`refresh` 路径已自动 invalid dde/daily DWS+state（见上节 P0 防复发）。
 
 ## SLA 验收（M4 真新日）
 
