@@ -5,6 +5,7 @@ import duckdb
 from backend.db.schema import create_all_tables
 from backend.fetch.fetch_result import FetchResult
 from backend.etl.pipeline_context import PipelineContext, compute_skip_dwd_calc
+from tests.test_etl.helpers import insert_prior_calc_volume, seed_dim_date_anchor
 
 
 def test_compute_skip_dwd_calc_true_when_unchanged_and_prior_calc():
@@ -35,12 +36,8 @@ def test_compute_skip_dwd_calc_true_when_unchanged_and_prior_calc():
            VALUES ('1', 'calc_dws', 't0', 't1', 'success', 1, '', ?)""",
         [comp],
     )
-    con.execute(
-        "INSERT INTO dws_macd_daily (ts_code, trade_date, calc_date, dif, dea, macd_bar) "
-        "SELECT code, '20260612', '20260612', 0, 0, 0 FROM "
-        "(SELECT unnest(generate_series(1, 4000)) AS i, "
-        " printf('C%04d.SZ', i) AS code)"
-    )
+    seed_dim_date_anchor(con, "20260612")
+    insert_prior_calc_volume(con, "20260612")
     fr = FetchResult(api_rows=100, rows_written=0, rows_unchanged=100)
     assert compute_skip_dwd_calc(con, "20260612", ["A.SZ"], fr) is True
     con.close()
@@ -72,12 +69,8 @@ def test_compute_skip_dwd_calc_true_despite_structural_stale_ods():
            VALUES ('1', 'calc_dws', 't0', 't1', 'success', 1, '', ?)""",
         [comp],
     )
-    con.execute(
-        "INSERT INTO dws_macd_daily (ts_code, trade_date, calc_date, dif, dea, macd_bar) "
-        "SELECT code, '20260612', '20260612', 0, 0, 0 FROM "
-        "(SELECT unnest(generate_series(1, 4000)) AS i, "
-        " printf('C%04d.SZ', i) AS code)"
-    )
+    seed_dim_date_anchor(con, "20260612")
+    insert_prior_calc_volume(con, "20260612")
     fr = FetchResult(rows_written=0, rows_unchanged=100)
     assert compute_skip_dwd_calc(con, "20260612", ["A.SZ", "B.SZ"], fr) is True
     con.close()
@@ -128,12 +121,8 @@ def test_pipeline_context_from_fetch_marks_shortcut():
            VALUES ('1', 'calc_dws', 't0', 't1', 'success', 1, '', ?)""",
         [comp],
     )
-    con.execute(
-        "INSERT INTO dws_macd_daily (ts_code, trade_date, calc_date, dif, dea, macd_bar) "
-        "SELECT code, '20260612', '20260612', 0, 0, 0 FROM "
-        "(SELECT unnest(generate_series(1, 4000)) AS i, "
-        " printf('C%04d.SZ', i) AS code)"
-    )
+    seed_dim_date_anchor(con, "20260612")
+    insert_prior_calc_volume(con, "20260612")
     fr = FetchResult(rows_written=0, rows_unchanged=50)
     ctx = PipelineContext.from_fetch(con, "20260612", ["A.SZ"], fr, mode="run")
     assert ctx.skip_dwd_calc is True
