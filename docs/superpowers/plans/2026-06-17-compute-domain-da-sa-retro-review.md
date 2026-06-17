@@ -3,7 +3,7 @@
 > **日期：** 2026-06-17  
 > **分支：** `feat/batch-full-compute-domain`（base: `main`，6 commits）  
 > **背景：** 实施时未按 plan §治理协议 完成 DA+SA 独立双签；用户批准 **Step B+C 补救**。  
-> **状态：** M5 实库 E1–E3 完成；**Final DA/SA 双签待签**
+**状态：** M5 Final 双签完成；**已合 main**（PR #11）
 
 **Plan：** [`2026-06-17-batch-full-compute-domain-optimization.md`](2026-06-17-batch-full-compute-domain-optimization.md)
 
@@ -169,7 +169,7 @@
 | M2 | ☑ | ☑ | ☑ 口头 | |
 | M3 | ☑ | ☑ | ☑ 口头 | T2 → M5 |
 | M4 | ☑ | ☑ | ☑ 口头 | S4.2/T3 → M5 门禁 |
-| **M5** | ☐ | ☐ | ☐ | E1–E3 证据就绪（见 retro review §M5） |
+| **M5** | ☑ | ☑ | ☑ | E1–E3 Pass；PR #11 |
 
 ---
 
@@ -183,13 +183,13 @@
 | E2 | pilot spec_stale=0 | **Pass** | macd/volume @ 20260616 anchor；`spec-status-20260616.txt` |
 | E3 | APPEND 同日复跑 ±10% | **Pass** | pilot 0.94；全市场 0.89；`e3-rerun.txt` |
 | T2 | `CALC_B4_WEEKLY_FAST=0` | **Pass（spot）** | 3 股 expanding vs stored，0 mismatch |
-| T3 | 全量 pytest | **Pass（1 例外）** | 704/705；`test_b4_golden_matches_db` 临时库缺表（非 plan 路径） |
+| T3 | 全量 pytest | **Pass** | 705 pass / 5 skip；golden 实库或 CI skip（`6d819b6`） |
 
 ### M5 小结
 
 | DA | SA | 阻塞项 |
 |----|-----|--------|
-| ☐ 待签 | ☐ 待签 | Final 双签 + 用户批准合 main |
+| ☑ 2026-06-17 | ☑ 2026-06-17 | 无 |
 
 ---
 
@@ -211,17 +211,16 @@ SA 签字：M0–M4 Pass  日期：2026-06-17  备注：T1 Pass；T2 留 M5；S4
 用户：  M0–M4 批准   日期：2026-06-17  备注：口头「DA 签 M0–M4 / SA 签 M0–M4，T1 Pass，T2 留 M5」
 ```
 
-## M5 Final 签字（待三方）
+## M5 Final 签字
 
 ```
-DA 签字：________  日期：________  备注：E1–E3 Pass；T2 spot / T3 1 例外
-SA 签字：________  日期：________  备注：________
-用户：  ________  日期：________  备注：批准合 main ☐
+DA 签字：M5 Pass  日期：2026-06-17  备注：E1 oracle 24.5k bar；算域=写域实库验收
+SA 签字：M5 Pass  日期：2026-06-17  备注：E3 0.94/0.89；pytest 705/705；PR #11
+用户：  M5 签 + merge  日期：2026-06-17  备注：批准合 main
 ```
 
 ---
 
 ## STOP 状态（当前）
 
-- **M5 实库 E1–E3 证据完成**（2026-06-17）  
-- **Final sign-off / merge main：** 待 M5 DA+SA 双签 + 用户批准
+- **P2+ compute domain plan 完成**（M0–M5 全 Milestone 双签 + 用户 merge 批准）

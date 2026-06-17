@@ -9,7 +9,7 @@
 **Tech Stack:** Python 3.9+, DuckDB, numpy, pandas, pytest, `profile_macd_b4_weekly.py`, `profile_volume_trend_v2.py`
 
 **日期：** 2026-06-17  
-**状态：** M5 E1–E3 证据完成；**Final DA/SA 双签 + 合 main 待批**  
+**状态：** M5 Final 完成；**PR #11 合 main**  
 **审批：** 用户同意 — 2026-06-17（DA+SA review 门禁 + 违规定停）  
 **ACCEPTANCE_DATE：** `20260616`（S2 实库 pilot 与 E1–E3 一致）
 
@@ -58,7 +58,7 @@
 | M2 | ☑ | ☑ | ☑ |
 | M3 | ☑ | ☑ | ☑ |
 | M4 | ☑ | ☑ | ☑ |
-| M5 | ☐ | ☐ | ☐ |
+| M5 | ☑ | ☑ | ☑ |
 
 **未双签通过 → 不得进入下一 Milestone。** M0–M4 追溯双签：2026-06-17（见 `2026-06-17-compute-domain-da-sa-retro-review.md`）。
 
@@ -542,7 +542,7 @@ python3 -m backend.cli calc --refresh-spec macd --date 20260616 \
 | E1 | 50 股 oracle 100% | ☑ |
 | E2 | spec_stale=0（已刷指标） | ☑ |
 | E3 | APPEND 不退化 | ☑ |
-| — | 用户批准合 main | ☐ |
+| — | 用户批准合 main | ☑ |
 
 ---
 
