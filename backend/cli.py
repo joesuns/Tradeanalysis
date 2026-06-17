@@ -476,6 +476,20 @@ def _cmd_run_single_day(args, date: str):
                 log_etl_end(con, lid2, "run_refresh_state", t02, "failed")
                 raise
 
+        if (
+            dwd_result
+            and stale_rebuilt
+            and not pipeline_ctx.skip_dwd_calc
+            and fetch_result is not None
+        ):
+            from backend.etl.backfill_dde_recalc import (
+                maybe_invalidate_dde_after_column_patch,
+            )
+
+            maybe_invalidate_dde_after_column_patch(
+                con, date, fetch_result, stale_rebuilt,
+            )
+
         if not skip_dwd_calc and fetch_result is not None:
             from backend.etl.calc_preflight_context import RunCalcHandoff
             from backend.etl.column_indicator_deps import (
