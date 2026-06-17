@@ -3,7 +3,8 @@ import numpy as np
 from backend.etl.calc_dde import DDECalculator
 
 
-# ── B2 golden-master: frozen pre-vectorization oracles (decay=0.20, window=8) ──
+# ── B2 golden-master: legacy _compute_ddx2_trend oracle (window=8); production
+# trend_strength uses DDE_TREND_STRENGTH_WINDOW=5. ──
 
 def _oracle_dde_trend(ddx2, window=8):
     result = [None] * len(ddx2)
@@ -31,7 +32,7 @@ def _oracle_dde_trend(ddx2, window=8):
     return result
 
 
-def _oracle_dde_trend_strength(ddx2, window=8):
+def _oracle_dde_trend_strength(ddx2, window=5):
     result = np.full(len(ddx2), np.nan)
     for i in range(window - 1, len(ddx2)):
         segment = ddx2[i - window + 1:i + 1]
@@ -233,22 +234,18 @@ def test_dde_alert_uses_ddx2():
 
 
 def test_dde_slope_inflection_bull_alert():
-    """123 adjacent-window slope flip → upturn_reverse."""
+    """2-bar adjacent-window slope flip → upturn_reverse."""
     calc = DDECalculator.__new__(DDECalculator)
-    n = 12
-    ddx2 = np.zeros(n, dtype=float)
-    ddx2[-6:] = [4.0, 3.0, 2.0, 1.0, 0.0, 5.0]
-    df = pd.DataFrame({"trade_date": [f"d{i}" for i in range(n)], "ddx2": ddx2})
+    ddx2 = np.array([0.0, 0.0, 1.0, 0.0, 5.0], dtype=float)
+    df = pd.DataFrame({"trade_date": [f"d{i}" for i in range(len(ddx2))], "ddx2": ddx2})
     result = calc._compute_alerts(df)
     assert result[-1] == "upturn_reverse"
 
 
 def test_dde_slope_inflection_bear_alert():
     calc = DDECalculator.__new__(DDECalculator)
-    n = 12
-    ddx2 = np.zeros(n, dtype=float)
-    ddx2[-6:] = [-4.0, -3.0, -2.0, -1.0, 0.0, -5.0]
-    df = pd.DataFrame({"trade_date": [f"d{i}" for i in range(n)], "ddx2": ddx2})
+    ddx2 = np.array([0.0, 0.0, -1.0, 0.0, -5.0], dtype=float)
+    df = pd.DataFrame({"trade_date": [f"d{i}" for i in range(len(ddx2))], "ddx2": ddx2})
     result = calc._compute_alerts(df)
     assert result[-1] == "downturn_reverse"
 
@@ -347,12 +344,12 @@ def test_dde_trend_weighted_flat():
 
 
 def test_dde_trend_strength_positive():
-    """trend_strength: 单调上升返回正值。"""
+    """trend_strength: 单调上升返回正值（5-bar）。"""
     calc = DDECalculator.__new__(DDECalculator)
 
     ddx2 = np.array([0.001, 0.002, 0.003, 0.004, 0.005,
                      0.006, 0.007, 0.008, 0.009, 0.010])
-    result = calc._compute_trend_strength(ddx2, window=8)
+    result = calc._compute_trend_strength(ddx2)
     assert result[9] is not None, "trend_strength 不应为 None"
     assert not np.isnan(result[9]), "trend_strength 不应为 NaN"
     assert result[9] > 0, (
@@ -361,12 +358,12 @@ def test_dde_trend_strength_positive():
 
 
 def test_dde_trend_strength_negative():
-    """trend_strength: 单调下降返回负值。"""
+    """trend_strength: 单调下降返回负值（5-bar）。"""
     calc = DDECalculator.__new__(DDECalculator)
 
     ddx2 = np.array([0.010, 0.009, 0.008, 0.007, 0.006,
                      0.005, 0.004, 0.003, 0.002, 0.001])
-    result = calc._compute_trend_strength(ddx2, window=8)
+    result = calc._compute_trend_strength(ddx2)
     assert result[9] is not None, "trend_strength 不应为 None"
     assert not np.isnan(result[9]), "trend_strength 不应为 NaN"
     assert result[9] < 0, (
@@ -375,11 +372,11 @@ def test_dde_trend_strength_negative():
 
 
 def test_dde_trend_strength_window_insufficient():
-    """窗口不足时 trend_strength 应返回 NaN。"""
+    """窗口不足时 trend_strength 应返回 NaN（5-bar）。"""
     calc = DDECalculator.__new__(DDECalculator)
 
-    ddx2 = np.array([0.001, 0.002, 0.003])  # 只有 3 根，不足 window=8
-    result = calc._compute_trend_strength(ddx2, window=8)
+    ddx2 = np.array([0.001, 0.002, 0.003])  # 只有 3 根，不足 window=5
+    result = calc._compute_trend_strength(ddx2)
     for i in range(len(ddx2)):
         assert np.isnan(result[i]), (
             f"窗口不足 index {i} 应返回 NaN，实际 {result[i]}"
@@ -391,7 +388,7 @@ def test_dde_trend_strength_zero_mean():
     calc = DDECalculator.__new__(DDECalculator)
 
     ddx2 = np.zeros(10)
-    result = calc._compute_trend_strength(ddx2, window=8)
+    result = calc._compute_trend_strength(ddx2)
     assert np.isnan(result[9]), (
         f"全零 DDX2 应返回 NaN，实际 {result[9]}"
     )

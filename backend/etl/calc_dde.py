@@ -25,6 +25,9 @@ DDE_DDX1_EMA_SPAN = 60
 DDE_COMPENSATION_FACTOR = 60.1953
 # 123 main_batch_analyzer extends moneyflow/circ history for weekly DDE EMA(60)
 DDE_WEEKLY_TREND_HISTORY_DAYS = 900
+# TA-native derived signals (not 123 B4 hard-gate parity for alert)
+DDE_ALERT_WINDOW = 2
+DDE_TREND_STRENGTH_WINDOW = 5
 
 # Shared weekly SQL fragments (_load_weekly + _load_weekly_batch).
 _WEEK_START_FALLBACK_SQL = """
@@ -58,12 +61,12 @@ class DDECalculator:
     """DDE (Data Display Estimate) indicator calculator.
 
     Computes DDX, DDX2 from moneyflow data, plus divergence, trend, and alerts.
-    Divergence uses structure pipeline; B4 alert uses 123 DDX2 slope inflection.
+    Divergence uses structure pipeline; alert uses TA-native short DDX2 inflection.
     Works for both daily and weekly frequencies.
     """
 
-    # B4 dde_alert: 123 ddx2_slope_reversal; bump invalidates fingerprint skip.
-    SPEC_VERSION = "v2"
+    # v3: alert 2-bar + trend_strength 5-bar (TA-native; bump invalidates fingerprint skip).
+    SPEC_VERSION = "v3"
 
     RECALC_SPEC_DAILY = RecalcSpec(lookback=250, seed=5, event_tail=10, min_rows=10)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=250, seed=5, event_tail=10, min_rows=2)
@@ -596,9 +599,9 @@ class DDECalculator:
                 circ_mv=circ_mv,
                 skip_mask=skip_arr,
             )
-        trend_window = 8
         df["trend_strength"] = self._compute_trend_strength(
-            df["ddx2"].values.astype(float), window=trend_window
+            df["ddx2"].values.astype(float),
+            window=DDE_TREND_STRENGTH_WINDOW,
         )
 
         df["divergence"] = self._compute_divergence(df, target_indices=target_indices)
@@ -786,13 +789,15 @@ class DDECalculator:
                 result[i] = "flat"
         return result
 
-    def _compute_trend_strength(self, ddx2: np.ndarray, window: int = 8) -> np.ndarray:
+    def _compute_trend_strength(
+        self, ddx2: np.ndarray, window: int = DDE_TREND_STRENGTH_WINDOW,
+    ) -> np.ndarray:
         """DDX2 trend strength via exponentially weighted linear regression.
 
         Formula: weighted_slope / mean(|DDX2_segment|), unitless signed value.
         Positive = bullish capital flow strength, negative = bearish.
         Weighted regression (decay=0.20) gives recent bars ~3x more influence
-        than bars 8 days ago.
+        than older bars in the 5-bar window.
 
         Returns NaN where window < window or all DDX2 in segment are zero.
         """
@@ -820,8 +825,10 @@ class DDECalculator:
         )
 
     def _compute_alerts(self, df: pd.DataFrame) -> list:
-        """123 ``_eval_ddx2_slope_reversal``: adjacent window DDX2 regression slopes."""
-        return compute_ddx2_slope_alerts(df["ddx2"].values, window=5, eps=0.0)
+        """TA-native DDX2 adjacent-window slope inflection (daily + weekly)."""
+        return compute_ddx2_slope_alerts(
+            df["ddx2"].values, window=DDE_ALERT_WINDOW, eps=0.0,
+        )
 
     def append_calculate(self, ts_code: str, df: pd.DataFrame, new_bars: list,
                          calc_date: str, state: dict) -> CalcResult:

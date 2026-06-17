@@ -4,6 +4,18 @@ from typing import Dict, List, Optional, Tuple
 from backend.etl.calc_indicators import CALC_ROUTE_SPECS, INDICATOR_SPEC_VERSIONS
 
 
+def resolve_weekly_anchor_trade_date(con, trade_date: str) -> Optional[str]:
+    """Latest week-end bar with trade_date <= anchor (matches export weekly load)."""
+    row = con.execute(
+        """
+        SELECT MAX(trade_date) FROM dim_date
+        WHERE trade_date <= ? AND is_week_end = 1
+        """,
+        [trade_date],
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def count_spec_stale_by_indicator(con) -> Dict[str, int]:
     """Count dws_calc_state rows whose spec_version lags code expectation.
 

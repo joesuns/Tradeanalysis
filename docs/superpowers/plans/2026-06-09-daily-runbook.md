@@ -51,6 +51,36 @@
 
 **PR checklist：** bump spec → pytest → refresh-spec/HARD calc → audit → export → health_check Section J。
 
+### Spec migration（一次性，禁并行 run/calc）
+
+> 首次启用 auto refresh 或 bump `SPEC_VERSION` 后的存量刷新。**禁止** migration 未完成时用 `run --skip-export` 测幂等（会触发多路由 auto FULL）。
+
+**`ACCEPTANCE_DATE=20260616`**（与 S2 实库验收一致）
+
+```bash
+# 1. 备份
+cp data/tradeanalysis.duckdb data/tradeanalysis.pre-migrate.duckdb
+
+# 2. 查看 stale（M1 起可用 ops spec-status；此前查 v_dq_spec_freshness / health_check Section J）
+python3 -m backend.cli ops spec-status --date 20260616
+
+# 3. 按指标窄窗 FULL（关闭 auto，避免 run 触发多路由）
+CALC_AUTO_SPEC_REFRESH=0 python3 -m backend.cli calc --refresh-spec IND --date 20260616
+
+# 4. 确认 stale=0
+python3 -m backend.cli ops spec-status --date 20260616
+
+# 5. Export 告警（非阻断）
+EXPORT_SPEC_GATE=1 python3 -m backend.cli export --date 20260616
+
+# 6. 全链路质检
+python3 -m scripts.health_check  # Section J
+```
+
+**禁止：** migration 未完成时用 `run --skip-export` 测幂等。
+
+**Plan：** `docs/superpowers/plans/2026-06-17-batch-full-compute-domain-optimization.md`（与 spec-gate hotfix **独立 PR**）
+
 ## 同日复跑
 
 | 目标 | 命令 |

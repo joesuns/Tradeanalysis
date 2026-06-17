@@ -284,14 +284,46 @@ def run(con) -> int:
 
     print("=== J. Spec 版本与 MA alignment 质检 ===")
     c.expect_zero(
-        "ma_daily spec_stale (v_dq_spec_freshness)",
+        "ma_daily spec_stale @ ODS max anchor",
         "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
-        "WHERE indicator='ma' AND freq='daily'",
+        "WHERE indicator='ma' AND freq='daily' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM ods_daily)",
     )
     c.expect_zero(
-        "ma_weekly spec_stale (v_dq_spec_freshness)",
+        "ma_weekly spec_stale @ weekly anchor",
         "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
-        "WHERE indicator='ma' AND freq='weekly'",
+        "WHERE indicator='ma' AND freq='weekly' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM dim_date "
+        "WHERE is_trade_day=1 AND is_week_end=1 "
+        "AND trade_date <= (SELECT MAX(trade_date) FROM ods_daily))",
+    )
+    c.expect_zero(
+        "macd_daily spec_stale @ ODS max anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='macd' AND freq='daily' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM ods_daily)",
+    )
+    c.expect_zero(
+        "macd_weekly spec_stale @ weekly anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='macd' AND freq='weekly' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM dim_date "
+        "WHERE is_trade_day=1 AND is_week_end=1 "
+        "AND trade_date <= (SELECT MAX(trade_date) FROM ods_daily))",
+    )
+    c.expect_zero(
+        "volume_daily spec_stale @ ODS max anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='volume' AND freq='daily' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM ods_daily)",
+    )
+    c.expect_zero(
+        "volume_weekly spec_stale @ weekly anchor",
+        "SELECT COALESCE(SUM(spec_stale), 0) FROM v_dq_spec_freshness "
+        "WHERE indicator='volume' AND freq='weekly' "
+        "AND anchor_trade_date = (SELECT MAX(trade_date) FROM dim_date "
+        "WHERE is_trade_day=1 AND is_week_end=1 "
+        "AND trade_date <= (SELECT MAX(trade_date) FROM ods_daily))",
     )
     c.expect_zero(
         "ma alignment bear_weakening+ma10_up",

@@ -1,0 +1,102 @@
+=== A. ODS 层不变量 ===
+  [PASS] ods_daily 重复主键: 0
+  [PASS] ods_daily_basic 重复主键: 0
+  [PASS] ods_moneyflow 重复主键: 0
+  [PASS] ods_daily high<low: 0
+  [PASS] ods_daily OHLC NULL: 0
+  [PASS] ods_daily adj_factor NULL/<=0: 0
+  [PASS] ods_daily vol/amount<0: 0
+=== B. DWD 日线不变量 ===
+  [PASS] dwd_daily 重复主键: 0
+  [PASS] dwd_daily close_qfq NULL/<=0: 0
+  [PASS] dwd_daily high<low: 0
+  [PASS] dwd_daily OHLC_qfq NULL: 0
+  [PASS] dwd_daily is_suspended 非0/1: 0
+  [PASS] dwd_daily OHLC一致性: 0
+  [PASS] dwd_daily 停牌日 vol<>0: 0
+  [PASS] dwd_daily 停牌填充越界(超ODS区间): 0
+=== C. DWD 周线不变量 ===
+  [PASS] dwd_weekly 重复主键: 0
+  [PASS] dwd_weekly close<=0/NULL: 0
+  [PASS] dwd_weekly high<low: 0
+  [PASS] dwd_weekly active_days∉[1,5]: 0
+=== D. DWS 12表通用不变量 ===
+  [PASS] dws_kpattern_daily calc_date NULL: 0
+  [PASS] dws_kpattern_daily 重复完整PK: 0
+  [PASS] dws_kpattern_daily latest 视图唯一性: 0
+  [PASS] dws_kpattern_weekly calc_date NULL: 0
+  [PASS] dws_kpattern_weekly 重复完整PK: 0
+  [PASS] dws_kpattern_weekly latest 视图唯一性: 0
+  [PASS] dws_kpattern_weekly 非真周末孤儿: 0
+  [PASS] dws_macd_daily calc_date NULL: 0
+  [PASS] dws_macd_daily 重复完整PK: 0
+  [PASS] dws_macd_daily latest 视图唯一性: 0
+  [PASS] dws_macd_weekly calc_date NULL: 0
+  [PASS] dws_macd_weekly 重复完整PK: 0
+  [PASS] dws_macd_weekly latest 视图唯一性: 0
+  [PASS] dws_macd_weekly 非真周末孤儿: 0
+  [PASS] dws_ma_daily calc_date NULL: 0
+  [PASS] dws_ma_daily 重复完整PK: 0
+  [PASS] dws_ma_daily latest 视图唯一性: 0
+  [PASS] dws_ma_weekly calc_date NULL: 0
+  [PASS] dws_ma_weekly 重复完整PK: 0
+  [PASS] dws_ma_weekly latest 视图唯一性: 0
+  [PASS] dws_ma_weekly 非真周末孤儿: 0
+  [PASS] dws_dde_daily calc_date NULL: 0
+  [PASS] dws_dde_daily 重复完整PK: 0
+  [PASS] dws_dde_daily latest 视图唯一性: 0
+  [PASS] dws_dde_weekly calc_date NULL: 0
+  [PASS] dws_dde_weekly 重复完整PK: 0
+  [PASS] dws_dde_weekly latest 视图唯一性: 0
+  [PASS] dws_dde_weekly 非真周末孤儿: 0
+  [PASS] dws_volume_daily calc_date NULL: 0
+  [PASS] dws_volume_daily 重复完整PK: 0
+  [PASS] dws_volume_daily latest 视图唯一性: 0
+  [PASS] dws_volume_weekly calc_date NULL: 0
+  [PASS] dws_volume_weekly 重复完整PK: 0
+  [PASS] dws_volume_weekly latest 视图唯一性: 0
+  [PASS] dws_volume_weekly 非真周末孤儿: 0
+  [PASS] dws_price_position_daily calc_date NULL: 0
+  [PASS] dws_price_position_daily 重复完整PK: 0
+  [PASS] dws_price_position_daily latest 视图唯一性: 0
+  [PASS] dws_price_position_weekly calc_date NULL: 0
+  [PASS] dws_price_position_weekly 重复完整PK: 0
+  [PASS] dws_price_position_weekly latest 视图唯一性: 0
+  [PASS] dws_price_position_weekly 非真周末孤儿: 0
+=== E. 取值域 ===
+  [PASS] kpattern strength∉[0,1]: 0
+  [PASS] price_position price_position_60d∉[0,100]: 0
+  [PASS] price_position price_position_120d∉[0,100]: 0
+  [PASS] price_position price_position_250d∉[0,100]: 0
+=== F. 参照完整性 ===
+  [PASS] DWS ts_code 不在 dim_stock: 0
+  [PASS] DWD trade_date 非交易日: 0
+=== G. 周划分一致性 ===
+  [PASS] 跨年周 is_week_end!=1 的自然周: 0
+=== H. 跨层覆盖对账(信息) ===
+  [info] ods_daily distinct(ts,td): 10,982,957
+  [info] dwd_daily 总行: 11,407,454
+  [info] dwd_daily 非停牌行: 10,979,116
+  [info] dwd_daily 停牌填充行: 428,338
+  [info] MACD latest 落停牌日(应0): 0
+  [info] DDE缺口=非停牌无moneyflow: 329,609
+  [info] dim_stock 有 delist_date(已知=0): 0
+=== I. 周线 volume 状态指标（成熟股，最新 week-end 截面） ===
+  [info] 成熟股 universe: 5,310
+  [info] volume_weekly 填充率阈值: 4,248
+  [PASS] volume_weekly pct_vol_rank 非空(成熟股,最新截面): 5,252 (min 4,248)
+  [PASS] volume_weekly zone 非空(成熟股,最新截面): 5,252 (min 4,248)
+=== J. Spec 版本与 MA alignment 质检 ===
+  [FAIL] ma_daily spec_stale (v_dq_spec_freshness): 1,734,698
+  [FAIL] ma_weekly spec_stale (v_dq_spec_freshness): 50,678
+  [PASS] macd_daily spec_stale @ ODS max anchor: 0
+  [PASS] macd_weekly spec_stale @ weekly anchor: 0
+  [PASS] volume_daily spec_stale @ ODS max anchor: 0
+  [PASS] volume_weekly spec_stale @ weekly anchor: 0
+  [FAIL] ma alignment bear_weakening+ma10_up: 4
+  [FAIL] ma alignment bull_strong+s5flat+s10up: 20
+=== K. DDE trend content oracle（日线最新 bar） ===
+  [info] dde_trend oracle sample=200 @ 20260616: matched=199 mismatched=1 rate=0.5000%
+  [WARN] dde_trend oracle mismatch rate 0.50% > 0.1%
+
+❌ 4 项检查 FAIL，请排查

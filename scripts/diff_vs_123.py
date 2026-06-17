@@ -1,6 +1,6 @@
 """Diff B4 hard-gate columns vs project 123 SQLite (transition period only).
 
-Compares 12 hard-gate columns (excludes ``ma_alignment`` / ``w_ma_alignment``).
+Compares 10 hard-gate columns (excludes ``ma_alignment`` / ``w_ma_alignment`` and ``dde_alert`` / ``w_dde_alert`` soft layer).
 
 Usage:
     export REF_123_SQLITE_PATH=/path/to/123/cache/stock_data.db
@@ -26,7 +26,7 @@ from backend.b4_gate.verify import load_dates
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Diff B4 hard-gate columns (12) vs 123 reference DB",
+        description="Diff B4 hard-gate columns (10) vs 123 reference DB",
     )
     parser.add_argument("--date", help="Analysis date YYYYMMDD")
     parser.add_argument("--dates-file", help="File with one date per line")

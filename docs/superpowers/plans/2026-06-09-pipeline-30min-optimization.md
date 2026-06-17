@@ -923,12 +923,29 @@ python3 scripts/health_check.py
 | cProfile | 200 股：37200 次 `volume_trend_v2`；热点 `np.percentile` + `pandas rolling.mean` |
 | 候选 | APPEND `target_indices` 仅算 new_bars（**~184×** trend 段；末 bar 50/50 等价） |
 | 外推收益 | 量能 batch_compute 944s → **~12s**（trend 段）；E2E 仍须 M1+M2 实库签字 |
-| 状态 | ✅ M2c+ + **remediation**（`require_trend_target_indices`）；待实库签字 |
+| 状态 | ✅ M2c+ APPEND + **P2+ FULL 写窗**（`batch_full_volume`）；pytest Q2 ✅；profile 写窗 ~188×；实库 E3 待 M5 |
 
 ```bash
 python3 scripts/profile_volume_trend_v2.py --stocks 500 --bars 245
 python3 scripts/profile_volume_trend_v2.py --stocks 200 --cprofile
 pytest tests/test_etl/test_vector_append.py::test_volume_trend_last_bar_matches_expanding_series -v
+```
+
+### P2+ batch FULL 算域 + MACD B4 fast（2026-06-17）
+
+| 项 | 值 |
+|----|-----|
+| 计划 | `docs/superpowers/plans/2026-06-17-batch-full-compute-domain-optimization.md` |
+| M1 运维 | ✅ `cli ops spec-status` + `calc --refresh-spec --dry-run` + `v_dq_spec_freshness` |
+| M2 Volume FULL | ✅ `batch_full_volume` → `trend_target_indices=resolve_compute_indices(...)` |
+| M3 MACD B4 FULL | ✅ `b4_weekly_series_from_daily_fast` + `CALC_B4_WEEKLY_FAST=1` + `batch_full_macd` 写窗 |
+| pytest Q1–Q4 | ✅ `test_b4_macd_weekly_append` / `test_batch_full_compute_domain` / `test_append_calc` |
+| profile Q5/Q6 | MACD 100×245 **10.9×**（`profile_macd_b4_weekly --mode fast`）；Volume 写窗 **~188×** |
+| 实库 E1–E3 | ☐ 待 M5（`ACCEPTANCE_DATE=20260616`） |
+
+```bash
+python3 scripts/profile_macd_b4_weekly.py --stocks 100 --bars 245 --mode fast_write_window
+pytest tests/test_etl/test_b4_macd_weekly_append.py tests/test_etl/test_batch_full_compute_domain.py -v
 ```
 
 ---
