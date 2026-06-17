@@ -27,14 +27,18 @@ python3 -m backend.cli run --date 20260612 --skip-export
 - chunk_stocks=**0**, batch_only=**5391**, batch_full=**118**
 - Wall ~256s (run_id `ded70a43`)
 
-## S5 — 真新日 @ 20260617
+## S5 — 真新日 @ 20260617 ✅
 
 ```bash
+python3 -m backend.cli fetch --start 20260617 --end 20260617   # 5504 rows
 python3 -m backend.cli run --date 20260617
 ```
 
-- **Blocked:** fetch 0 rows; `calc_date 20260617 > ods_max 20260616`
-- Steady-state new-day reference: **20260615 first run ~491s** (附录 F.1)
+- **Wall clock:** 1587s (~26.4min) — SLA PASS
+- chunk=0, batch_only=5391, batch_append=925s
+- export 5271 rows
+- health_check PASS
+- Log: `/tmp/run-20260617-newday.log`
 
 ## health_check
 

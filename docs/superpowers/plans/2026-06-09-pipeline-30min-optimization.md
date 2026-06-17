@@ -1131,13 +1131,25 @@ python3 scripts/health_check.py
 | health_check | PASS（Section J/K） | ✅ |
 | PR #14 spec-gate | merged → default branch | ✅ |
 
-### F.3 真新日 S5（20260617）
+### F.3 真新日 S5（20260617）✅
 
 | 项 | 结果 |
 |----|------|
-| 命令 | `python3 -m backend.cli run --date 20260617` |
-| 结果 | **阻塞** — tushare fetch 返回 0 行（`ods_max=20260616`）；`calc_date > ods_max` 门禁拒绝 |
-| 后续 | 下一交易日 ODS 就绪后复跑；F.1 已覆盖稳态真新日 SLA |
+| fetch | `cli fetch --start 20260617 --end 20260617` → **5504** 行（前置；首次 run 时 ODS 未就绪） |
+| 命令 | `python3 -m backend.cli run --date 20260617`（含 export） |
+| run_id | `82052935` |
+| **墙钟（Step1→Done）** | **1587s (~26.4min)** | ✅ SLA |
+| ods_etl_log 分项 | fetch 2.2s + DWD 29.9s + refresh_state 341.9s + calc 1.4s + export 143.5s = **518.9s**（batch_append **925s** 计在 refresh→calc 之间，见 log） |
+| batch_append | chunk=**0**, batch_only=**5391**, batch_full=**4**（DDE 日+周） |
+| export | **5271** 行 → `exports/analysis_20260617_gen20260617_161940.xlsx` |
+| health_check | ✅ PASS（2026-06-17 跑后） |
+
+```bash
+python3 -m backend.cli fetch --start 20260617 --end 20260617
+python3 -m backend.cli run --date 20260617
+python3 scripts/benchmark_run.py --date 20260617
+python3 scripts/health_check.py
+```
 
 ### F.4 四条硬约束终判
 
