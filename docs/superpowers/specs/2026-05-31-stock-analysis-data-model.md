@@ -158,6 +158,20 @@ tushare API
 
 ## 3. ODS 层 — 原始贴源层
 
+### 3.0 ODS diff 浮点容差（分层定稿）
+
+ODS 写入前 `backend/fetch/ods_diff.py` 做 API vs DuckDB 行级比对；**容差与 DWS 等价性门禁分离**：
+
+| 层 | 常量 / 阈值 | 用途 |
+|----|-------------|------|
+| ODS diff（价格/比率） | `FLOAT_ABS_TOL = 1e-4` | 元、% 等字段；吸收 float32 存库 vs API roundtrip |
+| ODS diff（大数值） | `FLOAT_LARGE_ABS_TOL = 1.0`, `FLOAT_RTOL = 1e-5` | vol/amount/mv（手、万元）；按 scale 取 max |
+| DWS 等价性 | `atol = 1e-9` | append vs FULL、batch vs selective、Wave5 narrow vs full（pytest golden） |
+
+> ODS 层「未变更」≠ DWS 逐 bit 相等；DWS 门禁在 calc 路由与 golden 测试中单独锁定。
+
+**FetchResult 观测字段（`to_completeness()`）：** `changed_field_events_count`、`affected_ods_columns`（列名去重排序），供 `run_fetch` / `refresh_fetch` 审计。
+
 ### 3.1 ods_stock_basic
 
 ```sql
@@ -596,6 +610,37 @@ CREATE TABLE dws_macd_daily (
 
 **底背离 `bottom_divergence`**：绿柱区自最近死叉起对称——价创新低、DIF MDIF 未创新低、绿柱峰值回升（柱背），于 DIF MDIF 转向日 TG 写入。
 
+#### 6.2.1 结构背离三用与可交易门槛
+
+> **一存三用：** DWS `divergence` 列存 **L1 结构背离**（通达信 Level 2，不变）；消费层按场景分三用：
+>
+> | 用途 | 列/出口 | 说明 |
+> |------|---------|------|
+> | **对标** | Excel `MACD结构背离` / `DDE结构背离` | 与通达信 L2 对齐，保留隔峰/TG 滞后语义 |
+> | **交易** | Excel `MACD可交易背离` / `DDE可交易背离` | 三条硬门槛过滤后的 L2 消费层（export 时 enrich，不落 DWS） |
+> | **诊断** | Excel `MACD背离剔除` / `DDE背离剔除` | reject_reason：`隔峰` / `滞后` / `区域` |
+>
+> 实现：`backend/etl/divergence_tradable.py`；trace 元数据来自 `divergence_structure.trace_*_structure_events()`。
+
+**可交易三条硬门槛（`classify_tradable`）：**
+
+| 门槛 | 常量 | 规则 |
+|------|------|------|
+| 路径 | `path == direct` | 仅 T1/B1 直接峰，拒绝 T2/B2 隔峰（`skip_peak`） |
+| 时效 | `TRADABLE_TG_LAG_MAX = 1` | TG 距段内价极值 bar 数 ≤1（`tg_lag`） |
+| 区域 | 顶：`macd_bar>0` / `ddx>0`；底：`<0` | 标注日柱/DDX 与背离方向一致（`zone_mismatch`） |
+
+reject 优先级：`skip_peak` > `tg_lag` > `zone_mismatch`。L1 存在但 trace 无法复现 TG 时，fallback 保守剔除（见 `divergence_tradable._fallback_verdict`）。
+
+**日/周/DDE 定位：**
+
+- **周线可交易背离**：趋势/结构滤镜（慢变量）
+- **日线可交易背离**：执行参考（快变量）
+- **DDE 可交易背离**：辅信号；`.BJ` 无 moneyflow → N/A
+- **共振策略**（`combo_eval`）：默认 `use_tradable=True`，单结构背离不作交易依据；须 K 线形态 + 可交易背离等同向共振
+
+**Screening CLI：** `python -m scripts.screen_divergence_tradable --date YYYYMMDD [--freq daily|weekly] [--indicator macd|dde] [--tradable-only]`
+
 **各模块调用差异**：
 
 | 模块 | 实现函数 | 锚点/信号 | dedup | 备注 |
@@ -652,8 +697,21 @@ CREATE TABLE dws_ma_daily (
 | `tangle` | Layer 1：\|MA5-MA10\|/MA10 < **2.99%** 且近 10 日 MA5/MA10 交叉 ≥ **2** 次 |
 | `sideways` | Layer 2：\|ma5_slope\| 与 \|ma10_slope\| 均 < 0.08%/日（且非 tangle） |
 | `bull_strong` … `bear_rolling` | Layer 4：MA5 vs MA10 位置 × 双斜率方向（>0.08 上升，<-0.08 下降） |
-| Layer 3 fallback | 一走平一趋势：归入最近 8 类（如多头位 + s5↑ + s10平 → `bull_building`） |
+| Layer 3 fallback | 一走平一趋势：8 格显式查表（`MACalculator.SPEC_VERSION=v2`，2026-06-14 修复） |
 | NULL | MA5/MA10/斜率不可用（<11 bar、NaN） |
+
+**Layer 3 fallback 八格映射（v2）：**
+
+| 位置 | s5 | s10 | 结果 |
+|------|----|-----|------|
+| MA5>MA10 | up | flat | `bull_building` |
+| MA5>MA10 | flat | up | `bull_building` |
+| MA5>MA10 | dn | flat | `bull_weakening` |
+| MA5>MA10 | flat | dn | `bull_weakening` |
+| MA5<MA10 | dn | flat | `bear_building` |
+| MA5<MA10 | flat | up | `bear_building` |
+| MA5<MA10 | up | flat | `bear_weakening` |
+| MA5<MA10 | flat | dn | `bear_strong` |
 
 | DWS 存储 | MA5/MA10 | ma5_slope | ma10_slope | 交易含义 |
 |----------|:--------:|:---------:|:----------:|------|
@@ -708,14 +766,9 @@ CREATE TABLE dws_dde_daily (
 | **net_mf_amount** | 直接取自 `dwd_daily_moneyflow` | 万元 |
 | **DDX** | `(buy_lg + buy_elg - sell_lg - sell_elg) / total_vol`；`total_vol=0` → NULL | 大单+超大单净买入量占比 |
 | **DDX2** | EMA(DDX, 5) | SMA 种子 / APPEND `resolve_ema_seeds` |
-| **趋势（上升）** | DDX2 **8-bar** 指数加权回归斜率 > **0.0001** | decay=0.20 |
-| **趋势（下降）** | 加权斜率 < **-0.0001** | 同上 |
-| **趋势（走平）** | 斜率在 [-0.0001, 0.0001] | 同上 |
-| **trend_strength** | 加权斜率 / mean(\|DDX2\|) | 与 trend 同窗口 |
-| **上升拐头** | DDX2 连续 **2** 日上升 → 今日 < 昨日 | `upturn_reverse` |
-| **下降拐头** | DDX2 连续 **2** 日下降 → 今日 > 昨日 | `downturn_reverse` |
-| **上升走平** | 连涨 2 日后 \|变化\|/\|昨日\| ≤ **2%** | 拐头优先 |
-| **下降走平** | 连跌 2 日后 \|变化\|/\|昨日\| ≤ 2% | 同上 |
+| **trend（B4 `dde_trend`）** | DDX3 polyfit 方向 up/down/flat | 日线 5-bar；周线 4-bar；123 moneyflow 路径 |
+| **trend_strength** | DDX2 **5-bar** 加权斜率 / mean(\|DDX2\|) | decay=0.20；与 `dde_trend` 解耦 |
+| **alert（软层 `dde_alert`）** | 相邻 **2-bar** DDX2 回归斜率拐点 | `upturn_reverse` / `downturn_reverse`；**非** 123 5-bar |
 | **顶背离** | `compute_dde_structure_divergence`；锚点 `CROSS(DDX,DDX2)` + 尖刺过滤 | dedup=10；`RECALC_SPEC` lookback=250 |
 | **底背离** | 同上；锚点 `CROSS(DDX2,DDX)`，底区对称 | dedup=10 |
 
@@ -1481,10 +1534,9 @@ python -m backend.cli status
 | 基础 | DDX | (大单+超大单净买入)/total_vol；.BJ 无数据 |
 | | DDX2 | EMA(DDX,5) |
 | | net_mf_amount | 主力净流入额（万元） |
-| 趋势 | 上升/下降/走平 | DDX2 8-bar 加权回归(decay=0.20)，阈值 ±0.0001 |
-| | trend_strength | 加权斜率/mean(\|DDX2\|) |
-| 警惕点 | 上升/下降拐头 | DDX2 连涨/跌2日后逆转 |
-| | 上升/下降走平 | 连涨/跌2日后变化≤2% |
+| 趋势（B4 `dde_trend`） | up/down/flat | DDX3 polyfit；日线 5-bar；周线 4-bar（123 moneyflow 路径） |
+| | trend_strength | DDX2 **5-bar** 加权斜率/mean(\|DDX2\|)；decay=0.20；与 `dde_trend` 解耦 |
+| 警惕（软层 `dde_alert`） | upturn_reverse / downturn_reverse | 相邻 **2-bar** DDX2 回归斜率拐点；**非** 123 5-bar |
 | 背离 | 顶/底背离 | `compute_dde_structure_divergence`；DDX/DDX2 交叉锚点 + 柱背；顶区尖刺过滤；TG 日标注 |
 
 ### 9.5 量能
@@ -1881,6 +1933,31 @@ CREATE INDEX idx_ods_moneyflow_date ON ods_moneyflow(trade_date);
 - **路由 `classify_calc_mode()`** — 无 state→FULL；强签名变（除权/填充/修正）→FULL；无新 bar 同签名→SKIP；有新 bar 同签名→APPEND。
 - **强签名 `state_signature()`** — 对 `last_td` 前**固定 245 根尾窗**的输入值序列（按各计算器 `SIGNATURE_COLS`）做 SHA256，替代弱的 min/max/mean 指纹；固定宽度保证跨运行稳定。误判方向只会多一次安全 FULL，绝不误 APPEND（新 bar 始终全窗重算）。
 - **APPEND `append_calculate()`** — 仅算/写新 bar；EMA/ddx2 `resolve_ema_seeds` 种子递推、Volume 迟滞 zone 种子、滚动类复用全尾窗算法。INSERT-only 不改写历史。与 FULL 逐值 `atol=1e-9` 等价（`tests/test_etl/test_append_calc.py`）。
+
+**Calc Spec Version 与 SKIP 不变量（2026-06-14）：**
+
+```
+允许 SKIP ⇔ input_fingerprint 同 AND spec_version 同 AND 无新 bar
+```
+
+- **双门禁：** `classify_calc_mode(..., expected_spec_version)`（路由层）与 `check_dwd_unchanged(..., expected_spec_version)`（per-stock calculate / batch_full `check_spec=True`）须同时生效。
+- **注册表：** `backend/etl/calc_indicators.INDICATOR_SPEC_VERSIONS` — 12 管线 `(indicator,freq) → Calculator.SPEC_VERSION`。
+- **禁止旁路：** `_modes_from_state_only` / `--force` 同日复跑短路 **不得**在 `dws_calc_state.spec_version` 落后时全 SKIP；`has_spec_stale_indicators()` 阻断整段 idempotent skip。
+- **运维刷新：** `cli calc --refresh-spec ma[,volume]` 或 spec 发布日 `CALC_FORCE_HARD=1 calc --force`（窄窗 FULL，**非** DWD rebuild）。Runbook：`docs/superpowers/plans/2026-06-09-daily-runbook.md`「算法 SPEC_VERSION 发布」。
+- **质检视图：** `v_dq_spec_freshness`（按指标/freq 统计 latest 截面 spec_ok/spec_stale）；`health_check` Section J。
+
+**Batch FULL 三层域契约（2026-06-17，ADR）：**
+
+batch FULL / spec refresh 须对齐 **读域 / 算域 / 写域**，禁止「写窄窗、算全窗 expanding」：
+
+| 域 | 含义 | FULL / spec refresh |
+|----|------|---------------------|
+| **读域** | tail 245 bar（`batch_load_quote_tails`） | 不变 |
+| **算域** | `[recalc_start, calc_date]` 内 bar 索引（`resolve_compute_indices`） | **必须**只算这些 index |
+| **写域** | 同算域（`insert_dws_batch_multi` narrow write） | compute 须对齐 |
+
+实施与验收见 `docs/superpowers/plans/2026-06-17-batch-full-compute-domain-optimization.md`（Volume trend / MACD B4 weekly P2+；实库 `ACCEPTANCE_DATE=20260616`）。
+
 - **范围外后续项：** 端到端「秒级日更」仍受 ~320s 全市场 freshness-fetch 拖累，需单独立项。
 
 **P3 热路径优化（与全量 golden-master 等价）：**
@@ -2289,7 +2366,7 @@ WHERE calc_date = (
 
 ### 12.53 dws_ma.alignment NULL 语义明确
 
-> alignment 取 NULL 的唯一场景：MA5、MA10 或斜率不可用（<11 bar、NaN）。`sideways` 为独立枚举（双斜率 |s|<0.08%/日 且非 tangle）。「一走平一趋势」过渡态由 Layer 3 fallback 归入 8 方向类，不再 NULL。
+> alignment 取 NULL 的唯一场景：MA5、MA10 或斜率不可用（<11 bar、NaN）。`sideways` 为独立枚举（双斜率 |s|<0.08%/日 且非 tangle）。「一走平一趋势」过渡态由 Layer 3 **八格查表** fallback 归入 8 方向类（v2 映射见 §6.3 表），不再 NULL。
 
 ### 12.54 dim_date 补 is_year_end（Data Architect Review 未优化项）
 
@@ -2458,6 +2535,14 @@ WHERE calc_date = (
 > - 新增 `backend/etl/divergence_structure.py`：`compute_macd_structure_divergence` / `compute_dde_structure_divergence`
 > - MACD/DDE `RECALC_SPEC` lookback 60→**250**、event_tail→**10**
 > - Volume 量价背离仍用 `base.compute_price_signal_divergence`（window=60, dedup=5）
+
+### 12.86 DDE alert/strength 调参 + B4 soft 层（2026-06-16）
+
+> §6.4 / §9.4 / CLAUDE.md 按 `DDECalculator.SPEC_VERSION=v3` 重对齐：
+> - **`dde_alert` / `w_dde_alert`**：相邻 **2-bar** DDX2 斜率拐点（TA-native）；移出 B4 hard gate（与 `ma_alignment` 同属 soft）
+> - **`dde_trend_strength`**：DDX2 **5-bar** 加权斜率/mean(|DDX2|)（decay=0.20）；与 MACD `trend_strength` 同窗
+> - **`dde_trend`**：不变（日线 DDX3 5-bar；周线 4-bar；仍 B4 hard）
+> - B4 hard gate：**10 列**（日周各 5；extract 仍 14 列）
 
 ---
 

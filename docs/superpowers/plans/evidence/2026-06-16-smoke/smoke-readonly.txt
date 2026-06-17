@@ -1,0 +1,149 @@
+
+======== 0. 基线：该日是否已有 calc ========
+run_rebuild_dwd	success	0	2026-06-15T07:02:52.715	{"analysis_date": "20260612", "skipped": true, "pipeline_shortcut": true, "ods_api_rows": 21738, "ods_rows_written": 0, 
+run_fetch	success	0	2026-06-15T07:02:49.274	{"analysis_date": "20260612", "stocks": 5524, "ods_api_rows": 21738, "ods_rows_written": 0, "ods_rows_unchanged": 16209,
+calc_dws	success	200	2026-06-15T07:01:30.393	{"calc_date": "20260612", "mode": "refresh", "calculated": 200, "full_by_indicator": {"ma_daily": 5524, "ma_weekly": 552
+cli_refresh	success	200	2026-06-15T07:00:24.928	{"analysis_date": "20260612", "scope": {"dates": ["20260612"], "n_stocks": 5524, "indicators": ["ma"], "n_routes": 2, "e
+calc_dws	success	1170	2026-06-15T06:58:46.229	{"calc_date": "20260612", "stocks": 5389, "ods_max": "20260612", "batch_only": 5389, "chunk_stocks": 0, "chunk_work_item
+run_rebuild_dwd	success	5559	2026-06-15T06:49:59.676	{"analysis_date": "20260612", "skipped": false, "ods_api_rows": 21738, "ods_rows_written": 1, "ods_rows_unchanged": 1620
+run_fetch	success	1	2026-06-15T06:49:57.399	{"analysis_date": "20260612", "stocks": 5524, "ods_api_rows": 21738, "ods_rows_written": 1, "ods_rows_unchanged": 16208,
+run_rebuild_dwd	success	0	2026-06-15T06:34:25.606	{"analysis_date": "20260612", "skipped": true, "pipeline_shortcut": true, "ods_api_rows": 21738, "ods_rows_written": 0, 
+run_fetch	success	0	2026-06-15T06:34:22.123	{"analysis_date": "20260612", "stocks": 5524, "ods_api_rows": 21738, "ods_rows_written": 0, "ods_rows_unchanged": 16209,
+run_rebuild_dwd	success	0	2026-06-15T06:31:22.684	{"analysis_date": "20260612", "skipped": true, "pipeline_shortcut": true, "ods_api_rows": 21738, "ods_rows_written": 0, 
+
+======== 模式: 只读预览（加 --run-all 执行写库步骤） ========
+将执行的写库步骤:
+  1) python -m backend.cli run --date 20260612 --skip-export
+  2) 手动 ODS 改一行 → 再 run（见下方 SQL）
+  4) python -m backend.cli refresh --date 20260612 --indicator ma
+  5) python -m backend.cli refresh --date 20260612 --dry-run
+  6) python -m backend.cli refresh --from 20260612 --to 20260612 --dry-run
+
+======== 2. 手动 ODS 变更连锁（人工） ========
+在 DuckDB 中改一行 ODS（示例，请换成真实 ts_code/trade_date）:
+
+  UPDATE ods_daily SET close = close + 0.01
+  WHERE ts_code = '000001.SZ' AND trade_date = 'ANALYSIS_DATE';
+
+再执行:
+  python -m backend.cli run --date ANALYSIS_DATE --skip-export
+
+期望 ods_etl_log.run_fetch.data_completeness.ods_rows_written >= 1
+     且 run_rebuild_dwd 非 pipeline_shortcut（或 stale_count > 0）
+（将 ANALYSIS_DATE 替换为 20260612）
+
+======== 3. spec stale → run 仅 ma FULL（可选，需 bump MACalculator.SPEC_VERSION 后） ========
+见 runbook「算法 SPEC_VERSION 发布」；本 smoke 可跳过。
+
+======== 5. refresh dry-run（12 路由规模，只读） ========
+/Users/joesun/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-06-15T17:56:45 INFO     [b3bef7ea][backend.etl.refresh_pipeline] refresh dry-run: {'dates': ['20260612'], 'n_stocks': 5524, 'indicators': ['dde', 'kpattern', 'ma', 'macd', 'priceposition', 'volume'], 'n_routes': 12, 'est_route_count': 65654}
+refresh dry-run: dates=['20260612'] stocks=5524 indicators=['dde', 'kpattern', 'ma', 'macd', 'priceposition', 'volume'] est_route_count=65654
+
+======== 6. refresh 范围 dry-run ========
+/Users/joesun/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-06-15T17:56:46 INFO     [cee5fea1][backend.etl.refresh_pipeline] refresh dry-run: {'dates': ['20260612'], 'n_stocks': 5524, 'indicators': ['dde', 'kpattern', 'ma', 'macd', 'priceposition', 'volume'], 'n_routes': 12, 'est_route_count': 65654}
+refresh dry-run: dates=['20260612'] stocks=5524 indicators=['dde', 'kpattern', 'ma', 'macd', 'priceposition', 'volume'] est_route_count=65654
+
+======== 8. health_check（只读） ========
+=== A. ODS 层不变量 ===
+  [PASS] ods_daily 重复主键: 0
+  [PASS] ods_daily_basic 重复主键: 0
+  [PASS] ods_moneyflow 重复主键: 0
+  [PASS] ods_daily high<low: 0
+  [PASS] ods_daily OHLC NULL: 0
+  [PASS] ods_daily adj_factor NULL/<=0: 0
+  [PASS] ods_daily vol/amount<0: 0
+=== B. DWD 日线不变量 ===
+  [PASS] dwd_daily 重复主键: 0
+  [PASS] dwd_daily close_qfq NULL/<=0: 0
+  [PASS] dwd_daily high<low: 0
+  [PASS] dwd_daily OHLC_qfq NULL: 0
+  [PASS] dwd_daily is_suspended 非0/1: 0
+  [PASS] dwd_daily OHLC一致性: 0
+  [PASS] dwd_daily 停牌日 vol<>0: 0
+  [PASS] dwd_daily 停牌填充越界(超ODS区间): 0
+=== C. DWD 周线不变量 ===
+  [PASS] dwd_weekly 重复主键: 0
+  [PASS] dwd_weekly close<=0/NULL: 0
+  [PASS] dwd_weekly high<low: 0
+  [PASS] dwd_weekly active_days∉[1,5]: 0
+=== D. DWS 12表通用不变量 ===
+  [PASS] dws_kpattern_daily calc_date NULL: 0
+  [PASS] dws_kpattern_daily 重复完整PK: 0
+  [PASS] dws_kpattern_daily latest 视图唯一性: 0
+  [PASS] dws_kpattern_weekly calc_date NULL: 0
+  [PASS] dws_kpattern_weekly 重复完整PK: 0
+  [PASS] dws_kpattern_weekly latest 视图唯一性: 0
+  [PASS] dws_kpattern_weekly 非真周末孤儿: 0
+  [PASS] dws_macd_daily calc_date NULL: 0
+  [PASS] dws_macd_daily 重复完整PK: 0
+  [PASS] dws_macd_daily latest 视图唯一性: 0
+  [PASS] dws_macd_weekly calc_date NULL: 0
+  [PASS] dws_macd_weekly 重复完整PK: 0
+  [PASS] dws_macd_weekly latest 视图唯一性: 0
+  [PASS] dws_macd_weekly 非真周末孤儿: 0
+  [PASS] dws_ma_daily calc_date NULL: 0
+  [PASS] dws_ma_daily 重复完整PK: 0
+  [PASS] dws_ma_daily latest 视图唯一性: 0
+  [PASS] dws_ma_weekly calc_date NULL: 0
+  [PASS] dws_ma_weekly 重复完整PK: 0
+  [PASS] dws_ma_weekly latest 视图唯一性: 0
+  [PASS] dws_ma_weekly 非真周末孤儿: 0
+  [PASS] dws_dde_daily calc_date NULL: 0
+  [PASS] dws_dde_daily 重复完整PK: 0
+  [PASS] dws_dde_daily latest 视图唯一性: 0
+  [PASS] dws_dde_weekly calc_date NULL: 0
+  [PASS] dws_dde_weekly 重复完整PK: 0
+  [PASS] dws_dde_weekly latest 视图唯一性: 0
+  [PASS] dws_dde_weekly 非真周末孤儿: 0
+  [PASS] dws_volume_daily calc_date NULL: 0
+  [PASS] dws_volume_daily 重复完整PK: 0
+  [PASS] dws_volume_daily latest 视图唯一性: 0
+  [PASS] dws_volume_weekly calc_date NULL: 0
+  [PASS] dws_volume_weekly 重复完整PK: 0
+  [PASS] dws_volume_weekly latest 视图唯一性: 0
+  [PASS] dws_volume_weekly 非真周末孤儿: 0
+  [PASS] dws_price_position_daily calc_date NULL: 0
+  [PASS] dws_price_position_daily 重复完整PK: 0
+  [PASS] dws_price_position_daily latest 视图唯一性: 0
+  [PASS] dws_price_position_weekly calc_date NULL: 0
+  [PASS] dws_price_position_weekly 重复完整PK: 0
+  [PASS] dws_price_position_weekly latest 视图唯一性: 0
+  [PASS] dws_price_position_weekly 非真周末孤儿: 0
+=== E. 取值域 ===
+  [PASS] kpattern strength∉[0,1]: 0
+  [PASS] price_position price_position_60d∉[0,100]: 0
+  [PASS] price_position price_position_120d∉[0,100]: 0
+  [PASS] price_position price_position_250d∉[0,100]: 0
+=== F. 参照完整性 ===
+  [PASS] DWS ts_code 不在 dim_stock: 0
+  [PASS] DWD trade_date 非交易日: 0
+=== G. 周划分一致性 ===
+  [PASS] 跨年周 is_week_end!=1 的自然周: 0
+=== H. 跨层覆盖对账(信息) ===
+  [info] ods_daily distinct(ts,td): 10,971,946
+  [info] dwd_daily 总行: 11,396,443
+  [info] dwd_daily 非停牌行: 10,968,105
+  [info] dwd_daily 停牌填充行: 428,338
+  [info] MACD latest 落停牌日(应0): 0
+  [info] DDE缺口=非停牌无moneyflow: 328,979
+  [info] dim_stock 有 delist_date(已知=0): 0
+=== I. 周线 volume 状态指标（成熟股，最新 week-end 截面） ===
+  [info] 成熟股 universe: 5,310
+  [info] volume_weekly 填充率阈值: 4,248
+  [PASS] volume_weekly pct_vol_rank 非空(成熟股,最新截面): 5,252 (min 4,248)
+  [PASS] volume_weekly zone 非空(成熟股,最新截面): 5,252 (min 4,248)
+=== J. Spec 版本与 MA alignment 质检 ===
+  [PASS] ma_daily spec_stale (v_dq_spec_freshness): 0
+  [PASS] ma_weekly spec_stale (v_dq_spec_freshness): 0
+  [PASS] ma alignment bear_weakening+ma10_up: 0
+  [FAIL] ma alignment bull_strong+s5flat+s10up: 1
+=== K. DDE trend content oracle（日线最新 bar） ===
+  [info] dde_trend oracle sample=200 @ 20260612: matched=200 mismatched=0 rate=0.0000%
+
+❌ 1 项检查 FAIL，请排查
+
+smoke 脚本完成。请人工核对 pipeline_shortcut / ods_rows_written / refresh dry-run / Wave5 narrow 输出。

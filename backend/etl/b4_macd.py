@@ -228,3 +228,77 @@ def b4_weekly_series_from_daily(
         trends[i] = t
         crosses[i] = c
     return trends, crosses
+
+
+def _weekly_last_daily_dates(daily_df: pd.DataFrame, weekly_df: pd.DataFrame) -> List[str]:
+    """Max daily trade_date per pandas ``W`` bucket aligned to ``weekly_df`` rows."""
+    if daily_df.empty or weekly_df.empty:
+        return []
+    d = daily_df.copy()
+    d["trade_date"] = pd.to_datetime(d["trade_date"])
+    d = d.sort_values("trade_date")
+    max_by_period = d.groupby(d["trade_date"].dt.to_period("W-SUN"))["trade_date"].max()
+    out: List[str] = []
+    for wdt in weekly_df["trade_date"]:
+        ts = pd.to_datetime(wdt)
+        mx = max_by_period.get(ts.to_period("W-SUN"))
+        out.append(mx.strftime("%Y%m%d") if mx is not None and pd.notna(mx) else "")
+    return out
+
+
+def _weekly_prefix_index(last_daily_dates: List[str], cutoff: str) -> int:
+    """Last weekly row whose bucket max daily date is <= cutoff (oracle prefix)."""
+    cutoff = str(cutoff)
+    j = -1
+    for idx, ld in enumerate(last_daily_dates):
+        if ld and ld <= cutoff:
+            j = idx
+        elif ld:
+            break
+    return j
+
+
+def b4_weekly_series_from_daily_fast(
+    daily_df: pd.DataFrame,
+    week_end_dates: List[str],
+    target_indices: Optional[Set[int]] = None,
+) -> Tuple[List[Optional[str]], List[Optional[str]]]:
+    """Single resample + EWM; map each week_end cutoff to weekly prefix index.
+
+    Oracle-equivalent to ``b4_weekly_series_from_daily`` (expanding per cutoff).
+    """
+    n = len(week_end_dates)
+    trends: List[Optional[str]] = [None] * n
+    crosses: List[Optional[str]] = [None] * n
+    if n == 0 or daily_df is None or daily_df.empty:
+        return trends, crosses
+
+    weekly = convert_daily_to_weekly_resample_w(daily_df)
+    if len(weekly) < 2:
+        return trends, crosses
+
+    last_daily = _weekly_last_daily_dates(daily_df, weekly)
+    params = B4_MACD_PARAMS_WEEKLY
+    near_cfg = B4_NEAR_WEEKLY
+    hist_bars = B4_HIST_BARS_WEEKLY
+    dif, dea, macd = macd_ewm_columns(
+        weekly["close_qfq"].values,
+        params["fast"], params["slow"], params["signal"],
+    )
+
+    indices = range(n) if target_indices is None else sorted(target_indices)
+    for i in indices:
+        if i < 0 or i >= n:
+            continue
+        j = _weekly_prefix_index(last_daily, week_end_dates[i])
+        if j < 0:
+            continue
+        trends[i] = _macd_trend_label(
+            macd[max(0, j - hist_bars + 1): j + 1],
+            B4_MACD_HIST_EPS,
+        )
+        crosses[i] = _crossover_at(
+            dif, dea, j,
+            int(near_cfg["n_std"]), float(near_cfg["frac"]),
+        )
+    return trends, crosses

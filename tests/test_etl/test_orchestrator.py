@@ -801,6 +801,31 @@ def test_run_calc_idempotent_skip_without_subset(monkeypatch):
     con.close()
 
 
+def test_should_skip_calc_idempotent_false_when_spec_stale():
+    import duckdb
+    from backend.db.schema import create_all_tables
+    from backend.etl.orchestrator import _should_skip_calc_idempotent
+
+    con = duckdb.connect(":memory:")
+    create_all_tables(con)
+    con.execute(
+        """INSERT INTO ods_etl_log
+           (id, step_name, started_at, finished_at, status, row_count, error_msg,
+            data_completeness)
+           VALUES ('1', 'calc_dws', 't0', 't1', 'success', 1, '',
+                   '{"calc_date":"20260602"}')"""
+    )
+    con.execute(
+        "INSERT INTO dws_calc_state "
+        "(ts_code, freq, indicator, last_trade_date, history_fp, spec_version, updated_calc_date) "
+        "VALUES ('000001.SZ', 'daily', 'ma', '20260602', 'abc', 'v1', '20260602')"
+    )
+    assert _should_skip_calc_idempotent(
+        con, "20260602", user_subset=False, force=False, skip_stale_fetch=True,
+    ) is False
+    con.close()
+
+
 def test_run_calc_logs_batch_chunk_split(monkeypatch):
     """Successful calc_dws logs batch_only/chunk_stocks/ods_max in data_completeness."""
     import json
@@ -836,7 +861,7 @@ def test_run_calc_logs_batch_chunk_split(monkeypatch):
     monkeypatch.setattr("backend.etl.orchestrator.run_checkpoint", lambda *a: None)
     monkeypatch.setattr(
         "backend.etl.calc_batch_append.run_batch_append_phase",
-        lambda con, codes, calc_date, force=False, preflight_ctx=None: {
+        lambda con, codes, calc_date, force=False, preflight_ctx=None, indicator_filter=None: {
             "chunk_codes": ["C.SZ"],
             "completed_keys": set(),
             "agg_by_key": {},
@@ -1291,7 +1316,7 @@ def test_run_calc_stale_dwd_merge_preserves_preflight_ctx(temp_db, monkeypatch):
     )
     captured = {"preflight_ctx": None}
 
-    def capture_batch(con, codes, calc_date, force=False, preflight_ctx=None):
+    def capture_batch(con, codes, calc_date, force=False, preflight_ctx=None, indicator_filter=None):
         captured["preflight_ctx"] = preflight_ctx
         return {
             "chunk_codes": [],

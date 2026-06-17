@@ -1,0 +1,6 @@
+ts_code,trade_date,freq,indicator,l1_expected,tradable_expected,reject_reason
+601518.SH,20260612,weekly,macd,top_divergence,,skip_peak
+300930.SZ,20260612,weekly,macd,top_divergence,,skip_peak
+300930.SZ,20230707,weekly,macd,bottom_divergence,,tg_lag
+601518.SH,20240927,daily,macd,top_divergence,,skip_peak
+601518.SH,20241206,daily,dde,top_divergence,,zone_mismatch

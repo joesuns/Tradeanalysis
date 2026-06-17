@@ -58,6 +58,9 @@ DWD_REBUILD_REFRESH_STATE = os.getenv("DWD_REBUILD_REFRESH_STATE", "1").strip() 
 CALC_REUSE_REFRESH_CTX = os.getenv("CALC_REUSE_REFRESH_CTX", "1").strip() != "0"
 # CALC_VECTOR_APPEND: cross-stock vectorized EMA batch in batch_append MACD/DDE paths.
 CALC_VECTOR_APPEND = os.getenv("CALC_VECTOR_APPEND", "1").strip() != "0"
+# CALC_B4_WEEKLY_FAST: single resample + EWM for MACD weekly B4 (FULL/write window).
+CALC_B4_WEEKLY_FAST = os.getenv("CALC_B4_WEEKLY_FAST", "1").strip() != "0"
 # CALC_WORKERS: optional override for calc thread-pool size (default min(cpu-1, 8)).
+CALC_COLUMN_NARROW = os.getenv("CALC_COLUMN_NARROW", "1").strip() != "0"
 # DuckDB single-file lock forbids multi-process writes, so calc parallelism is
 # thread-based (shared in-process instance), not multiprocessing.

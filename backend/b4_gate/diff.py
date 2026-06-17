@@ -12,7 +12,7 @@ from backend.b4_gate.enums import normalize_value
 from backend.b4_gate.sample import skip_dde_compare
 
 
-DDE_FIELDS = {"dde_trend", "dde_alert"}
+DDE_FIELDS = {"dde_trend"}
 
 
 def _norm(val: Any, field: str, source: str) -> Optional[str]:
@@ -27,7 +27,7 @@ def diff_b4_frames(
     skip_dde_ts: Optional[Set[str]] = None,
     bucket_by_ts: Optional[Dict[str, str]] = None,
 ) -> List[dict]:
-    """Row-level mismatches on B4 hard-gate columns (12; excludes ma_alignment)."""
+    """Row-level mismatches on B4 hard-gate columns (10; excludes ma_alignment, dde_alert)."""
     skip_dde_ts = skip_dde_ts or set()
     bucket_by_ts = bucket_by_ts or {}
     mismatches: List[dict] = []

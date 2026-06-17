@@ -1,7 +1,7 @@
-"""B4 column registry: extract 14 cols; hard gate 12 cols vs 123.
+"""B4 column registry: extract 14 cols; hard gate 10 cols vs 123.
 
-``ma_alignment`` / ``w_ma_alignment`` stay in extract/export but are soft
-(TA-native MA5/MA10 regime; not ported from 123 ``ma_regime``).
+``ma_alignment`` / ``w_ma_alignment`` — TA-native MA5/MA10 regime (not 123).
+``dde_alert`` / ``w_dde_alert`` — TA-native 2-bar DDX2 inflection (not 123 5-bar).
 """
 from typing import Dict, List
 
@@ -21,7 +21,7 @@ B4_WEEKLY_FIELDS: List[str] = list(B4_DAILY_FIELDS)
 B4_WEEKLY_PREFIX = "w_"
 
 # Soft layer: still extracted for Excel/audit, never diffed vs 123 or golden gate.
-B4_SOFT_DAILY_FIELDS: List[str] = ["ma_alignment"]
+B4_SOFT_DAILY_FIELDS: List[str] = ["ma_alignment", "dde_alert"]
 
 B4_HARD_DAILY_FIELDS: List[str] = [
     f for f in B4_DAILY_FIELDS if f not in B4_SOFT_DAILY_FIELDS

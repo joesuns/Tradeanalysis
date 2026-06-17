@@ -6,6 +6,28 @@ Key = Tuple[str, str]  # (indicator_name, freq)
 ModeEntry = Tuple[str, list]  # (mode, new_bars)
 
 _RUN_CTX: Optional["CalcPreflightContext"] = None
+_RUN_CALC_HANDOFF: Optional["RunCalcHandoff"] = None
+
+
+@dataclass
+class RunCalcHandoff:
+    """run → calc extras beyond refresh preflight context (Wave 5)."""
+
+    indicator_filter: Optional[List[str]] = None
+    calc_routes_narrowed: bool = False
+    active_routes: Optional[List[str]] = None
+
+
+def set_run_calc_handoff(handoff: Optional[RunCalcHandoff]) -> None:
+    global _RUN_CALC_HANDOFF
+    _RUN_CALC_HANDOFF = handoff
+
+
+def pop_run_calc_handoff() -> Optional[RunCalcHandoff]:
+    global _RUN_CALC_HANDOFF
+    handoff = _RUN_CALC_HANDOFF
+    _RUN_CALC_HANDOFF = None
+    return handoff
 
 
 @dataclass

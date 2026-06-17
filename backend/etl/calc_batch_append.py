@@ -637,6 +637,7 @@ def batch_full_macd(
     state_map: Optional[dict] = None,
 ):
     from backend.etl.base import load_latest_fingerprints, load_latest_spec_versions
+    from backend.etl.calc_compute_domain import resolve_compute_indices
     from backend.etl.calc_macd import MACDCalculator
 
     calc = MACDCalculator(con, freq)
@@ -666,7 +667,20 @@ def batch_full_macd(
     def _compute(c, ts_code, df):
         seeds = seeds_by_code.get(ts_code)
         daily_b4 = daily_b4_groups.get(ts_code) if freq == "weekly" else None
-        return c._compute_indicators(df, ema_seeds=seeds, daily_for_b4=daily_b4)
+        b4_target = None
+        target_idx = None
+        if freq == "weekly":
+            idx = resolve_compute_indices(df, recalc_start, calc_date)
+            if idx:
+                b4_target = set(idx)
+                target_idx = b4_target
+        return c._compute_indicators(
+            df,
+            ema_seeds=seeds,
+            daily_for_b4=daily_b4,
+            target_indices=target_idx,
+            b4_target_indices=b4_target,
+        )
 
     return _batch_full_loop(
         calc, ts_codes, calc_date, recalc_start, quote_groups, _compute,
@@ -748,12 +762,20 @@ def batch_full_volume(
     state_map: Optional[dict] = None,
 ):
     from backend.etl.base import load_latest_fingerprints, load_latest_spec_versions
+    from backend.etl.calc_compute_domain import resolve_compute_indices
     from backend.etl.calc_volume import VolumeCalculator
 
     calc = VolumeCalculator(con, freq)
+
+    def _compute(c, _code, df):
+        idx = resolve_compute_indices(df, recalc_start, calc_date)
+        core = c._compute_volume_core(df)
+        return c._compute_volume_derived(
+            core, trend_target_indices=idx or None,
+        )
+
     return _batch_full_loop(
-        calc, ts_codes, calc_date, recalc_start, quote_groups,
-        lambda c, _code, df: c._compute_indicators(df),
+        calc, ts_codes, calc_date, recalc_start, quote_groups, _compute,
         VolumeCalculator.DWS_COLS, VolumeCalculator.FLOAT_COLS,
         _batch_label_zh("volume", freq), min_rows=5,
         spec_version=VolumeCalculator.SPEC_VERSION,
@@ -1084,49 +1106,58 @@ def _merge_cold_tails_and_preflight(
     fp_cache_by_stock: dict,
     calc_date: str,
     dwd_fp_cache: Optional[dict],
+    indicator_filter: Optional[List[str]] = None,
 ) -> None:
     """Cold-load tails + preflight for codes missing from refresh context."""
     from backend.etl.calc_indicators import quote_tail_columns
+    from backend.etl.column_indicator_deps import (
+        active_route_specs,
+        needs_dde_tails,
+        needs_quote_tails,
+    )
     from backend.etl.calc_fast_skip import (
         batch_load_dde_tails,
         batch_load_quote_tails,
         preflight_stock_modes_with_fps,
     )
 
+    route_specs = active_route_specs(indicator_filter)
     missing = [c for c in codes if c not in stock_modes]
     if not missing:
         return
 
     from backend.etl.progress import log_timed_step, stock_progress
 
-    daily_tails.update(log_timed_step(
-        "calc.batch_tails", "quote_daily",
-        lambda: batch_load_quote_tails(
-            con, missing, "daily", quote_tail_columns("daily"),
-        ),
-        stocks=len(missing),
-        step_zh=BATCH_TAIL_ZH["quote_daily"],
-    ))
-    weekly_tails.update(log_timed_step(
-        "calc.batch_tails", "quote_weekly",
-        lambda: batch_load_quote_tails(
-            con, missing, "weekly", quote_tail_columns("weekly"),
-        ),
-        stocks=len(missing),
-        step_zh=BATCH_TAIL_ZH["quote_weekly"],
-    ))
-    dde_daily.update(log_timed_step(
-        "calc.batch_tails", "dde_daily",
-        lambda: batch_load_dde_tails(con, missing, "daily"),
-        stocks=len(missing),
-        step_zh=BATCH_TAIL_ZH["dde_daily"],
-    ))
-    dde_weekly.update(log_timed_step(
-        "calc.batch_tails", "dde_weekly",
-        lambda: batch_load_dde_tails(con, missing, "weekly"),
-        stocks=len(missing),
-        step_zh=BATCH_TAIL_ZH["dde_weekly"],
-    ))
+    if needs_quote_tails(indicator_filter):
+        daily_tails.update(log_timed_step(
+            "calc.batch_tails", "quote_daily",
+            lambda: batch_load_quote_tails(
+                con, missing, "daily", quote_tail_columns("daily"),
+            ),
+            stocks=len(missing),
+            step_zh=BATCH_TAIL_ZH["quote_daily"],
+        ))
+        weekly_tails.update(log_timed_step(
+            "calc.batch_tails", "quote_weekly",
+            lambda: batch_load_quote_tails(
+                con, missing, "weekly", quote_tail_columns("weekly"),
+            ),
+            stocks=len(missing),
+            step_zh=BATCH_TAIL_ZH["quote_weekly"],
+        ))
+    if needs_dde_tails(indicator_filter):
+        dde_daily.update(log_timed_step(
+            "calc.batch_tails", "dde_daily",
+            lambda: batch_load_dde_tails(con, missing, "daily"),
+            stocks=len(missing),
+            step_zh=BATCH_TAIL_ZH["dde_daily"],
+        ))
+        dde_weekly.update(log_timed_step(
+            "calc.batch_tails", "dde_weekly",
+            lambda: batch_load_dde_tails(con, missing, "weekly"),
+            stocks=len(missing),
+            step_zh=BATCH_TAIL_ZH["dde_weekly"],
+        ))
 
     preflight = stock_progress(
         "calc.batch_preflight", len(missing), detail="热路径冷合并预检",
@@ -1137,6 +1168,7 @@ def _merge_cold_tails_and_preflight(
             ts_code, state_map,
             daily_tails.get(ts_code), weekly_tails.get(ts_code),
             dde_daily.get(ts_code), dde_weekly.get(ts_code),
+            specs=route_specs,
             con=con, dwd_fp_cache=dwd_fp_cache,
         )
         if modes is None:
@@ -1151,6 +1183,7 @@ def _merge_cold_tails_and_preflight(
 def run_batch_append_phase(
     con, codes: List[str], calc_date: str, force: bool = False,
     preflight_ctx=None,
+    indicator_filter: Optional[List[str]] = None,
 ) -> Optional[dict]:
     """Batch APPEND + SKIP for all codes before per-stock chunk workers.
 
@@ -1159,6 +1192,12 @@ def run_batch_append_phase(
     """
     from backend.config import CALC_APPEND, CALC_BATCH_APPEND
     from backend.etl.calc_indicators import CALC_ROUTE_SPECS, quote_tail_columns
+    from backend.etl.column_indicator_deps import (
+        active_route_keys,
+        active_route_specs,
+        needs_dde_tails,
+        needs_quote_tails,
+    )
     from backend.etl.calc_fast_skip import (
         batch_load_dde_tails,
         batch_load_quote_tails,
@@ -1174,8 +1213,14 @@ def run_batch_append_phase(
     if not (CALC_APPEND and CALC_BATCH_APPEND):
         return None
 
-    shortcut = try_force_same_day_batch_shortcut(con, codes, calc_date, force)
+    route_specs = active_route_specs(indicator_filter)
+
+    shortcut = None
+    if indicator_filter is None:
+        shortcut = try_force_same_day_batch_shortcut(con, codes, calc_date, force)
     if shortcut is not None:
+        shortcut["indicator_filter"] = indicator_filter
+        shortcut["active_routes"] = active_route_keys(indicator_filter)
         return shortcut
 
     if not codes:
@@ -1247,6 +1292,7 @@ def run_batch_append_phase(
             con, codes, state_map,
             daily_tails, weekly_tails, dde_daily, dde_weekly,
             stock_modes, fp_cache_by_stock, calc_date, dwd_fp_cache,
+            indicator_filter=indicator_filter,
         )
         if cold_merge_stocks:
             cold_merge_elapsed_sec = round(time.monotonic() - t_cold, 2)
@@ -1263,34 +1309,40 @@ def run_batch_append_phase(
             step_zh=BATCH_TAIL_ZH["state"],
         )
         dwd_fp_cache = build_dwd_fp_cache(con, codes, calc_date)
-        daily_tails = log_timed_step(
-            "calc.batch_tails", "quote_daily",
-            lambda: batch_load_quote_tails(
-                con, codes, "daily", quote_tail_columns("daily"),
-            ),
-            stocks=n,
-            step_zh=BATCH_TAIL_ZH["quote_daily"],
-        )
-        weekly_tails = log_timed_step(
-            "calc.batch_tails", "quote_weekly",
-            lambda: batch_load_quote_tails(
-                con, codes, "weekly", quote_tail_columns("weekly"),
-            ),
-            stocks=n,
-            step_zh=BATCH_TAIL_ZH["quote_weekly"],
-        )
-        dde_daily = log_timed_step(
-            "calc.batch_tails", "dde_daily",
-            lambda: batch_load_dde_tails(con, codes, "daily"),
-            stocks=n,
-            step_zh=BATCH_TAIL_ZH["dde_daily"],
-        )
-        dde_weekly = log_timed_step(
-            "calc.batch_tails", "dde_weekly",
-            lambda: batch_load_dde_tails(con, codes, "weekly"),
-            stocks=n,
-            step_zh=BATCH_TAIL_ZH["dde_weekly"],
-        )
+        daily_tails = {}
+        weekly_tails = {}
+        if needs_quote_tails(indicator_filter):
+            daily_tails = log_timed_step(
+                "calc.batch_tails", "quote_daily",
+                lambda: batch_load_quote_tails(
+                    con, codes, "daily", quote_tail_columns("daily"),
+                ),
+                stocks=n,
+                step_zh=BATCH_TAIL_ZH["quote_daily"],
+            )
+            weekly_tails = log_timed_step(
+                "calc.batch_tails", "quote_weekly",
+                lambda: batch_load_quote_tails(
+                    con, codes, "weekly", quote_tail_columns("weekly"),
+                ),
+                stocks=n,
+                step_zh=BATCH_TAIL_ZH["quote_weekly"],
+            )
+        dde_daily = {}
+        dde_weekly = {}
+        if needs_dde_tails(indicator_filter):
+            dde_daily = log_timed_step(
+                "calc.batch_tails", "dde_daily",
+                lambda: batch_load_dde_tails(con, codes, "daily"),
+                stocks=n,
+                step_zh=BATCH_TAIL_ZH["dde_daily"],
+            )
+            dde_weekly = log_timed_step(
+                "calc.batch_tails", "dde_weekly",
+                lambda: batch_load_dde_tails(con, codes, "weekly"),
+                stocks=n,
+                step_zh=BATCH_TAIL_ZH["dde_weekly"],
+            )
 
         from backend.etl.progress import stock_progress
         preflight = stock_progress("calc.batch_preflight", len(codes), detail="批算路由预检")
@@ -1300,6 +1352,7 @@ def run_batch_append_phase(
                 ts_code, state_map,
                 daily_tails.get(ts_code), weekly_tails.get(ts_code),
                 dde_daily.get(ts_code), dde_weekly.get(ts_code),
+                specs=route_specs,
                 con=con, dwd_fp_cache=dwd_fp_cache,
             )
             if modes is None:
@@ -1332,7 +1385,7 @@ def run_batch_append_phase(
         step_zh=BATCH_TAIL_ZH["skip_refresh"],
     )
 
-    for indicator_name, freq, CalcCls, sig_cols, source in CALC_ROUTE_SPECS:
+    for indicator_name, freq, CalcCls, sig_cols, source in route_specs:
         append_codes: List[str] = []
         new_bars_map: Dict[str, list] = {}
         for ts_code, modes in stock_modes.items():
@@ -1436,4 +1489,6 @@ def run_batch_append_phase(
         "cold_merge_stocks": cold_merge_stocks,
         "cold_merge_elapsed_sec": cold_merge_elapsed_sec,
         "state_upsert_mode": "batch",
+        "indicator_filter": indicator_filter,
+        "active_routes": active_route_keys(indicator_filter),
     }

@@ -8,20 +8,77 @@
 |------|------|
 | 标准日更 | `python -m backend.cli run --date YYYYMMDD` |
 | 指定最近交易日（默认 today） | `python -m backend.cli run` |
+| 同 day 仅导 Excel（不重算） | `python -m backend.cli export --date YYYYMMDD` |
+| 强制重算（不信检测 / spec 发版 / 修史） | `python -m backend.cli refresh --date YYYYMMDD [--indicator ma]` |
+| 历史范围 repair | `python -m backend.cli refresh --from A --to B --confirm` |
 
-`run` = fetch → rebuild DWD → calc → export（可用 `--skip-export` 跳过 Excel）。
+`run` = fetch → rebuild DWD → calc → export（可用 `--skip-export` 跳过 Excel）。**同 day 无 ODS 变更时** `run` 仍 fetch 比对，但可 skip DWD+calc（`pipeline_shortcut`），此时用 `export` 最快。
+
+**Wave 5 列→指标收窄（run 路径）：** 小范围 ODS 列变更（如 `circ_mv`）时 calc 可仅跑 `dde` 等子集；`CALC_COLUMN_NARROW=0` 关闭。验收：`scripts/smoke_change_driven_refresh.sh --run-wave5`。
+
+**Change-driven refresh 验收状态：** Wave 1–5 + post-merge gates 已合入 `main`（PR #7 `c1b7649`、PR #8 `8306575`）。实库 smoke 证据：[`evidence/2026-06-16-smoke/`](evidence/2026-06-16-smoke/README.md)。双架构正式签字见 [`2026-06-16-post-merge-acceptance-gates.md` §10](2026-06-16-post-merge-acceptance-gates.md#10-审批)。
+
+**运维命令** 推荐 `python -m backend.cli ops <subcmd>`（顶层 `prune`/`refresh-state` 等仍可用，会 DeprecationWarning）。
 
 ## 禁止事项
 
 | 禁止 | 原因 |
 |------|------|
-| `CALC_FORCE_HARD=1` | 绕过幂等/批处理短路，人为全量重算 |
+| `CALC_FORCE_HARD=1` | 绕过幂等/批处理短路，人为全量重算（**spec 发布日除外**，见下节） |
 | `DWD_INCREMENTAL=0` | 回退全量 DWD rebuild，破坏增量路径 |
 | 日常无 `ts_codes` 全库 `rebuild_all_dwd` | 毒化 `history_fp`，导致 `chunk≈全市场` |
 | SLA 验收前全市场 DWD rebuild | 同上；验收用读库 `benchmark_run` 或真新日 `--run` |
 | 日常 `--force` calc/run | 同日复跑应走幂等快路径，非 FORCE 全量 |
 
 运维例外：除权/adj 回填后若未触发 fetch，需显式 `fetch` + `calc --force`（非日常）。
+
+## 算法 SPEC_VERSION 发布（运维例外）
+
+当 `Calculator.SPEC_VERSION` bump（算法/口径升级，DWD 输入未变）时，日常 `run/calc` **不会**自动刷新存量 DWS——须显式运维刷新。
+
+| 步骤 | 命令 | 验收 |
+|------|------|------|
+| 1 窄指标刷新（推荐） | `python3 -m backend.cli calc --date YYYYMMDD --refresh-spec ma` | `v_dq_spec_freshness` ma spec_stale=0 |
+| 1b 全链路 R1（含 fetch/DWD） | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | 同上 + ODS/DWD 审计 log |
+| 2 或全 calc HARD | `CALC_FORCE_HARD=1 python3 -m backend.cli calc --date YYYYMMDD --force` | 同上 |
+| 3 语义审计（MA） | `python3 -m scripts.audit_ma_alignment_fallback` | 前两项 = 0 |
+| 4 重导 Excel | `python3 -m backend.cli export --date YYYYMMDD` | export 在 calc **之后** |
+
+**允许 `CALC_FORCE_HARD=1` 的场景：** spec 发布日、Gate 3 验收；**日常禁止**。
+
+**语义澄清：** `calc --date` = DWS 快照批次 `calc_date`；`export --date` = Excel 锚定 **trade_date** 截面（读 `v_*_latest`）。
+
+**PR checklist：** bump spec → pytest → refresh-spec/HARD calc → audit → export → health_check Section J。
+
+### Spec migration（一次性，禁并行 run/calc）
+
+> 首次启用 auto refresh 或 bump `SPEC_VERSION` 后的存量刷新。**禁止** migration 未完成时用 `run --skip-export` 测幂等（会触发多路由 auto FULL）。
+
+**`ACCEPTANCE_DATE=20260616`**（与 S2 实库验收一致）
+
+```bash
+# 1. 备份
+cp data/tradeanalysis.duckdb data/tradeanalysis.pre-migrate.duckdb
+
+# 2. 查看 stale（M1 起可用 ops spec-status；此前查 v_dq_spec_freshness / health_check Section J）
+python3 -m backend.cli ops spec-status --date 20260616
+
+# 3. 按指标窄窗 FULL（关闭 auto，避免 run 触发多路由）
+CALC_AUTO_SPEC_REFRESH=0 python3 -m backend.cli calc --refresh-spec IND --date 20260616
+
+# 4. 确认 stale=0
+python3 -m backend.cli ops spec-status --date 20260616
+
+# 5. Export 告警（非阻断）
+EXPORT_SPEC_GATE=1 python3 -m backend.cli export --date 20260616
+
+# 6. 全链路质检
+python3 -m scripts.health_check  # Section J
+```
+
+**禁止：** migration 未完成时用 `run --skip-export` 测幂等。
+
+**Plan：** `docs/superpowers/plans/2026-06-17-batch-full-compute-domain-optimization.md`（与 spec-gate hotfix **独立 PR**）
 
 ## 同日复跑
 
@@ -31,6 +88,8 @@
 | 仅重新导出 Excel | `python -m backend.cli export --date YYYYMMDD` |
 
 同日复跑预期：fetch 0 行 → 跳过 rebuild；calc 幂等秒退；export 最快。
+
+**`run --force`（运维例外）：** 穿透 L0 `pipeline_shortcut`，同 day 0 ODS diff 仍进入 calc；DWD 仍仅 `changed∪stale` 窄重建。非日常命令。
 
 ## 验收 grep（日志 / progress）
 

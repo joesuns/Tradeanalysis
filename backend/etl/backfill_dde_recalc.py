@@ -10,6 +10,31 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 
+def purge_dde_daily_history(
+    con,
+    ts_codes: List[str],
+) -> int:
+    """Remove all DDE daily DWS snapshots for ts_codes (targeted deep repair).
+
+    Narrow scope: explicit ts_codes only — never call without a stock list.
+    Used before CALC_FORCE_HARD to drop stale superseded trend rows that
+    v_*_latest would otherwise keep serving.
+    """
+    if not ts_codes:
+        return 0
+    ph = ",".join(["?"] * len(ts_codes))
+    before = con.execute(
+        f"SELECT COUNT(*) FROM dws_dde_daily WHERE ts_code IN ({ph})",
+        list(ts_codes),
+    ).fetchone()[0]
+    if before:
+        con.execute(
+            f"DELETE FROM dws_dde_daily WHERE ts_code IN ({ph})",
+            list(ts_codes),
+        )
+    return int(before)
+
+
 def invalidate_dde_daily_snapshots(
     con,
     calc_date: str,
@@ -179,6 +204,7 @@ def prepare_dde_daily_recalc(
     calc_date: str,
     ts_codes: Optional[List[str]] = None,
     dry_run: bool = False,
+    purge_history: bool = False,
 ) -> dict:
     """Invalidate dde daily DWS/state (in-process, before calc subprocess)."""
     from backend.etl.calc_gate import assert_calc_date_ready, resolve_effective_calc_date
@@ -201,10 +227,18 @@ def prepare_dde_daily_recalc(
         "calc_date": calc_date,
         "stocks": len(universe),
         "dry_run": dry_run,
+        "purge_history": purge_history,
+        "dde_daily_history_purged": 0,
         "dde_daily_rows_deleted": 0,
         "dde_daily_state_deleted": 0,
     }
     if not dry_run:
+        if purge_history:
+            if not ts_codes:
+                raise ValueError("purge_history requires --ts-code (refusing full-market purge)")
+            stats["dde_daily_history_purged"] = purge_dde_daily_history(
+                con, list(ts_codes),
+            )
         stats["dde_daily_rows_deleted"] = invalidate_dde_daily_snapshots(
             con, calc_date, ts_codes=ts_codes,
         )

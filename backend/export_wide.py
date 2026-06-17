@@ -1,14 +1,18 @@
 import logging
 import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Optional
 
 import duckdb
 import pandas as pd
-from datetime import datetime
 from openpyxl import Workbook
 
-logger = logging.getLogger(__name__)
-from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
+from backend.etl.divergence_tradable import TradableEnrichStats, enrich_tradable_columns
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+logger = logging.getLogger(__name__)
 
 VIEW_MAP = {
     "daily": "v_ads_analysis_wide_daily",
@@ -20,6 +24,40 @@ INDEX_VIEW_MAP = {
 }
 
 EXPORT_DIR = "exports"
+
+
+@dataclass
+class ExportResult:
+    """Export outcome with tradable enrich observability."""
+
+    row_count: int
+    tradable_enrich: Dict[str, dict]
+
+    def __int__(self) -> int:
+        return self.row_count
+
+
+def format_tradable_enrich_log(stats: TradableEnrichStats) -> str:
+    return (
+        f"progress export: tradable enrich {stats.freq} | "
+        f"l1_macd={stats.l1_macd} l1_dde={stats.l1_dde} "
+        f"tradable={stats.tradable} reject={stats.reject} | "
+        f"{stats.elapsed_sec:.1f}s"
+    )
+
+
+def log_tradable_enrich_progress(stats: TradableEnrichStats) -> None:
+    logger.info(format_tradable_enrich_log(stats))
+
+
+def build_export_data_completeness(
+    analysis_date: str,
+    tradable_enrich: Dict[str, dict],
+) -> dict:
+    return {
+        "analysis_date": analysis_date,
+        "tradable_enrich": tradable_enrich,
+    }
 
 
 def default_export_path(trade_date: str, output: str = None) -> str:
@@ -39,7 +77,11 @@ _COL_NAMES = {
     "total_mv": "总市值(亿)", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
     "kpattern": "K线形态", "kpattern_strength": "形态强度",
     "ema_12": "EMA12", "ema_26": "EMA26", "dif": "DIF", "dea": "DEA",
-    "macd_bar": "MACD柱", "macd_divergence": "MACD背离", "macd_zone": "MACD区域",
+    "macd_bar": "MACD柱",
+    "macd_divergence": "MACD结构背离",
+    "macd_divergence_tradable": "MACD可交易背离",
+    "macd_divergence_reject": "MACD背离剔除",
+    "macd_zone": "MACD区域",
     "macd_turning_point": "MACD转折", "macd_alert": "MACD警惕", "macd_trend": "MACD趋势",
     "macd_trend_strength": "MACD趋势强度",
     "ma_5": "MA5", "ma_10": "MA10",
@@ -47,7 +89,10 @@ _COL_NAMES = {
     "ma5_slope": "MA5斜率", "ma10_slope": "MA10斜率",
     "ma_alignment": "均线形态", "ma_turning_point": "均线转折",
     "net_mf_amount": "主力净流入(万元)", "ddx": "DDX", "ddx2": "DDX2",
-    "dde_trend": "DDE趋势", "dde_trend_strength": "DDE趋势强度", "dde_alert": "DDE警惕", "dde_divergence": "DDE背离",
+    "dde_trend": "DDE趋势", "dde_trend_strength": "DDE趋势强度", "dde_alert": "DDE警惕",
+    "dde_divergence": "DDE结构背离",
+    "dde_divergence_tradable": "DDE可交易背离",
+    "dde_divergence_reject": "DDE背离剔除",
     "ma_vol_5": "5日均量(万手)", "pct_vol_rank": "量能百分位",
     "vol_zone": "量能区域", "vol_trend": "量能趋势",
     "volume_ratio": "量比", "vol_ratio": "量比", "vol_trend_strength": "量能趋势强度",
@@ -70,12 +115,16 @@ _ENUM_VALUES = {
     "macd_turning_point": {"golden_cross": "金叉", "dead_cross": "死叉",
                            "near_golden": "近金叉", "near_dead": "近死叉"},
     "macd_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
+    "macd_divergence_tradable": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
+    "macd_divergence_reject": {"skip_peak": "隔峰", "tg_lag": "滞后", "zone_mismatch": "区域"},
     "macd_alert": {"upturn_reverse": "上升拐头", "downturn_reverse": "下降拐头",
                    "upturn_flat": "上升走平", "downturn_flat": "下降走平"},
     "ma_turning_point": {"golden_cross": "金叉", "dead_cross": "死叉",
                          "near_golden": "近金叉", "near_dead": "近死叉"},
     "dde_trend": {"up": "上升", "down": "下降", "flat": "走平"},
     "dde_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
+    "dde_divergence_tradable": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
+    "dde_divergence_reject": {"skip_peak": "隔峰", "tg_lag": "滞后", "zone_mismatch": "区域"},
     "dde_alert": {"upturn_reverse": "上升拐头", "downturn_reverse": "下降拐头",
                   "upturn_flat": "上升走平", "downturn_flat": "下降走平"},
     "vol_zone": {"explosive": "爆量", "low_volume": "地量", "normal": "正常"},
@@ -91,8 +140,10 @@ _ENUM_VALUES = {
 # Event columns — NULL means "no signal today" (shown as "-")
 _EVENT_SIGNAL_COLS = {
     "kpattern", "kpattern_strength",
-    "macd_divergence", "macd_turning_point", "macd_alert",
-    "ma_turning_point", "dde_alert", "dde_divergence",
+    "macd_divergence", "macd_divergence_tradable", "macd_divergence_reject",
+    "macd_turning_point", "macd_alert",
+    "ma_turning_point", "dde_alert",
+    "dde_divergence", "dde_divergence_tradable", "dde_divergence_reject",
     "vol_divergence", "vol_signal",
 }
 # State metrics — NULL means "not computable / insufficient history" (shown as "N/A")
@@ -128,14 +179,15 @@ def export_wide_to_excel(
     filter_st: bool = True,
     include_index: bool = True,
     ts_codes: list[str] = None,  # 可选，只导出指定股票
-) -> int:
+) -> ExportResult:
     """Export horizontal daily+weekly merged analysis to Excel.
 
     Each row = one stock on trade_date, with daily indicators on the left
     and weekly (week-to-date) indicators on the right. Two-row header:
     Row 1 merges group labels (日线指标/周线指标), Row 2 has individual column names.
-    Returns total rows written.
+    Returns ExportResult with row_count and tradable_enrich stats.
     """
+    tradable_meta: Dict[str, dict] = {}
     logger.info("progress export: started | date=%s", trade_date)
     t0 = time.monotonic()
     con = duckdb.connect(db_path)
@@ -149,7 +201,7 @@ def export_wide_to_excel(
     if daily.empty:
         con.close()
         logger.info("progress export: done | rows=0 | %.0fs", time.monotonic() - t0)
-        return 0
+        return ExportResult(0, tradable_meta)
 
     logger.info(
         "progress export: daily query done | rows=%d | %.0fs",
@@ -161,9 +213,12 @@ def export_wide_to_excel(
         daily = daily[daily["ts_code"].isin(ts_codes)]
         if daily.empty:
             con.close()
-            return 0
+            return ExportResult(0, tradable_meta)
 
     daily = _format_numbers(daily)
+    daily, daily_enrich = enrich_tradable_columns(daily, con, freq="daily")
+    tradable_meta["daily"] = daily_enrich.to_dict()
+    log_tradable_enrich_progress(daily_enrich)
 
     # ---- Weekly data: use latest week-end ≤ trade_date ----
     t_weekly = time.monotonic()
@@ -185,6 +240,13 @@ def export_wide_to_excel(
     if ts_codes:
         weekly = weekly[weekly["ts_code"].isin(ts_codes)]
     weekly = _format_numbers(weekly)
+    if not weekly.empty:
+        weekly, weekly_enrich = enrich_tradable_columns(weekly, con, freq="weekly")
+        tradable_meta["weekly"] = weekly_enrich.to_dict()
+        log_tradable_enrich_progress(weekly_enrich)
+    else:
+        empty_weekly = TradableEnrichStats(freq="weekly")
+        tradable_meta["weekly"] = empty_weekly.to_dict()
 
     # Drop identity + fundamental columns from weekly (already in basic section from daily)
     id_cols_drop = ["freq", "trade_date", "stock_code", "stock_name",
@@ -224,15 +286,21 @@ def export_wide_to_excel(
     wb = Workbook()
     wb.remove(wb.active)
     # ---- Signal-only analysis sheet (first sheet) ----
-    _SIGNAL_ONLY = {"kpattern", "kpattern_strength",
-                    "price_position_60d", "price_position_120d", "price_position_250d",
-                    "macd_divergence", "macd_zone", "macd_turning_point", "macd_alert", "macd_trend",
-                    "macd_trend_strength",
-                    "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
-                    "dde_trend", "dde_trend_strength", "dde_alert", "dde_divergence",
-                    "vol_zone", "vol_trend"}
-    daily_signal_only = [c for c in daily_cols if c in _SIGNAL_ONLY or c in basic_cols_outer]
-    weekly_signal_only = [c for c in weekly_cols if c in _SIGNAL_ONLY]
+    _SIGNAL_ONLY = [
+        "kpattern", "kpattern_strength",
+        "price_position_60d", "price_position_120d", "price_position_250d",
+        "macd_divergence_tradable", "macd_divergence_reject", "macd_divergence",
+        "macd_zone", "macd_turning_point", "macd_alert", "macd_trend", "macd_trend_strength",
+        "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
+        "dde_divergence_tradable", "dde_divergence_reject", "dde_divergence",
+        "dde_trend", "dde_trend_strength", "dde_alert",
+        "vol_zone", "vol_trend",
+    ]
+    _signal_set = set(_SIGNAL_ONLY)
+    daily_signal_only = [c for c in _SIGNAL_ONLY if c in daily_cols] + [
+        c for c in daily_cols if c in basic_cols_outer and c not in _signal_set
+    ]
+    weekly_signal_only = [c for c in _SIGNAL_ONLY if c in weekly_cols]
     _write_sheet_merged(wb, "综合分析", merged, daily_signal_only, weekly_signal_only)
 
     # ---- Full analysis sheet ----
@@ -266,7 +334,7 @@ def export_wide_to_excel(
         "progress export: done | rows=%d | %.0fs",
         len(merged), time.monotonic() - t0,
     )
-    return len(merged)
+    return ExportResult(len(merged), tradable_meta)
 
 
 def _format_numbers(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -316,7 +384,7 @@ def _translate_df(df: "pd.DataFrame") -> "pd.DataFrame":
 
 
 def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
-    """Write merged daily+weekly DataFrame with two-row header and signal highlights."""
+    """Write merged daily+weekly DataFrame with two-row header and zebra-striped data rows."""
     ws = wb.create_sheet(title=sheet_name)
 
     # ── Build display column names ──
@@ -379,11 +447,6 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     header_bottom = Border(bottom=Side(style="thin", color="5D6D7E"))
     white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
     stripe_fill = PatternFill(start_color="F7F8FA", end_color="F7F8FA", fill_type="solid")
-
-    # Signal highlight colors
-    green = PatternFill(start_color="D4EDDA", end_color="D4EDDA", fill_type="solid")
-    red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
-    blue = PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
 
     # Indicator group colors — precise prefix match on English column names
     _GROUP_COLORS = {
@@ -485,48 +548,3 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
             cell.font = data_font
             cell.border = thin_border
             cell.fill = row_fill
-
-    # ── Signal highlights ──
-    kpattern_colors = {"阳包阴": green, "阳克阴": green, "墓碑线": red, "避雷针": red,
-                       "高开长阴": red, "阴包阳": red, "阴克阳": red,
-                       "阴包阳(反向买入)": green, "阴克阳(反向买入)": green}
-    text_signal_cols = {
-        "MACD转折": {"金叉": green, "死叉": red}, "MACD区域": {"多头": green, "空头": red},
-        "MACD背离": {"顶背离": red, "底背离": green},
-        "均线形态": {"多头强势": green, "多头初建": green, "多头衰竭": blue, "多头翻转": blue,
-                     "空头强势": red, "空头初建": red, "空头衰竭": blue, "空头翻转": blue,
-                     "均线缠绕": blue, "均线走平": blue},
-        "均线转折": {"金叉": green, "死叉": red}, "DDE趋势": {"上升": green, "下降": red},
-        "DDE背离": {"顶背离": red, "底背离": green}, "量能区域": {"爆量": red, "地量": blue},
-        "量能趋势": {"放量": green, "缩量": red},
-        "量价背离": {"顶背离": red, "底背离": green},
-        "量价复合信号": {
-            "突破确认": green,
-            "放量滞涨": red,
-            "缩量止跌": green,
-            "金叉量弱": blue,
-            "死叉量弱": blue,
-        },
-    }
-    for col_name, value_colors in text_signal_cols.items():
-        for prefix in ("", "__w__"):
-            cn = col_name if not prefix else col_name  # same Chinese name for weekly
-            lookup = col_name if not prefix else f"__w__{col_name}"
-            if lookup in df.columns:
-                col_idx = list(df.columns).index(lookup) + 1
-                for row_idx in range(3, len(df) + 3):
-                    val = ws.cell(row=row_idx, column=col_idx).value
-                    fill = value_colors.get(val)
-                    if fill is None and isinstance(val, str):
-                        for signal_prefix, color in value_colors.items():
-                            if val.startswith(signal_prefix):
-                                fill = color
-                                break
-                    if fill is not None:
-                        ws.cell(row=row_idx, column=col_idx).fill = fill
-    if "K线形态" in df.columns:
-        col_idx = list(df.columns).index("K线形态") + 1
-        for row_idx in range(3, len(df) + 3):
-            val = ws.cell(row=row_idx, column=col_idx).value
-            if val in kpattern_colors:
-                ws.cell(row=row_idx, column=col_idx).fill = kpattern_colors[val]

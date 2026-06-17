@@ -27,3 +27,16 @@ def test_diff_b4_skips_ma_alignment():
     ref.loc[0, "w_ma_alignment"] = "tangle"
     mismatches = diff_b4_frames(ta, ref, skip_dde_ts=set())
     assert mismatches == []
+
+
+def test_diff_b4_skips_dde_alert():
+    ta = pd.DataFrame({
+        "ts_code": ["A.SZ"],
+        "dde_alert": ["upturn_reverse"],
+        "w_dde_alert": ["downturn_reverse"],
+    })
+    ref = ta.copy()
+    ref.loc[0, "dde_alert"] = "downturn_reverse"
+    ref.loc[0, "w_dde_alert"] = "upturn_reverse"
+    mismatches = diff_b4_frames(ta, ref, skip_dde_ts=set())
+    assert mismatches == []

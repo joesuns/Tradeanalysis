@@ -1,0 +1,23 @@
+2026-06-17T00:39:11 INFO     [3df6be3f][backend.etl.ops_spec_status] spec-status: trade_date=20260616 weekly_anchor=20260612 rows=18
+indicator      freq    anchor       total      ok   stale expected
+------------------------------------------------------------------
+dde            daily   20260612      5193    5193       0       v3
+dde            daily   20260616      5112    5112       0       v3
+dde            weekly  20260612      5193    5193       0       v3
+kpattern       daily   20260616      5375    5375       0       v1
+kpattern       daily   20260612      5375    5375       0       v1
+kpattern       weekly  20260612      5375    5375       0       v1
+ma             daily   20260616      5375    5375       0       v2
+ma             daily   20260612      5508    5508       0       v2
+ma             weekly  20260612      5477    5477       0       v2
+macd           daily   20260612      5375    5372       3       v3
+macd           daily   20260616      5375    5375       0       v3
+macd           weekly  20260612      5375    5375       0       v3
+priceposition  daily   20260616      5375    5375       0       v1
+priceposition  daily   20260612      5375    5375       0       v1
+priceposition  weekly  20260612      5375    5375       0       v1
+volume         daily   20260612      5375    5372       3       v2
+volume         daily   20260616      5375    5375       0       v2
+volume         weekly  20260612      5375    5375       0       v2
+
+Suggested: python3 -m backend.cli calc --refresh-spec macd,volume --date 20260616

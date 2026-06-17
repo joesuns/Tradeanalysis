@@ -22,10 +22,12 @@ from backend.etl.b4_macd import (
     B4_NEAR_DAILY,
     B4_NEAR_WEEKLY,
     b4_weekly_series_from_daily,
+    b4_weekly_series_from_daily_fast,
     compute_macd_crossover_123_series,
     compute_macd_trend_123_series,
     macd_ewm_columns,
 )
+from backend.config import CALC_B4_WEEKLY_FAST
 from backend.etl.divergence_structure import compute_macd_structure_divergence
 from backend.etl.recalc_spec import RecalcSpec
 
@@ -233,7 +235,12 @@ class MACDCalculator:
             )
         elif daily_for_b4 is not None and not daily_for_b4.empty:
             week_ends = df["trade_date"].astype(str).tolist()
-            trends, crosses = b4_weekly_series_from_daily(
+            b4_fn = (
+                b4_weekly_series_from_daily_fast
+                if CALC_B4_WEEKLY_FAST
+                else b4_weekly_series_from_daily
+            )
+            trends, crosses = b4_fn(
                 daily_for_b4, week_ends, target_indices=b4_target_indices,
             )
             df["trend"] = trends
@@ -255,9 +262,16 @@ class MACDCalculator:
         df: pd.DataFrame,
         ema_seeds: dict = None,
         daily_for_b4: Optional[pd.DataFrame] = None,
+        target_indices: Optional[set] = None,
+        b4_target_indices: Optional[set] = None,
     ) -> pd.DataFrame:
         df = self._compute_macd_core(df, ema_seeds=ema_seeds)
-        return self._compute_macd_derived(df, daily_for_b4=daily_for_b4)
+        return self._compute_macd_derived(
+            df,
+            daily_for_b4=daily_for_b4,
+            target_indices=target_indices,
+            b4_target_indices=b4_target_indices,
+        )
 
     def _compute_macd_core(
         self,
