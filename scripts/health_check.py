@@ -131,6 +131,11 @@ class Checker:
     def warn(self, msg: str):
         print(f"  [WARN] {msg}")
 
+    def check(self, label: str, ok: bool):
+        if not ok:
+            self.failures += 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
+
     def fail(self, msg: str):
         print(f"  [FAIL] {msg}")
         self.failures += 1

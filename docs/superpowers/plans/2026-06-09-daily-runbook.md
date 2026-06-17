@@ -32,24 +32,33 @@
 
 运维例外：除权/adj 回填后若未触发 fetch，需显式 `fetch` + `calc --force`（非日常）。
 
-## 算法 SPEC_VERSION 发布（运维例外）
+## 算法 SPEC_VERSION 发布
 
-当 `Calculator.SPEC_VERSION` bump（算法/口径升级，DWD 输入未变）时，日常 `run/calc` **不会**自动刷新存量 DWS——须显式运维刷新。
+**默认（`CALC_AUTO_SPEC_REFRESH=1`）：** `run/calc` 在 batch APPEND 前自动检测 **state ∪ DWS** spec 落后并窄窗 FULL，无需日常手动 `refresh-spec`。
 
-| 步骤 | 命令 | 验收 |
+| 步骤 | 命令 | 验收 / 何时用 |
 |------|------|------|
-| 1 窄指标刷新（推荐） | `python3 -m backend.cli calc --date YYYYMMDD --refresh-spec ma` | `v_dq_spec_freshness` ma spec_stale=0 |
-| 1b 全链路 R1（含 fetch/DWD） | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | 同上 + ODS/DWD 审计 log |
-| 1c **v2 实现 bugfix（stay v2）** | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | state 已 v2 但 alignment 语义错时；**勿用** refresh-spec |
+| 日常 | `python -m backend.cli run --date YYYYMMDD` | 自动 spec refresh（观测 `calc_dws.data_completeness.auto_spec_refresh`） |
+| 1 窄指标刷新（应急） | `python3 -m backend.cli calc --date YYYYMMDD --refresh-spec ma` | `v_dq_spec_freshness` ma spec_stale=0 |
+| 1b dry-run 预览 | `python3 -m backend.cli calc --refresh-spec macd --date YYYYMMDD --dry-run` | 零 DWS 写，仅报 stale 规模 |
+| 1c 全链路 R1（含 fetch/DWD） | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | 同上 + ODS/DWD 审计 log |
+| 1d **v2 实现 bugfix（stay v2）** | `python3 -m backend.cli refresh --date YYYYMMDD --indicator ma` | state 已 v2 但 alignment 语义错时；**勿用** refresh-spec |
 | 2 或全 calc HARD | `CALC_FORCE_HARD=1 python3 -m backend.cli calc --date YYYYMMDD --force` | 同上 |
 | 3 语义审计（MA） | `python3 -m scripts.audit_ma_alignment_fallback` | 前两项 = 0 |
-| 4 重导 Excel | `python3 -m backend.cli export --date YYYYMMDD` | export 在 calc **之后** |
+| 4 重导 Excel | `python3 -m backend.cli export --date YYYYMMDD` | export 在 calc **之后**；`EXPORT_SPEC_GATE=1` 非阻断 WARNING |
 
-**允许 `CALC_FORCE_HARD=1` 的场景：** spec 发布日、Gate 3 验收；**日常禁止**。
+**验收：** `calc_dws.data_completeness.dws_spec_stale_counts` 全 0（scoped @ calc_date）；`v_dq_spec_freshness` / `health_check` Section J；或 `EXPORT_SPEC_GATE=1` export 无 WARNING。
+
+**首次启用 auto refresh 前（S2，一次性）：**
+
+```bash
+python -m backend.cli calc --refresh-spec dde --date 20260616
+# 迁移窗口可选：CALC_AUTO_SPEC_REFRESH=0 python -m backend.cli run --date YYYYMMDD
+```
 
 **语义澄清：** `calc --date` = DWS 快照批次 `calc_date`；`export --date` = Excel 锚定 **trade_date** 截面（读 `v_*_latest`）。
 
-**PR checklist：** bump spec → pytest → refresh-spec/HARD calc → audit → export → health_check Section J。
+**PR checklist：** bump spec → pytest → run/calc（auto refresh）→ export → health_check Section J。
 
 ### Spec migration（一次性，禁并行 run/calc）
 

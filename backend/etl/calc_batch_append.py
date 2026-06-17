@@ -246,6 +246,7 @@ def batch_append_macd(
         n = insert_dws_batch_multi(
             con, calc.dws_table, stock_rows, calc_date,
             MACDCalculator.DWS_COLS, MACDCalculator.FLOAT_COLS,
+            spec_version=MACDCalculator.SPEC_VERSION,
         )
         agg.calculated = n
         prog.log_done(写入行=n)
@@ -376,6 +377,7 @@ def batch_append_volume(
         n = insert_dws_batch_multi(
             con, calc.dws_table, stock_rows, calc_date,
             VolumeCalculator.DWS_COLS, VolumeCalculator.FLOAT_COLS,
+            spec_version=VolumeCalculator.SPEC_VERSION,
         )
         agg.calculated = n
         prog.log_done(写入行=n)
@@ -499,6 +501,7 @@ def batch_append_dde(
         n = insert_dws_batch_multi(
             con, calc.dws_table, stock_rows, calc_date,
             DDECalculator.DWS_COLS, DDECalculator.FLOAT_COLS,
+            spec_version=DDECalculator.SPEC_VERSION,
         )
         agg.calculated = n
         prog.log_done(写入行=n)
