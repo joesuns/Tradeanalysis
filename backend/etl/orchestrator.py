@@ -45,6 +45,12 @@ QUOTE_CALCULATORS = [
     VolumeCalculator, PricePositionCalculator,
 ]
 
+# Per-process negative cache: stocks whose auto_fetch returned 0 rows.
+# Keyed by (ts_code, YYYYMM) — resets on process restart. Prevents
+# repeated API calls for stocks tushare cannot fill (e.g., short-history
+# stocks lacking week-end bars in the fetchable range).
+_weekly_fetch_neg_cache: dict = {}
+
 
 def resolve_calc_workers() -> int:
     """Resolve calc parallelism: CALC_WORKERS env or min(cpu-1, 8).
@@ -1498,6 +1504,23 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         logger.info("Missing breakdown by reason: %s", reason_counts)
 
     if auto_fetch and (completeness["missing"] or weekly_fetch):
+        # Filter weekly_fetch through negative cache
+        cache_month = calc_date[:6]  # YYYYMM
+        if weekly_fetch:
+            filtered_weekly = {}
+            skipped_neg = 0
+            for ts_code, info in weekly_fetch.items():
+                if _weekly_fetch_neg_cache.get((ts_code, cache_month)):
+                    skipped_neg += 1
+                else:
+                    filtered_weekly[ts_code] = info
+            if skipped_neg:
+                logger.info(
+                    "progress calc.auto_fetch: weekly negative cache skip %d stocks",
+                    skipped_neg,
+                )
+            weekly_fetch = filtered_weekly
+
         fetch_candidates = list(completeness["missing"].keys()) + list(weekly_fetch.keys())
         to_fetch = []
         for ts_code in fetch_candidates:
@@ -1554,6 +1577,9 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                     logger.info(
                         "progress calc.auto_fetch: bucket done | rows=%d", int(rows),
                     )
+                    if int(rows) == 0:
+                        for ts_code in bucket_codes:
+                            _weekly_fetch_neg_cache[(ts_code, cache_month)] = True
                     attempted_codes.update(bucket_codes)
                     if int(rows) > 0:
                         n_fetched += int(rows)
