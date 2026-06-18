@@ -440,6 +440,15 @@ def maybe_refresh_state_after_dwd_rebuild(
         return None
     if not any(dwd_result.values()):
         return None
+    # Use dwd_result.changed_codes for minimal scope when available
+    scope_codes = dwd_result.get("changed_codes")
+    if scope_codes is not None:
+        orig_n = len(ts_codes)
+        ts_codes = scope_codes
+        logger.info(
+            "refresh_state: narrowed to %d changed codes (from %d stale)",
+            len(ts_codes), orig_n,
+        )
     return refresh_calc_state_fingerprints(
         con, ts_codes, calc_date, dry_run=False, return_artifacts=return_artifacts,
         isolated_tail_load=False,

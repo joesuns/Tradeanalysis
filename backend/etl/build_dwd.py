@@ -327,6 +327,10 @@ def rebuild_dwd_incremental(con, ts_codes: List[str], trade_date: str) -> dict:
         "daily_quote": n_daily,
         "weekly_quote": n_weekly,
         "moneyflow": n_mf,
+        "changed_codes": sorted(
+            set(qfq_codes) | set(insert_codes) | set(tail_daily_codes)
+            | set(full_weekly_codes) | set(tail_weekly_codes)
+        ),
     }
     logger.info(
         "progress dwd.rebuild_incremental: done | %.0fs | %s",
@@ -352,6 +356,7 @@ def rebuild_all_dwd(con, ts_codes=None) -> dict:
         "daily_quote": build_dwd_daily_quote(con, ts_codes),
         "weekly_quote": build_dwd_weekly_quote(con, ts_codes),
         "moneyflow": build_dwd_daily_moneyflow(con, ts_codes),
+        "changed_codes": sorted(ts_codes) if ts_codes else [],
     }
     logger.info(
         "progress dwd.rebuild: done | %.0fs | %s",
