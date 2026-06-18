@@ -642,26 +642,26 @@ class DDECalculator:
         ddx = (net / mv * 100.0).where(mv > 0)
         ddx1 = ddx.ewm(span=DDE_DDX1_EMA_SPAN, adjust=False).mean() * DDE_COMPENSATION_FACTOR
         ddx3 = ddx1.rolling(DDE_DDX3_WINDOW).mean()
+        # Vectorized OLS slopes: DDX3 primary, DDX fallback (handles NaN segments)
+        ddx3_slopes = weighted_window_slopes(
+            ddx3.values.astype(float), reg_w, decay=0.0,
+        )
+        ddx_slopes = weighted_window_slopes(
+            ddx.values.astype(float), reg_w, decay=0.0,
+        )
+        slopes = np.where(np.isnan(ddx3_slopes), ddx_slopes, ddx3_slopes)
+
         for i in range(n):
             if skip_mask is not None and skip_mask[i]:
                 continue
             if i < reg_w - 1:
                 continue
-            seg = ddx3.iloc[i - reg_w + 1:i + 1]
-            if seg.isna().any():
-                seg = ddx.iloc[i - reg_w + 1:i + 1]
-            if seg.isna().any():
+            s = slopes[i]
+            if not np.isfinite(s):
                 continue
-            x = np.arange(reg_w, dtype=float)
-            try:
-                slope = float(np.polyfit(x, seg.values.astype(float), 1)[0])
-            except (np.linalg.LinAlgError, ValueError, TypeError):
-                continue
-            if not np.isfinite(slope):
-                continue
-            if slope > 0:
+            if s > 0:
                 result[i] = "up"
-            elif slope < 0:
+            elif s < 0:
                 result[i] = "down"
             else:
                 result[i] = "flat"
