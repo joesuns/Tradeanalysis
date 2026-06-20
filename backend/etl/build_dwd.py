@@ -253,7 +253,7 @@ def rebuild_dwd_incremental(con, ts_codes: List[str], trade_date: str) -> dict:
     moneyflow tail INSERT.
     """
     if not ts_codes:
-        return {"daily_quote": 0, "weekly_quote": 0, "moneyflow": 0}
+        return {"daily_quote": 0, "weekly_quote": 0, "moneyflow": 0, "changed_codes": []}
 
     logger.info(
         "progress dwd.rebuild_incremental: started | stocks=%d date=%s",
@@ -374,7 +374,7 @@ def _dwd_rebuild_row_count(result: dict) -> int:
     ``sum(result.values())``, which raises ``TypeError``.
     """
     return sum(
-        v for v in result.values() if isinstance(v, (int, float))
+        result.get(k, 0) for k in ("daily_quote", "weekly_quote", "moneyflow")
     )
 
 
