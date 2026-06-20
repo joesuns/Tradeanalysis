@@ -430,6 +430,10 @@ export（导出层）
   全部 6 个周线计算器（含已修复的 kpattern）weekly 路径 `JOIN dim_date ... WHERE is_week_end=1`，
   禁止直接查滚动 bar。**注意：** kpattern 周线历史曾遗漏此过滤产出 intra-week 幽灵行，
   修复后须 `DELETE FROM dws_kpattern_weekly` 再重算才能从 `v_*_latest` 清除残留。
+- **DWD rebuild 结果字典：** `rebuild_dwd_incremental` / `rebuild_all_dwd` 返回的 dict
+  含 `changed_codes`（list）键。需要用 `_dwd_rebuild_row_count()` 而非裸
+  `sum(result.values())` 计算总行数（后者会 TypeError）。该 helper 定义于
+  `backend/etl/build_dwd.py`。
 
 ## 日志系统
 
