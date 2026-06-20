@@ -198,7 +198,9 @@ _ENUM_VALUES = {
     "vol_trend": {"expanding": "放量", "shrinking": "缩量", "flat": "平量"},
     "vol_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "vol_signal": {
-        "breakout_confirmed": "突破确认", "volume_climax": "放量滞涨",
+        "breakout_tight": "缩量突破", "breakout_moderate": "温和突破",
+        "breakout_heavy": "爆量突破",
+        "volume_climax": "放量滞涨",
         "volume_dry_up": "缩量止跌",
         "golden_cross_weakened": "金叉量弱", "dead_cross_weakened": "死叉量弱",
     },
@@ -211,7 +213,7 @@ _EVENT_SIGNAL_COLS = {
     "macd_turning_point", "macd_alert",
     "ma_turning_point", "dde_alert",
     "dde_divergence", "dde_divergence_tradable", "dde_divergence_reject",
-    "vol_divergence", "vol_signal",
+    "vol_divergence", "vol_signal", "risk_alert",
 }
 # State metrics — NULL means "not computable / insufficient history" (shown as "N/A")
 _STATE_METRIC_COLS = {
