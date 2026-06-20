@@ -388,3 +388,60 @@ def test_weekly_pct_vol_rank_with_130_week_end_bars():
     ranks = out["pct_vol_rank"].values
     assert np.isfinite(ranks[-1])
     assert out["zone"].iloc[-1] in ("normal", "explosive", "low_volume")
+
+
+def test_pct_rank_vectorized_matches_original():
+    """向量化版 _compute_pct_rank 与原始逐根循环逐值一致 (atol=1e-9)."""
+    from backend.etl.calc_volume import VolumeCalculator, _compute_pct_rank_vectorized
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    # 原始实现（拷贝自 calc_volume.py:397-415）
+    def _compute_pct_rank_original(ma_vol_5: np.ndarray, window: int) -> np.ndarray:
+        n = len(ma_vol_5)
+        result = np.full(n, np.nan)
+        for i in range(window - 1, n):
+            start = max(0, i - window + 1)
+            window_vals = ma_vol_5[start:i + 1]
+            valid = window_vals[~np.isnan(window_vals)]
+            if len(valid) < 2:
+                continue
+            cur = ma_vol_5[i]
+            if np.isnan(cur):
+                continue
+            rank = np.sum(valid <= cur) / len(valid) * 100.0
+            result[i] = rank
+        return result
+
+    rng = np.random.default_rng(42)
+
+    # Case 1: all-finite, normal data
+    for _ in range(20):
+        n = rng.integers(130, 300)
+        data = rng.lognormal(11.0, 0.5, size=n)
+        for w in [60, 120]:
+            orig = _compute_pct_rank_original(data, w)
+            vec = _compute_pct_rank_vectorized(data, w)
+            np.testing.assert_allclose(
+                vec[~np.isnan(orig)], orig[~np.isnan(orig)],
+                atol=1e-9,
+                err_msg=f"pct_rank mismatch: n={n}, w={w}",
+            )
+            # NaN positions must match
+            np.testing.assert_array_equal(np.isnan(vec), np.isnan(orig))
+
+    # Case 2: with NaN holes
+    data_with_nan = rng.lognormal(11.0, 0.5, size=200)
+    data_with_nan[rng.integers(0, 200, 15)] = np.nan
+    orig = _compute_pct_rank_original(data_with_nan, 120)
+    vec = _compute_pct_rank_vectorized(data_with_nan, 120)
+    np.testing.assert_allclose(
+        vec[~np.isnan(orig)], orig[~np.isnan(orig)], atol=1e-9,
+    )
+    np.testing.assert_array_equal(np.isnan(vec), np.isnan(orig))
+
+    # Case 3: short data (< window)
+    short = rng.lognormal(11.0, 0.5, size=50)
+    orig = _compute_pct_rank_original(short, 120)
+    vec = _compute_pct_rank_vectorized(short, 120)
+    assert np.all(np.isnan(vec)), "short data should be all-NaN"
+    np.testing.assert_array_equal(np.isnan(vec), np.isnan(orig))

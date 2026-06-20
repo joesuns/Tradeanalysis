@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import pandas as pd
 from backend.etl.base import (
     sma, linear_regression_slope, to_float_safe,
@@ -203,6 +204,43 @@ def require_trend_target_indices(
     return indices
 
 
+def _compute_pct_rank_vectorized(ma_vol_5: np.ndarray, window: int = 120) -> np.ndarray:
+    """Percentile rank (vectorized, single-pass).
+
+    For each bar ``i >= window-1``, computes the fraction of valid values
+    in ``ma_vol_5[i-window+1 : i+1]`` that are <= ``ma_vol_5[i]``, then
+    multiplies by 100.  Uses ``sliding_window_view`` to compare all bars
+    against their respective windows in one broadcast operation.
+
+    Matches the original per-bar loop exactly (verified by
+    ``test_pct_rank_vectorized_matches_original``).
+    """
+    n = len(ma_vol_5)
+    result = np.full(n, np.nan)
+
+    if n < window:
+        return result
+
+    # sliding_window_view(x, w) returns shape (n-w+1, w):
+    #   row k = x[k : k+w]  for k = 0 .. n-w
+    # For bar i, the trailing window is ma_vol_5[i-window+1 : i+1],
+    # which is row (i-window+1) of the view.
+    windows = sliding_window_view(ma_vol_5, window)               # (n-w+1, window)
+    cur = ma_vol_5[window - 1:]                                    # (n-w+1,)
+
+    valid_mask = ~np.isnan(windows)                                # (n-w+1, window)
+    valid_count = valid_mask.sum(axis=1)                           # (n-w+1,)
+
+    cur_2d = cur[:, np.newaxis]                                    # (n-w+1, 1)
+    le = (windows <= cur_2d) & valid_mask                          # (n-w+1, window)
+    rank = le.sum(axis=1) / np.maximum(valid_count, 1) * 100.0    # (n-w+1,)
+
+    apply_mask = (valid_count >= 2) & np.isfinite(cur)
+    result[window - 1:][apply_mask] = rank[apply_mask]
+
+    return result
+
+
 class VolumeCalculator:
     """Volume indicator calculator.
 
@@ -296,7 +334,7 @@ class VolumeCalculator:
         v = df["vol"].values.astype(float)
         df["ma_vol_5"] = sma(v, 5)
         df["volume_ratio"] = self._compute_volume_ratio(df)
-        df["pct_vol_rank"] = self._compute_pct_rank(df["ma_vol_5"].values, 120)
+        df["pct_vol_rank"] = _compute_pct_rank_vectorized(df["ma_vol_5"].values, 120)
         return df
 
     def _compute_volume_derived(
@@ -394,7 +432,8 @@ class VolumeCalculator:
             result.calculated += 1
         return result
 
-    def _compute_pct_rank(self, ma_vol_5: np.ndarray, window: int) -> np.ndarray:
+    @staticmethod
+    def _compute_pct_rank(ma_vol_5: np.ndarray, window: int) -> np.ndarray:
         """Percentile rank of current MA5_vol within the last `window` valid values."""
         n = len(ma_vol_5)
         result = np.full(n, np.nan)
