@@ -450,7 +450,7 @@ _DWS_DDL = {
 }
 
 # ============================================================
-# INDEXES: DWS (20) + DWD (3) + ODS (3) = 26
+# INDEXES: DWS (36) + DWD (3) + ODS (8) + DIM (1) = 48
 # ============================================================
 
 _DWS_INDEX_DDL = []
@@ -466,6 +466,11 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
         _DWS_INDEX_DDL.append(
             f"CREATE INDEX IF NOT EXISTS idx_{_indicator}_{_freq}_dc "
             f"ON {_table}(trade_date, ts_code)"
+        )
+        # Prune: seek superseded snapshots by calc_date
+        _DWS_INDEX_DDL.append(
+            f"CREATE INDEX IF NOT EXISTS idx_{_indicator}_{_freq}_cdate "
+            f"ON {_table}(calc_date, ts_code, trade_date)"
         )
 
 _DWD_INDEX_DDL = [
@@ -643,8 +648,19 @@ _ADS_WIDE_VIEWS_DDL = [
 
         -- Composite volume-price signals
         CASE
-            WHEN pp.price_position_60d > 98 AND v.volume_ratio > 1.5
-                THEN 'breakout_confirmed'
+            -- 缩量突破（最强：筹码锁定，次日胜率最高）
+            WHEN pp.price_position_60d > 98 AND q.pct_chg > 3
+                 AND v.volume_ratio < 0.9 AND v.pct_vol_rank < 60
+                THEN 'breakout_tight'
+            -- 温和放量突破（中等）
+            WHEN pp.price_position_60d > 98 AND q.pct_chg > 3
+                 AND v.volume_ratio BETWEEN 0.9 AND 1.5
+                THEN 'breakout_moderate'
+            -- 爆量突破（警惕：多空分歧大，次日胜率最低）
+            WHEN pp.price_position_60d > 98 AND q.pct_chg > 3
+                 AND v.volume_ratio > 1.5 AND v.pct_vol_rank > 80
+                THEN 'breakout_heavy'
+            -- 以下保留原有逻辑
             WHEN pp.price_position_60d > 85 AND v.zone = 'explosive'
                  AND q.pct_chg BETWEEN -2 AND 2
                 THEN 'volume_climax'
@@ -694,7 +710,16 @@ _ADS_WIDE_VIEWS_DDL = [
         v.trend          AS vol_trend,
         v.volume_ratio   AS vol_ratio,
         v.trend_strength AS vol_trend_strength,
-        v.divergence     AS vol_divergence
+        v.divergence     AS vol_divergence,
+
+        -- Sparse risk alerts (~10/day) — unusual volume without clear catalyst
+        CASE
+            WHEN v.volume_ratio > 2.5
+                 AND pp.price_position_60d BETWEEN 20 AND 80
+                 AND v.pct_vol_rank > 85
+                THEN '异常放量 —— 非极端价位突然爆量，注意规避'
+            ELSE NULL
+        END              AS risk_alert
 
     FROM dwd_daily_quote q
     LEFT JOIN dim_stock s                  ON q.ts_code = s.ts_code
@@ -744,8 +769,19 @@ _ADS_WIDE_VIEWS_DDL = [
 
         -- Composite volume-price signals
         CASE
-            WHEN ppw.price_position_60d > 98 AND vw.volume_ratio > 1.5
-                THEN 'breakout_confirmed'
+            -- 缩量突破（最强：筹码锁定，次日胜率最高）
+            WHEN ppw.price_position_60d > 98 AND qw.pct_chg > 3
+                 AND vw.volume_ratio < 0.9 AND vw.pct_vol_rank < 60
+                THEN 'breakout_tight'
+            -- 温和放量突破（中等）
+            WHEN ppw.price_position_60d > 98 AND qw.pct_chg > 3
+                 AND vw.volume_ratio BETWEEN 0.9 AND 1.5
+                THEN 'breakout_moderate'
+            -- 爆量突破（警惕：多空分歧大，次日胜率最低）
+            WHEN ppw.price_position_60d > 98 AND qw.pct_chg > 3
+                 AND vw.volume_ratio > 1.5 AND vw.pct_vol_rank > 80
+                THEN 'breakout_heavy'
+            -- 以下保留原有逻辑
             WHEN ppw.price_position_60d > 85 AND vw.zone = 'explosive'
                  AND qw.pct_chg BETWEEN -2 AND 2
                 THEN 'volume_climax'
@@ -795,7 +831,16 @@ _ADS_WIDE_VIEWS_DDL = [
         vw.trend          AS vol_trend,
         vw.volume_ratio   AS vol_ratio,
         vw.trend_strength AS vol_trend_strength,
-        vw.divergence     AS vol_divergence
+        vw.divergence     AS vol_divergence,
+
+        -- Sparse risk alerts (~1/week) — unusual volume without clear catalyst
+        CASE
+            WHEN vw.volume_ratio > 2.5
+                 AND ppw.price_position_60d BETWEEN 20 AND 80
+                 AND vw.pct_vol_rank > 85
+                THEN '异常放量 —— 非极端价位突然爆量，注意规避'
+            ELSE NULL
+        END              AS risk_alert
 
     FROM dwd_weekly_quote qw
     LEFT JOIN dim_stock s                      ON qw.ts_code = s.ts_code
