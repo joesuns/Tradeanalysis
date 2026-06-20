@@ -18,8 +18,16 @@ def main():
                         help="Number of stocks to profile")
     args = parser.parse_args()
 
+    from datetime import datetime, timedelta
+
     con = get_connection()
     calc_date = "20260615"
+
+    # Recalc start matching run_batch_full_phase behaviour
+    recalc_dt = datetime.strptime(calc_date, "%Y%m%d") - timedelta(days=400)
+    recalc_start = recalc_dt.strftime("%Y%m%d")
+    load_dt = datetime.strptime(calc_date, "%Y%m%d") - timedelta(days=500)
+    load_start = load_dt.strftime("%Y%m%d")
 
     # Resolve active stocks
     rows = con.execute(
@@ -36,13 +44,14 @@ def main():
     t0 = time.monotonic()
     quote_groups = load_quote_groups(
         con, calc.src_table, "daily", load_cols, ts_codes,
+        start_date=load_start,
     )
     t1 = time.monotonic()
     print(f"load_quote_groups: {t1 - t0:.1f}s for {len(ts_codes)} stocks")
 
     t0 = time.monotonic()
     agg, stock_rows = batch_full_volume(
-        con, "daily", ts_codes, calc_date, None, quote_groups,
+        con, "daily", ts_codes, calc_date, recalc_start, quote_groups,
     )
     t1 = time.monotonic()
     elapsed = t1 - t0
