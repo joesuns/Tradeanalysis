@@ -448,13 +448,32 @@ def test_pct_rank_vectorized_matches_original():
 
 
 def test_compute_volume_trend_series_vectorized_matches_original():
-    """预计算版 trend series 与原始逐 bar 版完全一致."""
+    """预计算版 trend series 与逐 bar 调 volume_trend_v2 的原始实现完全一致."""
     from backend.etl.calc_volume import (
-        compute_volume_trend_series,
         _compute_volume_trend_series_vectorized,
+        volume_trend_v2,
+        trend_from_v2_label,
         VOLUME_TREND_V2_DAILY,
         VOLUME_TREND_V2_WEEKLY,
     )
+
+    # ---- independent oracle: per-bar call to volume_trend_v2 ----
+    def _compute_trend_series_oracle(vol, params, target_indices=None):
+        """Original per-bar loop calling volume_trend_v2 on expanding prefixes."""
+        vol_arr = np.asarray(vol, dtype=float)
+        n = len(vol_arr)
+        anchor = int(params["anchor_bars"])
+        result = [None] * n
+        kw = {k: params[k] for k in params if k != "anchor_bars"}
+        indices = range(n) if target_indices is None else target_indices
+        for i in indices:
+            if i < 0 or i >= n:
+                continue
+            if i + 1 < anchor:
+                continue
+            _, label = volume_trend_v2(vol_arr[: i + 1], anchor_bars=anchor, **kw)
+            result[i] = trend_from_v2_label(label)
+        return result
 
     rng = np.random.default_rng(77)
 
@@ -466,29 +485,33 @@ def test_compute_volume_trend_series_vectorized_matches_original():
             vol = rng.lognormal(11.0, 0.5, size=n)
 
             # Full range (target_indices=None)
-            orig = compute_volume_trend_series(vol, params)
+            oracle = _compute_trend_series_oracle(vol, params)
             vec = _compute_volume_trend_series_vectorized(vol, params)
-            assert len(orig) == len(vec) == n
+            assert len(oracle) == len(vec) == n
             for i in range(n):
-                assert orig[i] == vec[i], (
-                    f"[{label}] mismatch at i={i}: orig={orig[i]}, vec={vec[i]}"
+                assert oracle[i] == vec[i], (
+                    f"[{label}] mismatch at i={i}: oracle={oracle[i]}, vec={vec[i]}"
                 )
 
             # Subset indices (APPEND path)
-            indices = sorted(set(rng.integers(anchor, n, size=min(10, n - anchor))))
-            orig_sub = compute_volume_trend_series(vol, params, target_indices=indices)
-            vec_sub = _compute_volume_trend_series_vectorized(
-                vol, params, target_indices=indices,
-            )
-            for i in range(n):
-                assert orig_sub[i] == vec_sub[i], (
-                    f"[{label}] subset mismatch at i={i}"
+            subset_size = min(10, n - anchor)
+            if subset_size > 0:
+                indices = sorted(set(rng.integers(anchor, n, size=subset_size)))
+                oracle_sub = _compute_trend_series_oracle(
+                    vol, params, target_indices=indices,
                 )
+                vec_sub = _compute_volume_trend_series_vectorized(
+                    vol, params, target_indices=indices,
+                )
+                for i in range(n):
+                    assert oracle_sub[i] == vec_sub[i], (
+                        f"[{label}] subset mismatch at i={i}"
+                    )
 
     # Case: data with NaN
     vol_nan = rng.lognormal(11.0, 0.5, size=120)
     vol_nan[rng.integers(0, 120, 5)] = np.nan
-    orig = compute_volume_trend_series(vol_nan, VOLUME_TREND_V2_DAILY)
+    oracle = _compute_trend_series_oracle(vol_nan, VOLUME_TREND_V2_DAILY)
     vec = _compute_volume_trend_series_vectorized(vol_nan, VOLUME_TREND_V2_DAILY)
     for i in range(len(vol_nan)):
-        assert orig[i] == vec[i], f"NaN case mismatch at i={i}"
+        assert oracle[i] == vec[i], f"NaN case mismatch at i={i}"

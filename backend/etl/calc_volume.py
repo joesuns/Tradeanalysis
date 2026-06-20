@@ -182,23 +182,31 @@ def _compute_volume_trend_series_vectorized(
     result = [None] * n
     kw = {k: params[k] for k in params if k not in ("anchor_bars", "ma_window")}
 
-    # ---- pre-compute once ----
-    # 1. Full MA5 series (same as volume_trend_v2's pd.Series.rolling)
-    ma_full = (
-        pd.Series(vol)
+    # ---- pre-compute once on NaN-free array ----
+    # volume_trend_v2 drops NaN via y = y[np.isfinite(y)] before computing
+    # SMA and direction; match that behaviour so the per-bar loop only needs
+    # index-mapping via cumulative finite counts.
+    finite_mask = np.isfinite(vol)
+    vol_clean = vol[finite_mask]
+    cumsum_finite = np.cumsum(finite_mask)
+
+    # 1. Full MA5 series on clean data (same semantics as volume_trend_v2)
+    ma_clean = (
+        pd.Series(vol_clean)
         .rolling(window=ma_window, min_periods=ma_window)
         .mean()
         .to_numpy(dtype=float)
     )
 
-    # 2. Per-bar direction slopes for obs_5 = vol[i-4:i+1] (window=5, unweighted)
-    dir_slopes = weighted_window_slopes(vol, window=5, decay=0.0)
-    dir_scales = sliding_window_mean_abs(vol, window=5)
-    # direction value = slope / scale (matches _slope_over_mean_abs)
-    dir_vals = np.full(n, np.nan)
+    # 2. Per-bar direction slopes for obs_5 (window=5, unweighted, on clean data)
+    dir_slopes_clean = weighted_window_slopes(vol_clean, window=5, decay=0.0)
+    dir_scales_clean = sliding_window_mean_abs(vol_clean, window=5)
+    dir_vals_clean = np.full(len(vol_clean), np.nan)
     with np.errstate(invalid="ignore"):
-        dir_vals_ok = np.isfinite(dir_slopes) & (dir_scales > 1e-9)
-        dir_vals[dir_vals_ok] = dir_slopes[dir_vals_ok] / dir_scales[dir_vals_ok]
+        dir_ok = np.isfinite(dir_slopes_clean) & (dir_scales_clean > 1e-9)
+        dir_vals_clean[dir_ok] = (
+            dir_slopes_clean[dir_ok] / dir_scales_clean[dir_ok]
+        )
 
     vol_flat_eps = float(kw.get("vol_flat_eps", 0.001))
     high_percentile = float(kw.get("high_percentile", 80))
@@ -214,15 +222,16 @@ def _compute_volume_trend_series_vectorized(
     for i in indices:
         if i < 0 or i >= n:
             continue
-        if i + 1 < anchor_bars:
+        # number of finite (non-NaN) values in vol[:i+1]
+        n_finite_i = int(cumsum_finite[i])
+        if n_finite_i < anchor_bars:
+            continue
+        # valid SMA values = clean SMA minus leading NaN from min_periods
+        n_valid_sma = n_finite_i - ma_window + 1
+        if n_valid_sma < anchor_bars:
             continue
 
-        # ma for bars 0..i  (pre-computed, just slice)
-        ma_i = ma_full[: i + 1]
-        valid_ma = ma_i[~np.isnan(ma_i)]
-        if len(valid_ma) < anchor_bars:
-            continue
-
+        valid_ma = ma_clean[ma_window - 1 : n_finite_i]
         anchor = valid_ma[-anchor_bars:]
         p80 = float(np.percentile(anchor, high_percentile))
         p20 = float(np.percentile(anchor, low_percentile))
@@ -264,8 +273,8 @@ def _compute_volume_trend_series_vectorized(
                 else:
                     regime = "正常区"
 
-        # direction from pre-computed dir_vals
-        dir_val = dir_vals[i]
+        # direction: map original index to clean-array position
+        dir_val = dir_vals_clean[n_finite_i - 1]
         if not np.isfinite(dir_val):
             dir_val = 0.0
         if dir_val > vol_flat_eps:
