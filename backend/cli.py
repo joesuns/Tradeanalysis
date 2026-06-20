@@ -429,7 +429,9 @@ def _cmd_run_single_day(args, date: str):
             dwd_result, stale_rebuilt, dwd_meta = _rebuild_dwd_for_run(
                 con, codes, date, fetch_result,
             )
-            rebuild_rows = sum(dwd_result.values()) if dwd_result else 0
+            from backend.etl.build_dwd import _dwd_rebuild_row_count
+
+            rebuild_rows = _dwd_rebuild_row_count(dwd_result) if dwd_result else 0
             log_etl_end(
                 con, lid, "run_rebuild_dwd", t0, "success", row_count=rebuild_rows,
                 data_completeness={
