@@ -519,12 +519,15 @@ def find_stale_dwd_codes(con, ts_codes: list[str], analysis_date: str) -> list[s
     return [r[0] for r in rows]
 
 
-def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str) -> int:
-    """Fetch missing tail ODS for stale stocks; rebuild their DWD."""
+def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str):
+    """Fetch missing tail ODS for stale stocks; rebuild their DWD.
+
+    Returns (n_fetched, dwd_result) where dwd_result is the rebuild dict.
+    """
     from backend.fetch.ods_daily import fetch_stocks_incremental
 
     if not stale_codes:
-        return 0
+        return 0, {}
 
     placeholders = ",".join(["?" for _ in stale_codes])
     max_rows = con.execute(f"""
@@ -577,12 +580,12 @@ def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str) -> in
         stocks=len(stale_codes),
         extra=f"{seg_start}~{analysis_date}",
     )
-    log_timed_step(
+    dwd_result = log_timed_step(
         "calc.stale_fetch", "rebuild_dwd",
         lambda: rebuild_dwd_for_stale(con, stale_codes, analysis_date),
         stocks=len(stale_codes),
     )
-    return int(n_fetched)
+    return int(n_fetched), dwd_result
 
 
 def _compute_fetch_range(con, ts_code: str, calc_date: str,
@@ -1638,7 +1641,11 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 "Stale ODS: %d/%d stocks missing data through %s",
                 len(stale_ods), len(ts_codes), calc_date,
             )
-            n_stale = _auto_fetch_stale_ods(con, stale_ods, calc_date)
+            n_stale, dwd_result = _auto_fetch_stale_ods(con, stale_ods, calc_date)
+            if dwd_result:
+                preflight_ctx = _merge_preflight_after_dwd_rebuild(
+                    con, stale_ods, calc_date, dwd_result, preflight_ctx,
+                )
             logger.info("Stale auto-fetch complete: %d ODS rows", n_stale)
         else:
             stale_dwd = find_stale_dwd_codes(con, ts_codes, calc_date)
