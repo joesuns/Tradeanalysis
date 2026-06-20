@@ -170,6 +170,8 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             try:
                 result = rebuild_all_dwd(con, codes)
                 for name, n in result.items():
+                    if name == "changed_codes":
+                        continue
                     log_etl_end(con, lid, f"build_dwd_{name}", t0, "success", row_count=n)
             except Exception as e:
                 log_etl_error(con, lid, "build_dwd", t0, 0, e)
