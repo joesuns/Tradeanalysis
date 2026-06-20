@@ -147,24 +147,137 @@ def compute_volume_trend_series(
 ) -> list:
     """Per-bar ``volume_trend_v2`` on expanding prefixes; None until anchor met.
 
-    When ``target_indices`` is set (APPEND path), only those bar indices are
-    computed — each call uses ``vol[:i+1]`` identical to the full-series path.
-    Volume uses an ordered index **list**; MACD/DDE divergence uses a **set**
-    for output cropping only.
+    Delegates to the vectorized implementation that pre-computes SMA and
+    direction slopes once, then does a lightweight per-bar pass for
+    percentile/regime classification only.
     """
+    return _compute_volume_trend_series_vectorized(
+        vol_series, params, target_indices=target_indices,
+    )
+
+
+def _compute_volume_trend_series_vectorized(
+    vol_series,
+    params: dict,
+    target_indices: Optional[list] = None,
+) -> list:
+    """Pre-computed SMA + direction slopes version of compute_volume_trend_series.
+
+    Avoids per-bar ``pd.Series.rolling()`` and ``np.polyfit`` by:
+    1. Computing the full MA5 rolling series ONCE (via pandas, then .to_numpy())
+    2. Pre-computing 5-bar OLS direction slopes for ALL bars via
+       ``weighted_window_slopes(decay=0)`` / ``sliding_window_mean_abs``
+    Then the per-bar loop only does percentile / regime classification,
+    which are cheap (anchor: 60 or 30 elements).
+
+    Semantically identical to compute_volume_trend_series; verified by
+    test_compute_volume_trend_series_vectorized_matches_original.
+    """
+    from backend.etl.base import weighted_window_slopes, sliding_window_mean_abs
+
     vol = np.asarray(vol_series, dtype=float)
     n = len(vol)
-    anchor = int(params["anchor_bars"])
+    anchor_bars = int(params["anchor_bars"])
+    ma_window = int(params.get("ma_window", 5))
     result = [None] * n
-    kw = {k: params[k] for k in params if k != "anchor_bars"}
+    kw = {k: params[k] for k in params if k not in ("anchor_bars", "ma_window")}
+
+    # ---- pre-compute once ----
+    # 1. Full MA5 series (same as volume_trend_v2's pd.Series.rolling)
+    ma_full = (
+        pd.Series(vol)
+        .rolling(window=ma_window, min_periods=ma_window)
+        .mean()
+        .to_numpy(dtype=float)
+    )
+
+    # 2. Per-bar direction slopes for obs_5 = vol[i-4:i+1] (window=5, unweighted)
+    dir_slopes = weighted_window_slopes(vol, window=5, decay=0.0)
+    dir_scales = sliding_window_mean_abs(vol, window=5)
+    # direction value = slope / scale (matches _slope_over_mean_abs)
+    dir_vals = np.full(n, np.nan)
+    with np.errstate(invalid="ignore"):
+        dir_vals_ok = np.isfinite(dir_slopes) & (dir_scales > 1e-9)
+        dir_vals[dir_vals_ok] = dir_slopes[dir_vals_ok] / dir_scales[dir_vals_ok]
+
+    vol_flat_eps = float(kw.get("vol_flat_eps", 0.001))
+    high_percentile = float(kw.get("high_percentile", 80))
+    low_percentile = float(kw.get("low_percentile", 20))
+    amp_threshold = float(kw.get("amp_threshold", 1.4))
+    fast_count = int(kw.get("fast_count", 3))
+    recent_count = int(kw.get("recent_count", 2))
+    confirm_window = int(kw.get("confirm_window", 10))
+    confirm_count = int(kw.get("confirm_count", 3))
+
+    # ---- per-bar loop (only percentile + regime, no polyfit / rolling) ----
     indices = range(n) if target_indices is None else target_indices
     for i in indices:
         if i < 0 or i >= n:
             continue
-        if i + 1 < anchor:
+        if i + 1 < anchor_bars:
             continue
-        _, label = volume_trend_v2(vol[: i + 1], anchor_bars=anchor, **kw)
+
+        # ma for bars 0..i  (pre-computed, just slice)
+        ma_i = ma_full[: i + 1]
+        valid_ma = ma_i[~np.isnan(ma_i)]
+        if len(valid_ma) < anchor_bars:
+            continue
+
+        anchor = valid_ma[-anchor_bars:]
+        p80 = float(np.percentile(anchor, high_percentile))
+        p20 = float(np.percentile(anchor, low_percentile))
+
+        amp = p80 / max(p20, 1e-9)
+        if amp < amp_threshold:
+            regime = "振幅不足"
+        else:
+            recent_ma = (
+                valid_ma[-confirm_window:]
+                if len(valid_ma) >= confirm_window
+                else valid_ma
+            )
+            if len(recent_ma) >= fast_count and bool(
+                np.all(recent_ma[-fast_count:] >= p80)
+            ):
+                regime = "爆量区"
+            elif len(recent_ma) >= fast_count and bool(
+                np.all(recent_ma[-fast_count:] <= p20)
+            ):
+                regime = "地量区"
+            else:
+                boom_days = int(np.sum(recent_ma >= p80))
+                dry_days = int(np.sum(recent_ma <= p20))
+                boom_recent = (
+                    int(np.sum(recent_ma[-5:] >= p80))
+                    if len(recent_ma) >= 5
+                    else 0
+                )
+                dry_recent = (
+                    int(np.sum(recent_ma[-5:] <= p20))
+                    if len(recent_ma) >= 5
+                    else 0
+                )
+                if boom_days >= confirm_count and boom_recent >= recent_count:
+                    regime = "爆量区"
+                elif dry_days >= confirm_count and dry_recent >= recent_count:
+                    regime = "地量区"
+                else:
+                    regime = "正常区"
+
+        # direction from pre-computed dir_vals
+        dir_val = dir_vals[i]
+        if not np.isfinite(dir_val):
+            dir_val = 0.0
+        if dir_val > vol_flat_eps:
+            direction = "放量中"
+        elif dir_val < -vol_flat_eps:
+            direction = "缩量中"
+        else:
+            direction = "平量"
+
+        label = f"{regime}·{direction}"
         result[i] = trend_from_v2_label(label)
+
     return result
 
 

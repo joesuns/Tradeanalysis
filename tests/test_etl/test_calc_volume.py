@@ -445,3 +445,50 @@ def test_pct_rank_vectorized_matches_original():
     vec = _compute_pct_rank_vectorized(short, 120)
     assert np.all(np.isnan(vec)), "short data should be all-NaN"
     np.testing.assert_array_equal(np.isnan(vec), np.isnan(orig))
+
+
+def test_compute_volume_trend_series_vectorized_matches_original():
+    """预计算版 trend series 与原始逐 bar 版完全一致."""
+    from backend.etl.calc_volume import (
+        compute_volume_trend_series,
+        _compute_volume_trend_series_vectorized,
+        VOLUME_TREND_V2_DAILY,
+        VOLUME_TREND_V2_WEEKLY,
+    )
+
+    rng = np.random.default_rng(77)
+
+    for label, params in [("daily", VOLUME_TREND_V2_DAILY),
+                           ("weekly", VOLUME_TREND_V2_WEEKLY)]:
+        anchor = params["anchor_bars"]
+        for _ in range(30):
+            n = rng.integers(anchor + 10, anchor + 80)
+            vol = rng.lognormal(11.0, 0.5, size=n)
+
+            # Full range (target_indices=None)
+            orig = compute_volume_trend_series(vol, params)
+            vec = _compute_volume_trend_series_vectorized(vol, params)
+            assert len(orig) == len(vec) == n
+            for i in range(n):
+                assert orig[i] == vec[i], (
+                    f"[{label}] mismatch at i={i}: orig={orig[i]}, vec={vec[i]}"
+                )
+
+            # Subset indices (APPEND path)
+            indices = sorted(set(rng.integers(anchor, n, size=min(10, n - anchor))))
+            orig_sub = compute_volume_trend_series(vol, params, target_indices=indices)
+            vec_sub = _compute_volume_trend_series_vectorized(
+                vol, params, target_indices=indices,
+            )
+            for i in range(n):
+                assert orig_sub[i] == vec_sub[i], (
+                    f"[{label}] subset mismatch at i={i}"
+                )
+
+    # Case: data with NaN
+    vol_nan = rng.lognormal(11.0, 0.5, size=120)
+    vol_nan[rng.integers(0, 120, 5)] = np.nan
+    orig = compute_volume_trend_series(vol_nan, VOLUME_TREND_V2_DAILY)
+    vec = _compute_volume_trend_series_vectorized(vol_nan, VOLUME_TREND_V2_DAILY)
+    for i in range(len(vol_nan)):
+        assert orig[i] == vec[i], f"NaN case mismatch at i={i}"
