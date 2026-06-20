@@ -527,3 +527,44 @@ def test_moneyflow_mapping(temp_db):
     assert row[4] == 400   # buy_elg_vol
     assert row[5] == 200   # sell_elg_vol
     assert row[6] == 1000  # total_vol = 100+200+300+400
+
+
+def test_dwd_rebuild_row_count_ignores_changed_codes():
+    """_dwd_rebuild_row_count sums only numeric fields, skipping changed_codes."""
+    from backend.etl.build_dwd import _dwd_rebuild_row_count
+
+    # Normal case
+    result = {
+        "daily_quote": 10,
+        "weekly_quote": 5,
+        "moneyflow": 92,
+        "changed_codes": ["000001.SZ", "000002.SZ"],
+    }
+    assert _dwd_rebuild_row_count(result) == 107
+
+    # Empty changed_codes
+    result2 = {
+        "daily_quote": 0,
+        "weekly_quote": 0,
+        "moneyflow": 0,
+        "changed_codes": [],
+    }
+    assert _dwd_rebuild_row_count(result2) == 0
+
+    # All zero (daily_basic gate deferred)
+    result3 = {
+        "daily_quote": 0,
+        "weekly_quote": 0,
+        "moneyflow": 92,
+        "changed_codes": [],
+    }
+    assert _dwd_rebuild_row_count(result3) == 92
+
+    # Only changed_codes populated (insert + qfq)
+    result4 = {
+        "daily_quote": 150,
+        "weekly_quote": 10,
+        "moneyflow": 150,
+        "changed_codes": ["A.SZ", "B.SZ"],
+    }
+    assert _dwd_rebuild_row_count(result4) == 310

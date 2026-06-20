@@ -365,6 +365,19 @@ def rebuild_all_dwd(con, ts_codes=None) -> dict:
     return result
 
 
+def _dwd_rebuild_row_count(result: dict) -> int:
+    """Sum only numeric DWD rebuild counts, skipping ``changed_codes``.
+
+    ``rebuild_dwd_incremental`` and ``rebuild_all_dwd`` both return a dict
+    with integer row-count fields *and* a ``changed_codes`` list.  Callers
+    that need a total row count should use this helper instead of
+    ``sum(result.values())``, which raises ``TypeError``.
+    """
+    return sum(
+        v for v in result.values() if isinstance(v, (int, float))
+    )
+
+
 def build_dwd_daily_quote(
     con, ts_codes=None, incremental_trade_date: Optional[str] = None,
 ) -> int:
