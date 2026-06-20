@@ -103,6 +103,7 @@ _COL_NAMES = {
     "price_position_60d": "60日价格滚动分位(%)", "price_position_120d": "120日价格滚动分位(%)",
     "price_position_250d": "250日价格滚动分位(%)",
     "vol_signal": "量价信号",
+    "risk_alert": "风险预警",
 }
 
 _BASIC_HEADER_FILL = "1A1A1A"
@@ -135,7 +136,7 @@ _SIGNAL_ONLY = [
     "macd_zone", "macd_turning_point", "macd_alert", "macd_trend", "macd_trend_strength",
     "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
     "dde_divergence_tradable",
-    "dde_trend", "dde_trend_strength", "dde_alert",
+    "dde_trend", "dde_trend_strength", "dde_alert", "risk_alert",
     "vol_zone", "vol_trend", "vol_divergence", "vol_signal",
 ]
 

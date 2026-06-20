@@ -648,19 +648,20 @@ _ADS_WIDE_VIEWS_DDL = [
 
         -- Composite volume-price signals
         CASE
-            -- 缩量突破（最强：筹码锁定，次日胜率最高）
-            WHEN pp.price_position_60d > 98 AND q.pct_chg > 3
-                 AND v.volume_ratio < 0.9 AND v.pct_vol_rank < 60
-                THEN 'breakout_tight'
-            -- 温和放量突破（中等）
-            WHEN pp.price_position_60d > 98 AND q.pct_chg > 3
-                 AND v.volume_ratio BETWEEN 0.9 AND 1.5
-                THEN 'breakout_moderate'
-            -- 爆量突破（警惕：多空分歧大，次日胜率最低）
-            WHEN pp.price_position_60d > 98 AND q.pct_chg > 3
-                 AND v.volume_ratio > 1.5 AND v.pct_vol_rank > 80
-                THEN 'breakout_heavy'
-            -- 以下保留原有逻辑
+            -- 突破信号（pp60>98, pct_chg>=2）：按量能质量分三级
+            WHEN pp.price_position_60d > 98 AND q.pct_chg >= 2 THEN
+                CASE
+                    -- 缩量突破（最强：筹码锁定，次日胜率最高）
+                    WHEN v.volume_ratio < 0.9
+                         AND (v.pct_vol_rank < 60 OR v.pct_vol_rank IS NULL)
+                        THEN 'breakout_tight'
+                    -- 温和放量突破（中等）
+                    WHEN v.volume_ratio BETWEEN 0.9 AND 1.5
+                        THEN 'breakout_moderate'
+                    -- 爆量突破（警惕：多空分歧大，次日胜率最低）
+                    WHEN v.volume_ratio > 1.5
+                        THEN 'breakout_heavy'
+                END
             WHEN pp.price_position_60d > 85 AND v.zone = 'explosive'
                  AND q.pct_chg BETWEEN -2 AND 2
                 THEN 'volume_climax'
@@ -769,19 +770,20 @@ _ADS_WIDE_VIEWS_DDL = [
 
         -- Composite volume-price signals
         CASE
-            -- 缩量突破（最强：筹码锁定，次日胜率最高）
-            WHEN ppw.price_position_60d > 98 AND qw.pct_chg > 3
-                 AND vw.volume_ratio < 0.9 AND vw.pct_vol_rank < 60
-                THEN 'breakout_tight'
-            -- 温和放量突破（中等）
-            WHEN ppw.price_position_60d > 98 AND qw.pct_chg > 3
-                 AND vw.volume_ratio BETWEEN 0.9 AND 1.5
-                THEN 'breakout_moderate'
-            -- 爆量突破（警惕：多空分歧大，次日胜率最低）
-            WHEN ppw.price_position_60d > 98 AND qw.pct_chg > 3
-                 AND vw.volume_ratio > 1.5 AND vw.pct_vol_rank > 80
-                THEN 'breakout_heavy'
-            -- 以下保留原有逻辑
+            -- 突破信号（pp60>98, pct_chg>=2）：按量能质量分三级
+            WHEN ppw.price_position_60d > 98 AND qw.pct_chg >= 2 THEN
+                CASE
+                    -- 缩量突破（最强：筹码锁定，次日胜率最高）
+                    WHEN vw.volume_ratio < 0.9
+                         AND (vw.pct_vol_rank < 60 OR vw.pct_vol_rank IS NULL)
+                        THEN 'breakout_tight'
+                    -- 温和放量突破（中等）
+                    WHEN vw.volume_ratio BETWEEN 0.9 AND 1.5
+                        THEN 'breakout_moderate'
+                    -- 爆量突破（警惕：多空分歧大，次日胜率最低）
+                    WHEN vw.volume_ratio > 1.5
+                        THEN 'breakout_heavy'
+                END
             WHEN ppw.price_position_60d > 85 AND vw.zone = 'explosive'
                  AND qw.pct_chg BETWEEN -2 AND 2
                 THEN 'volume_climax'
