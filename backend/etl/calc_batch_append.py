@@ -770,20 +770,42 @@ def batch_full_volume(
     from backend.etl.base import load_latest_fingerprints, load_latest_spec_versions
     from backend.etl.calc_compute_domain import resolve_compute_indices
     from backend.etl.calc_volume import VolumeCalculator
+    from backend.etl.vector.volume_batch import (
+        batch_volume_rolling_core,
+        attach_volume_core_to_df,
+    )
 
     calc = VolumeCalculator(con, freq)
 
-    def _compute(c, _code, df):
+    # ---- Phase A: batch compute rolling core for all stocks at once ----
+    batch_core = batch_volume_rolling_core(
+        ts_codes, quote_groups, pct_window=120, ma_period=5,
+    )
+    label_zh = _batch_label_zh("volume", freq)
+    logger.info(
+        "progress calc.batch_full: %s batch rolling core | %d/%d stocks",
+        label_zh, len(batch_core), len(ts_codes),
+    )
+
+    # ---- Phase B: per-stock compute (zone + trend + divergence only) ----
+    def _compute(c, ts_code, df):
         idx = resolve_compute_indices(df, recalc_start, calc_date)
-        core = c._compute_volume_core(df)
+        core = batch_core.get(ts_code)
+        if core is not None and len(core.get("ma_vol_5", [])) == len(df):
+            # Fast path: attach pre-computed rolling core
+            df = attach_volume_core_to_df(df, core)
+        else:
+            # Fallback: stock not in batch_core (different bar count),
+            # use the per-stock path (now vectorized from Task 1)
+            df = c._compute_volume_core(df)
         return c._compute_volume_derived(
-            core, trend_target_indices=idx or None,
+            df, trend_target_indices=idx or None,
         )
 
     return _batch_full_loop(
         calc, ts_codes, calc_date, recalc_start, quote_groups, _compute,
         VolumeCalculator.DWS_COLS, VolumeCalculator.FLOAT_COLS,
-        _batch_label_zh("volume", freq), min_rows=5,
+        label_zh, min_rows=5,
         spec_version=VolumeCalculator.SPEC_VERSION,
         check_spec=True,
         latest_fps=load_latest_fingerprints(con, calc.dws_table, ts_codes),
@@ -932,8 +954,8 @@ def run_batch_full_phase(
     agg_by_key = defaultdict(CalcResult)
 
     spec_by_key = {
-        (indicator_name, freq): (CalcCls, source)
-        for indicator_name, freq, CalcCls, _, source in CALC_ROUTE_SPECS
+        (indicator_name, freq): (CalcCls, sig_cols, source)
+        for indicator_name, freq, CalcCls, sig_cols, source in CALC_ROUTE_SPECS
     }
 
     for (indicator_name, freq), ts_codes in full_groups.items():
@@ -943,7 +965,7 @@ def run_batch_full_phase(
         meta = spec_by_key.get((indicator_name, freq))
         if meta is None:
             continue
-        CalcCls, source = meta
+        CalcCls, sig_cols, source = meta
         recalc_start = daily_recalc if freq == "daily" else weekly_recalc
         label_zh = _batch_label_zh(indicator_name, freq)
 
@@ -983,7 +1005,8 @@ def run_batch_full_phase(
         from backend.etl.calc_state import build_append_state_records, upsert_calc_state_batch
         spec_ver = getattr(calc, "SPEC_VERSION", "v1")
         full_state_records = build_append_state_records(
-            stock_rows, freq, indicator_name, calc_date, spec_version=spec_ver,
+            stock_rows, freq, indicator_name, calc_date,
+            spec_version=spec_ver, sig_cols=sig_cols,
         )
         if full_state_records:
             from backend.etl.progress import log_timed_step
@@ -1321,6 +1344,18 @@ def run_batch_append_phase(
             lambda: load_calc_state_batch(con, codes), stocks=n,
             step_zh=BATCH_TAIL_ZH["state"],
         )
+        # Recover missing state from existing DWS data (interrupted-run recovery)
+        from backend.config import CALC_RECOVER_STATE
+        if CALC_RECOVER_STATE:
+            from backend.etl.calc_state import recover_calc_state_from_dws
+            n_recovered, state_map = recover_calc_state_from_dws(
+                con, codes, calc_date, state_map,
+            )
+            if n_recovered:
+                logger.info(
+                    "progress calc.recovery: 从 DWS 数据恢复 %d 条 state 记录",
+                    n_recovered,
+                )
         dwd_fp_cache = build_dwd_fp_cache(con, codes, calc_date)
         daily_tails = {}
         weekly_tails = {}
@@ -1435,7 +1470,8 @@ def run_batch_append_phase(
         from backend.etl.calc_state import build_append_state_records
         spec_ver = getattr(calc, "SPEC_VERSION", "v1")
         append_state_records = build_append_state_records(
-            stock_rows, freq, indicator_name, calc_date, spec_version=spec_ver,
+            stock_rows, freq, indicator_name, calc_date,
+            spec_version=spec_ver, sig_cols=sig_cols,
         )
         if append_state_records:
             log_timed_step(
