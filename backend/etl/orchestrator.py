@@ -24,7 +24,7 @@ from backend.etl.error_handler import (
 from backend.etl.base import SkipReason, CalcResult
 from backend.fetch.client import TushareClient
 from backend.fetch.ods_daily import fetch_by_date_range_parallel, get_all_active_codes
-from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
+from backend.etl.build_dim import build_dim_stock, build_dim_date
 from backend.etl.build_dwd import rebuild_all_dwd, rebuild_dwd_for_stale
 from backend.etl.calc_macd import MACDCalculator
 from backend.etl.calc_ma import MACalculator
@@ -110,7 +110,6 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             # Global dimension data — always needed regardless of --ts-code
             from backend.fetch.ods_stock_basic import fetch_stock_basic
             from backend.fetch.ods_trade_cal import fetch_trade_cal
-            from backend.fetch.ods_concept import fetch_concept_detail
 
             lid, t0 = log_etl_start(con, "fetch_stock_basic")
             n = fetch_stock_basic(client, con)
@@ -131,13 +130,17 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
                         row_count=int(rows),
                         min_trade_date=start, max_trade_date=end)
 
-            # Concept detail LAST — per-stock calls, low priority, skip on failure
-            lid, t0 = log_etl_start(con, "fetch_concept_detail")
+            # Plate (board/concept) data — low priority, skip on failure
+            from backend.fetch.ods_plate import fetch_plate_data
+
+            lid, t0 = log_etl_start(con, "fetch_plate_data")
             try:
-                n = fetch_concept_detail(client, con, ts_codes=codes)
-                log_etl_end(con, lid, "fetch_concept_detail", t0, "success", row_count=n)
+                plate_results = fetch_plate_data(client, con, end)
+                total_members = sum(r.get("n_members", 0) for r in plate_results.values())
+                log_etl_end(con, lid, "fetch_plate_data", t0, "success",
+                            row_count=total_members)
             except Exception as e:
-                log_etl_end(con, lid, "fetch_concept_detail", t0, "degraded",
+                log_etl_end(con, lid, "fetch_plate_data", t0, "degraded",
                             error_msg=f"skipped (rate limited): {e}")
 
             # Run data completeness check after fetch
@@ -150,15 +153,10 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             for dim_step, fn in [
                 ("build_dim_stock", build_dim_stock),
                 ("build_dim_date", build_dim_date),
-                ("build_dim_concept", build_dim_concept),
             ]:
                 lid, t0 = log_etl_start(con, dim_step)
                 try:
-                    if dim_step == "build_dim_concept":
-                        nc, nm = fn(con)
-                        n = nc + nm
-                    else:
-                        n = fn(con)
+                    n = fn(con)
                     log_etl_end(con, lid, dim_step, t0, "success", row_count=n)
                 except Exception as e:
                     log_etl_error(con, lid, dim_step, t0, 0, e)
