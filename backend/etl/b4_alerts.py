@@ -61,14 +61,14 @@ def compute_macd_hist_turn_alerts(macd_bar: np.ndarray) -> List[Optional[str]]:
 
 def compute_ddx2_slope_alerts(
     ddx2: np.ndarray,
-    window: int = 5,
+    window: int = 2,
     eps: float = 0.0,
 ) -> List[Optional[str]]:
     """Per-bar DDX2 slope inflection alerts (123 ``_eval_ddx2_slope_reversal``).
 
     Returns TA enums:
-    - downturn_reverse: 下降趋势反转（斜率由负转正，看多）
-    - upturn_reverse: 上升趋势反转（斜率由正转负，看空）
+    - downturn_reverse: 下降趋势反弹（斜率由负转正，看多）
+    - upturn_reverse: 上升趋势回落（斜率由正转负，看空）
     """
     values = np.asarray(ddx2, dtype=float)
     n = len(values)
