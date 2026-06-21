@@ -4,7 +4,7 @@ Data sources:
   - TDX (通达信): tdx_index(idx_type='行业板块') → tdx_member per board
   - DC  (东方财富): dc_index(idx_type='概念板块') → dc_member per board
 
-TTL: 7-day cache per (trade_date, source, idx_type) tracked via ods_plate_snapshot.
+TTL: per-source cache (TDX 7d / DC 3d) tracked via ods_plate_snapshot.
 """
 
 import logging
@@ -13,15 +13,13 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-# TTL in days — plate membership changes slowly
-_PLATE_SNAPSHOT_TTL_DAYS = 7
-
 # Per-source tushare API config
 _PLATE_SOURCES = {
     "tdx": {
         "index_func": "tdx_index",
         "member_func": "tdx_member",
         "idx_type": "行业板块",
+        "ttl_days": 7,  # industry classification changes slowly
         "ts_code_field": "ts_code",
         "name_field": "name",
         "member_con_code_field": "con_code",
@@ -31,6 +29,7 @@ _PLATE_SOURCES = {
         "index_func": "dc_index",
         "member_func": "dc_member",
         "idx_type": "概念板块",
+        "ttl_days": 3,  # concept membership rotates faster
         "ts_code_field": "ts_code",
         "name_field": "name",
         "member_con_code_field": "con_code",
@@ -39,9 +38,10 @@ _PLATE_SOURCES = {
 }
 
 
-def _is_snapshot_fresh(con, trade_date: str, source: str, idx_type: str) -> bool:
-    """Check if a valid snapshot exists within TTL for (trade_date, source, idx_type)."""
-    cutoff = (datetime.now() - timedelta(days=_PLATE_SNAPSHOT_TTL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+def _is_snapshot_fresh(con, trade_date: str, source: str, idx_type: str,
+                       ttl_days: int = 7) -> bool:
+    """Check if a valid snapshot exists within *ttl_days* for (trade_date, source, idx_type)."""
+    cutoff = (datetime.now() - timedelta(days=ttl_days)).strftime("%Y-%m-%d %H:%M:%S")
     row = con.execute(
         """SELECT fetched_at FROM ods_plate_snapshot
            WHERE trade_date = ? AND source = ? AND idx_type = ?""",
@@ -109,7 +109,7 @@ def fetch_plate_data(client, con, trade_date: str) -> dict:
         result = {"n_boards": 0, "n_members": 0, "cached": False, "error": None}
 
         # TTL gate
-        if _is_snapshot_fresh(con, trade_date, source, idx_type):
+        if _is_snapshot_fresh(con, trade_date, source, idx_type, ttl_days=cfg["ttl_days"]):
             n = _count_members_for_date(con, trade_date, source)
             result["n_members"] = n
             result["cached"] = True

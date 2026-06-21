@@ -50,6 +50,33 @@ class TestSnapshotFreshness:
         assert _is_snapshot_fresh(con, "20260620", "tdx", "行业板块") is True
         assert _is_snapshot_fresh(con, "20260620", "dc", "概念板块") is False
 
+    def test_custom_ttl_days(self):
+        """Custom ttl_days: DC 3d TTL — 4-day-old snapshot is stale."""
+        from backend.fetch.ods_plate import _is_snapshot_fresh
+
+        con = MagicMock()
+        stale_4d = (datetime.now() - timedelta(days=4)).strftime("%Y-%m-%d %H:%M:%S")
+        con.execute.return_value.fetchone.return_value = [stale_4d]
+
+        assert _is_snapshot_fresh(con, "20260620", "dc", "概念板块", ttl_days=3) is False
+
+    def test_custom_ttl_still_fresh(self):
+        """Custom ttl_days: DC 3d TTL — 2-day-old snapshot is still fresh."""
+        from backend.fetch.ods_plate import _is_snapshot_fresh
+
+        con = MagicMock()
+        fresh_2d = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+        con.execute.return_value.fetchone.return_value = [fresh_2d]
+
+        assert _is_snapshot_fresh(con, "20260620", "dc", "概念板块", ttl_days=3) is True
+
+    def test_per_source_ttl_in_config(self):
+        """_PLATE_SOURCES has per-source ttl_days."""
+        from backend.fetch.ods_plate import _PLATE_SOURCES
+
+        assert _PLATE_SOURCES["tdx"]["ttl_days"] == 7
+        assert _PLATE_SOURCES["dc"]["ttl_days"] == 3
+
 
 class TestLoadPlateEnrichment:
     """load_plate_enrichment export query tests."""
