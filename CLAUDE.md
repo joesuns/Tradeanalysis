@@ -81,8 +81,11 @@ python -m backend.cli export --date 20260603 --ts-code 000543.SZ
 python -m backend.cli query --ts-code 000001.SZ --freq daily
 
 # ===== 快照清理 =====
-python -m backend.cli prune              # 保留最近 5 次运行（默认）
+python -m backend.cli prune              # 保留最近 2 次运行（默认）
 python -m backend.cli prune --keep 1     # 完全坍缩为纯 latest，最省空间
+python -m backend.cli prune --cleanup-backups --dry-run  # 预览待删除的旧 pre-* 备份
+python -m backend.cli prune --cleanup-backups --keep-backups 1  # 仅保留最近 1 个备份
+python -m backend.cli prune --cleanup-backups  # 清理旧备份（默认保留 2 个）
 
 # ===== calc state 运维（一次性）=====
 python -m backend.cli backfill-state              # 缺 state 键 → FULL 补缺（慢）
@@ -143,13 +146,13 @@ python scripts/benchmark_run.py --date 20260609 --run
 
 ```
 backend/
-├── config.py              # 环境变量加载（TUSHARE_TOKEN/DUCKDB_PATH/LOG_LEVEL）
+├── config.py              # 环境变量加载（TUSHARE_TOKEN/DUCKDB_PATH/LOG_LEVEL/DUCKDB_TEMP_DIRECTORY/DUCKDB_MAX_MEMORY_MB/MIN_DISK_FREE_MB/PRUNE_KEEP_BACKUPS/DWS_PRUNE_KEEP_RUNS）
 ├── cli.py                 # CLI 入口（check/fetch/calc/export/query/status 6 子命令）
 ├── export_wide.py         # Excel 导出（中文列名、分组着色、日线+周线水平合并、表头列注释）
 ├── export_column_comments.py  # 从 docs/export/export-column-comments.yaml 加载表头注释
 ├── db/
-│   ├── connection.py      # DuckDB 连接、自检、WAL checkpoint
-│   └── schema.py          # 完整 DDL（26 表 + 16 视图 + 31 索引，含 input_fingerprint/spec_version）
+│   ├── connection.py      # DuckDB 连接、自检、WAL checkpoint、temp_directory/内存管理、孤儿清理、atexit/signal
+│   └── schema.py          # 完整 DDL（26 表 + 16 视图 + 48 索引，含 input_fingerprint/spec_version）
 ├── fetch/
 │   ├── client.py          # tushare API 封装（限流 600/min、指数退避重试）
 │   ├── ods_daily.py       # 双模式拉取：date-batched（全市场）+ stock-batched（per-stock 增量）
@@ -257,6 +260,7 @@ calc（计算层）
 ├── **跨股 batch FULL（`CALC_BATCH_FULL=1` 默认，需 `CALC_BATCH_APPEND`）：** `run_batch_append_phase` APPEND 后按 `group_by_indicator(full_items)` 批处理 mass 单指标 FULL（共享尾窗 + `insert_dws_batch_multi` 窄写）；完成后重建 `full_items`，仅余量进 `_calc_full_work_chunk` / `_calc_stock_chunk`。`=0` 回退 chunk-only。设计见 `docs/superpowers/plans/2026-06-12-p4-indicator-chunk-impl.md` Task 5b。
 │   - **batch 尾窗列：** `quote_tail_columns(freq)` 与 `quote_pipeline_columns(freq)` 相同（含 `pct_chg`，供 kpattern 涨跌停过滤）；≠ 各指标 `SIGNATURE_COLS` 并集 alone。
 ├── **性能专项（batch write）：** `insert_dws_batch_multi` 按 `(indicator,freq)` 一次窄写；MACD/DDE/Volume 种子批载；SKIP 路径 `CALC_SKIP_STATE_REFRESH` 跳过冗余 `dws_calc_state` UPSERT；`batch_ctx` chunk 零重复 tail SQL。
+├── **断点恢复（`CALC_RECOVER_STATE=1` 默认）：** 冷路径 preflight 前从 DWS 数据表恢复缺失的 `dws_calc_state` 记录（`recover_calc_state_from_dws`），避免进程异常退出后下次 `run` 全量 FULL 重算。**签名域对齐**：`build_append_state_records` 统一用 `state_signature(df.tail(245))` 写入 `history_fp`，与 `classify_calc_mode_detail` 比对域一致。`=0` 回退旧行为。
 ├── **calc_date 门禁（`CALC_STRICT_DATE=1` 默认）：** `calc_date > MAX(ods_daily)` 时拒绝 calc（防假新日 72min 空跑）；`=0` 时自动 cap 到 ODS max。
 └── export 行数 << 预期（<80% 活跃股）→ WARNING
 
@@ -280,7 +284,7 @@ export（导出层）
 - **DWS 用 INSERT-only 快照模式**，calc_date 区分批次
 - **所有查询必须走 v_*_latest 视图**，禁止直接查 DWS 基表
 - **latest 视图取最新快照（A5）：** `v_dws_*_latest` 用 `QUALIFY ROW_NUMBER() OVER (PARTITION BY ts_code, trade_date ORDER BY calc_date DESC)=1`（单次扫描），替代旧的逐行关联子查询。语义等价但随快照数稳定提速。⚠️ 改 DDL 后**实库需重跑 schema 初始化**（`CREATE OR REPLACE VIEW`）才会生效
-- **DWS 快照保留策略：** 快照无界增长，用 `prune_dws_snapshots(con, keep_runs=N)`（CLI `prune --keep N`，默认 5）清理。只删被新 calc_date 覆盖的 superseded 行，**绝不删每个 `(ts_code, trade_date)` 的 `MAX(calc_date)` 行**，故 `v_*_latest` 结果不变；`keep_runs=1` 为纯 latest。逻辑删除 + CHECKPOINT，不挂进 run_calc，运维显式执行
+- **DWS 快照保留策略：** 快照无界增长，用 `prune_dws_snapshots(con, keep_runs=N)`（CLI `prune --keep N`，默认 2，可通过 `DWS_PRUNE_KEEP_RUNS` 环境变量覆盖）清理。只删被新 calc_date 覆盖的 superseded 行，**绝不删每个 `(ts_code, trade_date)` 的 `MAX(calc_date)` 行**，故 `v_*_latest` 结果不变；`keep_runs=1` 为纯 latest。逻辑删除 + CHECKPOINT，不挂进 run_calc，运维显式执行
 - **停牌填充到每只股票 ODS 数据的 max(trade_date)**，而非全局 dim_date。填充触发条件：gap 检测按**交易日历**判断内部缺口（该股 ODS 实际行数 < 其 [min,max] 区间内 dim_date 交易日天数），而非 `dwd.n < ods.n`（step1 为 1:1 插入恒等，旧逻辑导致停牌永不填充）。仅内部缺口填充，尾部缺口（max ODS 之后）不填
 - **ods_etl_log 用 UUID 主键**，避免并发写冲突
 - **DuckDB 不支持 AUTOINCREMENT**，用 INTEGER PRIMARY KEY 默认自增
@@ -289,6 +293,17 @@ export（导出层）
 - **DWD 重建入口：** 日常新日走 `rebuild_dwd_for_stale(con, stale_codes, trade_date)`（`DWD_INCREMENTAL=1` 默认）；运维/首次建库走 `rebuild_all_dwd(con, ts_codes)`。禁止单独调 `build_dwd_*` 或日常无 `ts_codes` 全库 rebuild，否则部分 DWD 表遗漏或破坏增量路径
 - **BSE 股票（.BJ）无 moneyflow 数据**——tushare 不支持，DDE 指标为空属正常
 - **周线数据充足性：** MACD 需 ≥27 条周线，price_position 需 ≥60 条。上市不足 1 年的股票周线指标为空属正常
+
+### 临时文件与磁盘空间管理（2026-06-19）
+
+- **DuckDB temp_directory：** 默认 `data/tmp/`（`DUCKDB_TEMP_DIRECTORY` 默认 `"tmp"`，相对 data_dir 解析；设绝对路径可跨卷）。溢出文件与数据库同卷，空间可预测
+- **内存限制：** `DUCKDB_MAX_MEMORY_MB=4096`（4 GiB）。更早 spill → 更小的 temp 文件，避免大查询撑爆磁盘。**所有连接（含 Worker 线程）统一走 `get_connection()`**，确保配置一致
+- **磁盘门禁：** `MIN_DISK_FREE_MB=5120`（5 GiB）。管道启动前检查数据目录可用空间；实际阈值 `max(MIN_DISK_FREE_MB, DB_SIZE/3)`。temp 目录阈值 `max(threshold/2, 1024 MB)`
+- **孤儿清理：** 首次 `get_connection(read_only=False)` 自动清理上次崩溃残留的 `.tmp` 目录（全 CLI 路径覆盖）。`cli check` 输出含 temp 可用空间和备份文件数量
+- **优雅关闭：** `atexit` + `SIGTERM/SIGINT` handler 自动清理 temp 目录，防止残留。信号到达时仅设标记位，atexit 中执行清理并 `sys.exit(128+signum)` 恢复标准退出码
+- **备份清理：** `prune --cleanup-backups` 管理 `data/tradeanalysis.pre-*.duckdb` 旧备份（默认保留 2 个，`PRUNE_KEEP_BACKUPS` 可配）
+- **环境变量：** `DUCKDB_TEMP_DIRECTORY`、`DUCKDB_MAX_MEMORY_MB`、`MIN_DISK_FREE_MB`、`PRUNE_KEEP_BACKUPS`、`DWS_PRUNE_KEEP_RUNS`
+- **数据质量不变：** temp/memory 配置仅影响 DuckDB 执行引擎的中间溢出行为，不改变任何计算结果
 
 ### Price Position（价格位置）
 
@@ -333,7 +348,7 @@ export（导出层）
 - **DDX2：** EMA(DDX, 5)
 - **背离：** `divergence_structure.compute_dde_structure_divergence` — 与 MACD 同构，`CROSS(DDX,DDX2)` 锚点 + 隔峰柱背 + TG 日标注（dedup=10）；顶区 DDX 峰邻域尖刺过滤；`RECALC_SPEC` lookback=250
 - **可交易背离：** 同 MACD L2 门槛；DDE 为辅信号，`.BJ` 无数据
-- **警惕（`dde_alert` / `w_dde_alert`，B4 软层）：** TA-native 相邻 **2-bar** DDX2 线性回归斜率拐点（`eps=0`）；`b4_alerts.compute_ddx2_slope_alerts`；**不对齐** 123 5-bar。仍 export/Excel。
+- **警惕（`dde_alert` / `w_dde_alert`，B4 软层）：** TA-native 相邻 **2-bar** DDX2 线性回归斜率拐点（`eps=0`）；`b4_alerts.compute_ddx2_slope_alerts`；**不对齐** 123 5-bar。枚举命名遵循「描述被反转的旧趋势」设计本意：`downturn_reverse`=下降趋势反弹（V 形，斜率由负转正，看多）；`upturn_reverse`=上升趋势回落（Λ 形，斜率由正转负，看空）。Excel 标签：上升趋势回落 / 下降趋势反弹。2026-06-21 修正了 DDE Alert 枚举值颠倒 bug（原 s_prev<0 & s_now>0 错误输出 upturn_reverse），详见 `docs/superpowers/plans/2026-06-21-alert-enum-semantic-fix.md`。
 - **趋势（B4 hard `dde_trend` / `w_dde_trend`）：** 日线 123 同构 `analyze_moneyflow_trend_optimized` — `moneyflow_dc`+`circ_mv` → DDX1/DDX3 + 5 日 polyfit；缺 dc/circ 日线可回退 `net_mf_amount`/`total_mv`。周线 B4 对齐 `analyze_weekly_dde_trend`：`resample('W')` 独立聚合 **仅 `net_amount_dc`** 与 `circ_mv` 再 inner merge（禁止日级 join 后 resample、周线 trend **禁止** `net_mf_amount`/`total_mv` 回退）、`ddx3.tail(4)` 在全序列 `iloc[-1]`（非 dim_date 周界）；`ddx3` 尾窗含 NaN → flat（不回退 `ddx`）。`ods_moneyflow.net_amount_dc` + `ods_daily_basic.circ_mv` 落库。**2026-06-18 向量化：** 逐 bar `np.polyfit` 循环 → `weighted_window_slopes(decay=0)` 闭式 OLS，等价性 `atol=1e-9` 锁定（`test_append_calc.py`）。
 - **趋势强度（`dde_trend_strength`，非 B4）：** DDX2 **5-bar** 指数加权回归斜率 / mean(|DDX2|)（decay=0.20）；与 MACD `trend_strength` 同窗。`DDECalculator.SPEC_VERSION=v3`（v3=alert 2-bar + strength 5-bar；v2=123 5-bar alert）
 - **Tier-0 内容 DQ：** 日线 `dde_trend` 须与 B4 moneyflow 重算一致；`scripts/audit_dde_trend_oracle.py` 为 oracle（**全历史** `_compute_indicators`，非 tail255 — EMA60 暖机），`health_check` Section K 抽样 200 股（mismatch >0.1% WARN、>1% FAIL）；异常时 `ops repair-dde-trend` 窄窗 invalidate+`CALC_FORCE_HARD` 重算；指定 `--ts-code` 时可加 `--purge-history` 清除该股全部 dde/daily 历史快照（修复 v_*_latest 中旧 calc_date 脏 trend）。**P0 防复发（已接线）：** `net_amount_dc`/`circ_mv` ODS patch + DWD rebuild 后，`cli run`/`refresh` 在 `refresh_state` 之后自动 `maybe_invalidate_dde_after_column_patch`（删 dde/daily @ calc_date DWS + state，再 calc FULL）；见 `docs/superpowers/plans/2026-06-17-dde-content-invalidation-p0.md`
@@ -348,6 +363,7 @@ export（导出层）
 - `build_dwd_daily_quote` 依赖 `ods_daily.adj_factor`——stock-batched 拉取时必须单独调 `adj_factor` API（daily 接口不返回此字段）
 - BSE 股票无 moneyflow 数据（DDE 不可用）
 - 上市不足 1 年的股票周线数据可能不足（MACD 需 ≥27 条，price_position 需 ≥60 条）
+- **DDE Alert 存量迁移（2026-06-21）：** 枚举语义修正后，`dws_dde_daily` 和 `dws_dde_weekly` 的 `alert` 列中已有枚举值与修改后语义相反。部署后需执行 `cli refresh --indicator dde --date <latest_calc_date>` 覆盖存量。详见 `docs/superpowers/plans/2026-06-21-alert-enum-semantic-fix.md`。
 - `ema()` 函数在 `total_valid < min(period, 5)` 时返回全 NaN——极短历史股票无法计算 EMA
 - **空数据处理：**
   - `run_calc()` 自动补拉缺失数据（策略选择器 date/stock-batched，per-target-stock 增量检测，100% 覆盖率阈值，warmup=250 tdays，熔断器：连续 5 次 fetch 异常或 5 次空返回则中止）
