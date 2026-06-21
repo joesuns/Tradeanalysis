@@ -75,7 +75,7 @@ def default_export_path(trade_date: str, output: str = None) -> str:
 _COL_NAMES = {
     "freq": "周期", "trade_date": "交易日期", "ts_code": "股票代码",
     "stock_code": "代码", "stock_name": "股票名称", "exchange": "交易所",
-    "sector": "上市板块", "industry": "行业", "tdx_industry_board": "行业板块", "dc_concept_board": "概念板块", "is_st": "ST",
+    "sector": "上市板", "industry": "申万行业", "tdx_industry_board": "通达信行业", "dc_concept_board": "概念板块", "is_st": "ST",
     "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量(万手)", "amount": "成交额(亿)",
     "total_mv": "总市值(亿)", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
     "kpattern": "K线形态", "kpattern_strength": "形态强度",

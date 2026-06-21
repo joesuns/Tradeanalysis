@@ -30,16 +30,16 @@ columns:
     上市交易所（上海/深圳/北京）。
 
   sector: |
-    上市板块（主板/创业板/科创板/北交所），基于股票代码前缀推导。
+    上市板（主板/创业板/科创板/北交所），基于股票代码前缀推导。
 
   tdx_industry_board: |
-    TDX通达信行业板块分类（如银行、汽车制造、半导体等），以分析日为锚点，多板块以逗号分隔。数据源：tushare tdx_index/tdx_member。
+    TDX通达信行业分类（如银行、汽车制造、半导体等），以分析日为锚点，多板块以逗号分隔。数据源：tushare tdx_index/tdx_member。
 
   dc_concept_board: |
     DC东方财富概念板块分类（如新能源、人工智能、国企改革等），以分析日为锚点，多概念以逗号分隔。数据源：tushare dc_index/dc_member。
 
   industry: |
-    申万或 tushare 行业分类。
+    申万行业分类（如股份制银行、汽车零部件等），来自 tushare stock_basic。与『通达信行业』为两套独立行业分类体系，可交叉参考。
 
   is_st: |
     是否 ST/*ST（1=是，0=否）。默认导出可过滤 ST 股。

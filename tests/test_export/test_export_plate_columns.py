@@ -28,8 +28,9 @@ class TestPlateColumnsInExport:
         """_COL_NAMES must map new columns to Chinese names."""
         from backend.export_wide import _COL_NAMES
 
-        assert _COL_NAMES["sector"] == "上市板块"
-        assert _COL_NAMES["tdx_industry_board"] == "行业板块"
+        assert _COL_NAMES["sector"] == "上市板"
+        assert _COL_NAMES["industry"] == "申万行业"
+        assert _COL_NAMES["tdx_industry_board"] == "通达信行业"
         assert _COL_NAMES["dc_concept_board"] == "概念板块"
 
     def test_plate_merge_with_existing_daily(self):
