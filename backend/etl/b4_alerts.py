@@ -67,8 +67,8 @@ def compute_ddx2_slope_alerts(
     """Per-bar DDX2 slope inflection alerts (123 ``_eval_ddx2_slope_reversal``).
 
     Returns TA enums:
-    - upturn_reverse: 斜率拐头看多
-    - downturn_reverse: 斜率拐头看空
+    - downturn_reverse: 下降趋势反转（斜率由负转正，看多）
+    - upturn_reverse: 上升趋势反转（斜率由正转负，看空）
     """
     values = np.asarray(ddx2, dtype=float)
     n = len(values)
@@ -82,7 +82,7 @@ def compute_ddx2_slope_alerts(
         if not (np.isfinite(s_prev) and np.isfinite(s_now)):
             continue
         if s_prev < -eps and s_now > eps:
-            result[i] = "upturn_reverse"
-        elif s_prev > eps and s_now < -eps:
             result[i] = "downturn_reverse"
+        elif s_prev > eps and s_now < -eps:
+            result[i] = "upturn_reverse"
     return result
