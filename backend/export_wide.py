@@ -75,7 +75,7 @@ def default_export_path(trade_date: str, output: str = None) -> str:
 _COL_NAMES = {
     "freq": "周期", "trade_date": "交易日期", "ts_code": "股票代码",
     "stock_code": "代码", "stock_name": "股票名称", "exchange": "交易所",
-    "sector": "板块", "industry": "行业", "is_st": "ST",
+    "sector": "上市板块", "industry": "行业", "tdx_industry_board": "行业板块", "dc_concept_board": "概念板块", "is_st": "ST",
     "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量(万手)", "amount": "成交额(亿)",
     "total_mv": "总市值(亿)", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
     "kpattern": "K线形态", "kpattern_strength": "形态强度",
@@ -110,7 +110,7 @@ _BASIC_HEADER_FILL = "1A1A1A"
 
 _ID_COLS = [
     "ts_code", "trade_date", "stock_code", "stock_name",
-    "exchange", "sector", "industry", "is_st",
+    "exchange", "sector", "industry", "tdx_industry_board", "dc_concept_board", "is_st",
 ]
 _FUND_COLS = [
     "close", "pct_chg", "vol", "amount", "total_mv",
@@ -302,6 +302,35 @@ def export_wide_to_excel(
     daily, daily_enrich = enrich_tradable_columns(daily, con, freq="daily")
     tradable_meta["daily"] = daily_enrich.to_dict()
     log_tradable_enrich_progress(daily_enrich)
+
+    # ---- Enrich with plate/concept data ----
+    from backend.fetch.ods_plate import load_plate_enrichment
+
+    t_plate = time.monotonic()
+    logger.info("progress export: loading plate enrichment | date=%s", trade_date)
+    plate_enrichment = load_plate_enrichment(con, trade_date)
+    if plate_enrichment:
+        plate_df_data = []
+        for ts_code, cols in plate_enrichment.items():
+            plate_df_data.append({
+                "ts_code": ts_code,
+                "tdx_industry_board": cols.get("tdx_industry_board"),
+                "dc_concept_board": cols.get("dc_concept_board"),
+            })
+        plate_df = pd.DataFrame(plate_df_data)
+        daily = daily.merge(plate_df, on="ts_code", how="left")
+        logger.info(
+            "progress export: plate enrichment done | enriched=%d rows | %.0fs",
+            len(plate_df), time.monotonic() - t_plate,
+        )
+    else:
+        logger.info("progress export: no plate data for %s | %.0fs",
+                    trade_date, time.monotonic() - t_plate)
+
+    # Fill missing plate/concept values with "N/A"
+    for col in ["tdx_industry_board", "dc_concept_board"]:
+        if col in daily.columns:
+            daily[col] = daily[col].fillna("N/A")
 
     # ---- Weekly data: use latest week-end ≤ trade_date ----
     t_weekly = time.monotonic()
