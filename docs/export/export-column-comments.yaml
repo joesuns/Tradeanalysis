@@ -36,7 +36,7 @@ columns:
     TDX通达信行业分类（如银行、汽车制造、半导体等），以分析日为锚点，多板块以逗号分隔。数据源：tushare tdx_index/tdx_member。
 
   dc_concept_board: |
-    DC东方财富概念板块分类（如新能源、人工智能、国企改革等），以分析日为锚点，多概念以逗号分隔。数据源：tushare dc_index/dc_member。
+    DC东方财富概念板块分类（如新能源、人工智能、国企改革等），以分析日为锚点，多概念以逗号分隔。数据源：tushare dc_index/dc_member。注意：北交所(.BJ)股票无 DC 概念数据，此列固定显示 N/A。
 
   industry: |
     申万行业分类（如股份制银行、汽车零部件等），来自 tushare stock_basic。与『通达信行业』为两套独立行业分类体系，可交叉参考。
