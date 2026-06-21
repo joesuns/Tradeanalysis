@@ -10,7 +10,6 @@ TTL: 7-day cache per (trade_date, source, idx_type) tracked via ods_plate_snapsh
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +98,7 @@ def _fetch_members_for_board(client, trade_date: str, board_ts_code: str,
     return members
 
 
-def fetch_plate_data(client, con, trade_date: str, ts_codes: Optional[list[str]] = None) -> dict:
+def fetch_plate_data(client, con, trade_date: str) -> dict:
     """Fetch TDX + DC plate members for a trade_date. TTL-cached; degraded on failure.
 
     Returns dict: {source: {n_boards, n_members, cached, error}}
