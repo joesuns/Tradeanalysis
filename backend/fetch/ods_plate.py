@@ -213,11 +213,14 @@ def load_plate_enrichment(con, trade_date: str) -> dict[str, dict[str, str]]:
 
     # TDX industry plates → tdx_industry_board column
     tdx_rows = con.execute(
-        """SELECT con_code AS ts_code,
-                  STRING_AGG(DISTINCT board_name, ',' ORDER BY board_name) AS boards
-           FROM ods_plate_member
-           WHERE trade_date = ? AND source = 'tdx'
-           GROUP BY con_code""",
+        """SELECT m.con_code AS ts_code,
+                  STRING_AGG(DISTINCT b.board_name, ',' ORDER BY b.board_name) AS boards
+           FROM ods_plate_member m
+           JOIN ods_plate_board b ON m.trade_date = b.trade_date
+               AND m.source = b.source
+               AND m.board_ts_code = b.board_ts_code
+           WHERE m.trade_date = ? AND m.source = 'tdx'
+           GROUP BY m.con_code""",
         [trade_date],
     ).fetchall()
     for ts_code, boards in tdx_rows:
@@ -225,11 +228,14 @@ def load_plate_enrichment(con, trade_date: str) -> dict[str, dict[str, str]]:
 
     # DC concept plates → dc_concept_board column
     dc_rows = con.execute(
-        """SELECT con_code AS ts_code,
-                  STRING_AGG(DISTINCT board_name, ',' ORDER BY board_name) AS boards
-           FROM ods_plate_member
-           WHERE trade_date = ? AND source = 'dc'
-           GROUP BY con_code""",
+        """SELECT m.con_code AS ts_code,
+                  STRING_AGG(DISTINCT b.board_name, ',' ORDER BY b.board_name) AS boards
+           FROM ods_plate_member m
+           JOIN ods_plate_board b ON m.trade_date = b.trade_date
+               AND m.source = b.source
+               AND m.board_ts_code = b.board_ts_code
+           WHERE m.trade_date = ? AND m.source = 'dc'
+           GROUP BY m.con_code""",
         [trade_date],
     ).fetchall()
     for ts_code, boards in dc_rows:
