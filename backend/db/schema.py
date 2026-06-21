@@ -1,7 +1,7 @@
 """
 Complete DDL for the stock analysis data model.
 
-Tables: ODS(10) + DIM(4) + DWD(3) + DWS(10) = 27
+Tables: ODS(11) + DIM(4) + DWD(3) + DWS(12) = 30
 Views: 10 latest views + 4 ADS wide views = 14
 Indexes: DWS(20) + DWD(3) + ODS(3) + DIM(1) = 27
 
@@ -12,7 +12,7 @@ Usage:
 import duckdb
 
 # ============================================================
-# ODS LAYER (10 tables) — Original Data Source, 1:1 tushare
+# ODS LAYER (11 tables) — Original Data Source, 1:1 tushare
 # ============================================================
 
 _ODS_DDL = [
@@ -1038,7 +1038,7 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
 
     Executes: ODS -> DIM -> DWD -> DWS -> Indexes -> Views
     """
-    # ODS (10 tables)
+    # ODS (11 tables)
     for ddl in _ODS_DDL:
         con.execute(ddl)
     _migrate_etl_log(con)
