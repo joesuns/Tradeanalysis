@@ -1,7 +1,7 @@
 """
 Complete DDL for the stock analysis data model.
 
-Tables: ODS(7) + DIM(4) + DWD(3) + DWS(10) = 24
+Tables: ODS(10) + DIM(4) + DWD(3) + DWS(10) = 27
 Views: 10 latest views + 4 ADS wide views = 14
 Indexes: DWS(20) + DWD(3) + ODS(3) + DIM(1) = 27
 
@@ -12,7 +12,7 @@ Usage:
 import duckdb
 
 # ============================================================
-# ODS LAYER (7 tables) — Original Data Source, 1:1 tushare
+# ODS LAYER (10 tables) — Original Data Source, 1:1 tushare
 # ============================================================
 
 _ODS_DDL = [
@@ -93,12 +93,44 @@ _ODS_DDL = [
         pretrade_date  TEXT
     )""",
 
-    # 3.6 ods_concept_detail
+    # 3.6 ods_concept_detail — DEPRECATED (replaced by ods_plate_* tables, 2026-06-21)
     """CREATE TABLE IF NOT EXISTS ods_concept_detail (
         concept_name   TEXT,
         ts_code        TEXT,
         fetched_at     TEXT DEFAULT (now()),
         PRIMARY KEY (concept_name, ts_code)
+    )""",
+
+    # 3.7 ods_plate_snapshot — TTL-tracked plate fetch metadata
+    """CREATE TABLE IF NOT EXISTS ods_plate_snapshot (
+        trade_date     TEXT NOT NULL,
+        source         TEXT NOT NULL,
+        idx_type       TEXT NOT NULL,
+        n_boards       INTEGER,
+        n_members      INTEGER,
+        fetched_at     TEXT NOT NULL DEFAULT (now()),
+        PRIMARY KEY (trade_date, source, idx_type)
+    )""",
+
+    # 3.8 ods_plate_board — plate (board) definitions
+    """CREATE TABLE IF NOT EXISTS ods_plate_board (
+        trade_date     TEXT NOT NULL,
+        source         TEXT NOT NULL,
+        board_ts_code  TEXT NOT NULL,
+        board_name     TEXT,
+        fetched_at     TEXT NOT NULL DEFAULT (now()),
+        PRIMARY KEY (trade_date, source, board_ts_code)
+    )""",
+
+    # 3.9 ods_plate_member — plate member stocks
+    """CREATE TABLE IF NOT EXISTS ods_plate_member (
+        trade_date     TEXT NOT NULL,
+        source         TEXT NOT NULL,
+        board_ts_code  TEXT NOT NULL,
+        con_code       TEXT NOT NULL,
+        con_name       TEXT,
+        fetched_at     TEXT NOT NULL DEFAULT (now()),
+        PRIMARY KEY (trade_date, source, board_ts_code, con_code)
     )""",
 
     # 12.2 ods_etl_log — UUID primary key avoids race conditions with concurrent ETL
@@ -1006,7 +1038,7 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
 
     Executes: ODS -> DIM -> DWD -> DWS -> Indexes -> Views
     """
-    # ODS (7 tables)
+    # ODS (10 tables)
     for ddl in _ODS_DDL:
         con.execute(ddl)
     _migrate_etl_log(con)
@@ -1156,8 +1188,9 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
         + ["dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
         # DIM (4) — FK tables first
         + ["dim_concept_stock", "dim_concept", "dim_date", "dim_stock"]
-        # ODS (7)
-        + ["ods_etl_log", "ods_calc_skip_log", "ods_concept_detail", "ods_trade_cal",
+        # ODS (10)
+        + ["ods_etl_log", "ods_calc_skip_log", "ods_plate_member", "ods_plate_board", "ods_plate_snapshot",
+           "ods_concept_detail", "ods_trade_cal",
            "ods_moneyflow", "ods_daily_basic", "ods_daily", "ods_stock_basic"]
     )
     for table in _all_tables:
