@@ -1,7 +1,7 @@
 """B4 column registry: extract 14 cols; hard gate 10 cols vs 123.
 
 ``ma_alignment`` / ``w_ma_alignment`` — TA-native MA5/MA10 regime (not 123).
-``dde_alert`` / ``w_dde_alert`` — TA-native 2-bar DDX2 inflection (not 123 5-bar).
+``dde_alert`` / ``w_dde_alert`` — TA-native 3-bar DDX2 inflection (not 123 5-bar).
 """
 from typing import Dict, List
 

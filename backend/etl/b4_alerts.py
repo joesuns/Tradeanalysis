@@ -66,6 +66,10 @@ def compute_ddx2_slope_alerts(
 ) -> List[Optional[str]]:
     """Per-bar DDX2 slope inflection alerts (123 ``_eval_ddx2_slope_reversal``).
 
+    Adjacent-window slope comparison: s_prev = slope of window bars ending at i-1,
+    s_now = slope of window bars ending at i.  Window=3 gives 67% segment overlap
+    (33% new info per bar), balancing responsiveness against noise rejection.
+
     Returns TA enums:
     - downturn_reverse: 下降趋势反弹（斜率由负转正，看多）
     - upturn_reverse: 上升趋势回落（斜率由正转负，看空）
