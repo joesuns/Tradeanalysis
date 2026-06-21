@@ -77,8 +77,8 @@ MACD_ALERT_123_TO_TA: Dict[str, str] = {
 }
 
 DDE_ALERT_123_TO_TA: Dict[str, str] = {
-    "斜率拐头看多": "upturn_reverse",
-    "斜率拐头看空": "downturn_reverse",
+    "斜率拐头看多": "downturn_reverse",
+    "斜率拐头看空": "upturn_reverse",
     "downturn_reverse": "downturn_reverse",
     "downturn_flat": "downturn_flat",
     "upturn_reverse": "upturn_reverse",
