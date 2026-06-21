@@ -131,6 +131,31 @@ def cmd_fetch(args):
                 start, end, workers=3, ts_codes=codes, con=con
             )
             mode = "date"
+
+        # Plate (board/concept) data — low priority, skip on failure
+        from backend.fetch.ods_plate import fetch_plate_data
+        from datetime import datetime as _dt
+
+        try:
+            plate_date = _dt.now().strftime("%Y%m%d")
+            plate_lid, plate_t0 = log_etl_start(con, "cli_fetch_plate")
+            try:
+                plate_results = fetch_plate_data(client, con, plate_date)
+                total_members = sum(
+                    r.get("n_members", 0) for r in plate_results.values()
+                )
+                log_etl_end(
+                    con, plate_lid, "cli_fetch_plate", plate_t0, "success",
+                    row_count=total_members,
+                )
+            except Exception as e:
+                log_etl_end(
+                    con, plate_lid, "cli_fetch_plate", plate_t0, "degraded",
+                    error_msg=f"skipped: {e}",
+                )
+        except Exception:
+            pass  # defensive: plate fetch must never block fetch
+
         rows_written = int(n)
         completeness = {"mode": mode, "start": start, "end": end}
         if hasattr(n, "to_completeness"):
@@ -534,6 +559,30 @@ def _cmd_run_single_day(args, date: str):
                 calc_routes_narrowed=narrowed,
                 active_routes=active_route_keys(indicator_filter),
             )
+
+        # Plate (board/concept) fetch — low priority, degrade on failure
+        from backend.fetch.ods_plate import fetch_plate_data
+
+        try:
+            plate_client = TushareClient()
+            plate_lid, plate_t0 = log_etl_start(con, "run_fetch_plate")
+            try:
+                plate_results = fetch_plate_data(plate_client, con, date)
+                total_members = sum(
+                    r.get("n_members", 0) for r in plate_results.values()
+                )
+                log_etl_end(
+                    con, plate_lid, "run_fetch_plate", plate_t0, "success",
+                    row_count=total_members,
+                )
+            except Exception as e:
+                log_etl_end(
+                    con, plate_lid, "run_fetch_plate", plate_t0, "degraded",
+                    error_msg=f"skipped: {e}",
+                )
+        except Exception:
+            pass  # defensive: plate fetch must never block run
+
     finally:
         con.close()
 
