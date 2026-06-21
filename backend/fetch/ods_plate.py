@@ -104,6 +104,7 @@ def fetch_plate_data(client, con, trade_date: str) -> dict:
     Returns dict: {source: {n_boards, n_members, cached, error}}
     """
     results = {}
+    ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for source, cfg in _PLATE_SOURCES.items():
         idx_type = cfg["idx_type"]
         result = {"n_boards": 0, "n_members": 0, "cached": False, "error": None}
@@ -146,17 +147,17 @@ def fetch_plate_data(client, con, trade_date: str) -> dict:
                     con.execute(
                         """INSERT OR REPLACE INTO ods_plate_board
                            (trade_date, source, board_ts_code, board_name, fetched_at)
-                           VALUES (?, ?, ?, ?, now())""",
-                        [trade_date, source, b["board_ts_code"], b["board_name"]],
+                           VALUES (?, ?, ?, ?, ?)""",
+                        [trade_date, source, b["board_ts_code"], b["board_name"], ts_now],
                     )
                     # UPSERT members
                     for m in members:
                         con.execute(
                             """INSERT OR REPLACE INTO ods_plate_member
                                (trade_date, source, board_ts_code, con_code, con_name, fetched_at)
-                               VALUES (?, ?, ?, ?, ?, now())""",
+                               VALUES (?, ?, ?, ?, ?, ?)""",
                             [trade_date, source, b["board_ts_code"],
-                             m["con_code"], m["con_name"]],
+                             m["con_code"], m["con_name"], ts_now],
                         )
                         total_members += 1
                 except Exception as e:
@@ -179,8 +180,8 @@ def fetch_plate_data(client, con, trade_date: str) -> dict:
             con.execute(
                 """INSERT OR REPLACE INTO ods_plate_snapshot
                    (trade_date, source, idx_type, n_boards, n_members, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, now())""",
-                [trade_date, source, idx_type, len(boards), total_members],
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [trade_date, source, idx_type, len(boards), total_members, ts_now],
             )
 
             elapsed = time.monotonic() - t_start
