@@ -1188,7 +1188,7 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
         + ["dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
         # DIM (4) — FK tables first
         + ["dim_concept_stock", "dim_concept", "dim_date", "dim_stock"]
-        # ODS (10)
+        # ODS (11)
         + ["ods_etl_log", "ods_calc_skip_log", "ods_plate_member", "ods_plate_board", "ods_plate_snapshot",
            "ods_concept_detail", "ods_trade_cal",
            "ods_moneyflow", "ods_daily_basic", "ods_daily", "ods_stock_basic"]
