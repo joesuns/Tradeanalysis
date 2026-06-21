@@ -170,6 +170,14 @@ def _attach_header_comment(cell, col_key, weekly=False):
     width, height = comment_box_size()
     cell.comment = Comment(text, comment_author(), width=width, height=height)
 
+# Shared alert enum labels — macd_alert and dde_alert use identical translations.
+_ALERT_LABELS = {
+    "upturn_reverse": "上升趋势回落",
+    "downturn_reverse": "下降趋势反弹",
+    "upturn_flat": "上升趋势走平",
+    "downturn_flat": "下降趋势走平",
+}
+
 # Enum value translations (English → Chinese). NULL = no signal, shown as "-"
 _ENUM_VALUES = {
     "kpattern": {"yang_bao_yin": "阳包阴", "yang_ke_yin": "阳克阴",
@@ -185,14 +193,14 @@ _ENUM_VALUES = {
     "macd_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "macd_divergence_tradable": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "macd_divergence_reject": {"skip_peak": "隔峰", "tg_lag": "滞后", "zone_mismatch": "区域"},
-    "macd_alert": {"upturn_reverse": "上升趋势回落", "downturn_reverse": "下降趋势反弹"},
+    "macd_alert": _ALERT_LABELS,
     "ma_turning_point": {"golden_cross": "金叉", "dead_cross": "死叉",
                          "near_golden": "近金叉", "near_dead": "近死叉"},
     "dde_trend": {"up": "上升", "down": "下降", "flat": "走平"},
     "dde_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "dde_divergence_tradable": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "dde_divergence_reject": {"skip_peak": "隔峰", "tg_lag": "滞后", "zone_mismatch": "区域"},
-    "dde_alert": {"upturn_reverse": "上升趋势回落", "downturn_reverse": "下降趋势反弹"},
+    "dde_alert": _ALERT_LABELS,
     "vol_zone": {"explosive": "爆量", "low_volume": "地量", "normal": "正常"},
     "vol_trend": {"expanding": "放量", "shrinking": "缩量", "flat": "平量"},
     "vol_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
