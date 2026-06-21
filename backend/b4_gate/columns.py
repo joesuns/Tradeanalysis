@@ -20,7 +20,8 @@ B4_WEEKLY_FIELDS: List[str] = list(B4_DAILY_FIELDS)
 
 B4_WEEKLY_PREFIX = "w_"
 
-# Soft layer: still extracted for Excel/audit, never diffed vs 123 or golden gate.
+# TA-native with different window than 123 — excluded from hard-gate diff
+# (dde_alert: TA 2-bar ≠ 123 5-bar; ma_alignment: TA regime ≠ 123)
 B4_SOFT_DAILY_FIELDS: List[str] = ["ma_alignment", "dde_alert"]
 
 B4_HARD_DAILY_FIELDS: List[str] = [
