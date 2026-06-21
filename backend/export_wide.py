@@ -231,6 +231,8 @@ _STATE_METRIC_COLS = {
     "price_position_60d", "price_position_120d", "price_position_250d",
 }
 _FUNDAMENTAL_NA_COLS = {"pe_ttm"}
+# Classification columns — stock attributes not derived from signals; null → "N/A"
+_PLATE_CLASSIFICATION_COLS = {"tdx_industry_board", "dc_concept_board"}
 # Backward-compatible union for highlight logic
 _SIGNAL_COLS = _EVENT_SIGNAL_COLS | _STATE_METRIC_COLS | _FUNDAMENTAL_NA_COLS
 
