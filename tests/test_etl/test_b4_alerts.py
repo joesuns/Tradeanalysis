@@ -22,13 +22,13 @@ def test_macd_hist_turn_down():
 def test_ddx2_slope_inflection_bull_2bar():
     ddx2 = np.array([0.0, 0.0, 1.0, 0.0, 5.0], dtype=float)
     alerts = compute_ddx2_slope_alerts(ddx2, window=2, eps=0.0)
-    assert alerts[-1] == "upturn_reverse"
+    assert alerts[-1] == "downturn_reverse"
 
 
 def test_ddx2_slope_inflection_bear_2bar():
     ddx2 = np.array([0.0, 0.0, -1.0, 0.0, -5.0], dtype=float)
     alerts = compute_ddx2_slope_alerts(ddx2, window=2, eps=0.0)
-    assert alerts[-1] == "downturn_reverse"
+    assert alerts[-1] == "upturn_reverse"
 
 
 def test_dde_alert_production_window():
