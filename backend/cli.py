@@ -80,9 +80,14 @@ def cmd_check(_args):
     from backend.db.connection import check_connectivity
     from backend.fetch.client import TushareClient
 
+    # Orphan temp cleanup happens automatically in get_connection()
     db = check_connectivity()
     print(f"DuckDB: {db['duckdb']} (v{db['version']})")
-    print(f"Disk free: {db['disk_free_mb']} MB | DB size: {db['db_size_mb']} MB")
+    print(f"Disk free: {db['disk_free_mb']:,} MB | DB size: {db['db_size_mb']:,} MB")
+    print(f"Temp disk free: {db.get('temp_disk_free_mb', '?'):,} MB")
+    if db.get('backup_count', 0) > 0:
+        print(f"Old backups: {db.get('backup_count', 0)} files "
+              f"({db.get('backup_size_mb', 0):,} MB)")
     try:
         TushareClient().call("stock_basic", exchange="", list_status="L", limit=1)
         print("tushare: connected")
@@ -789,8 +794,34 @@ def cmd_prune(args):
     latest-per-key value for every (ts_code, trade_date) is always kept,
     so v_*_latest views are unchanged. Runs a CHECKPOINT afterwards to
     reclaim space within the database file.
+
+    With --cleanup-backups: remove old pre-* DuckDB backup files
+    instead of DWS pruning, retaining the most recent N (default 2,
+    via PRUNE_KEEP_BACKUPS).
     """
-    from backend.db.connection import get_connection, prune_dws_snapshots, run_checkpoint
+    from backend.db.connection import get_connection, prune_dws_snapshots, run_checkpoint, cleanup_backup_files
+    from backend.config import DUCKDB_PATH
+    import os
+
+    if args.cleanup_backups:
+        data_dir = os.path.dirname(os.path.abspath(DUCKDB_PATH)) or "."
+        result = cleanup_backup_files(data_dir, keep=args.keep_backups, dry_run=args.dry_run)
+        if args.dry_run:
+            if result["deleted"]:
+                print(f"Would delete {len(result['deleted'])} backup(s) "
+                      f"({result['freed_mb']:,} MB):")
+                for name in result["deleted"]:
+                    print(f"  - {name}")
+                print(f"Would retain: {', '.join(result['retained']) or 'none'}")
+            else:
+                print(f"No backup files to clean (retained: {result.get('retained', [])})")
+            return
+        if result["deleted"]:
+            print(f"Deleted {len(result['deleted'])} backup(s) "
+                  f"({result['freed_mb']:,} MB freed)")
+        else:
+            print("No old backup files to delete")
+        return
 
     con = get_connection()
     try:
@@ -1167,8 +1198,16 @@ def _add_refresh_state_args(p):
 
 
 def _add_prune_args(p):
-    p.add_argument("--keep", type=int, default=5,
-                   help="Number of most recent calc runs to retain (default 5)")
+    from backend.config import DWS_PRUNE_KEEP_RUNS
+    p.add_argument("--keep", type=int, default=DWS_PRUNE_KEEP_RUNS,
+                   help=f"Number of most recent calc runs to retain "
+                        f"(default {DWS_PRUNE_KEEP_RUNS}, env DWS_PRUNE_KEEP_RUNS)")
+    p.add_argument("--cleanup-backups", action="store_true",
+                   help="Remove old pre-* DuckDB backup files instead of DWS pruning")
+    p.add_argument("--keep-backups", type=int, default=None,
+                   help="Backup files to retain (default: PRUNE_KEEP_BACKUPS=2)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Preview cleanup-backups without deleting")
 
 
 def _add_repair_weekly_args(p):

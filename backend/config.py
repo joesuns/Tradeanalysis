@@ -39,6 +39,9 @@ CALC_BATCH_FULL = os.getenv("CALC_BATCH_FULL", "1").strip() != "0"
 CALC_FAST_SKIP = os.getenv("CALC_FAST_SKIP", "1").strip() != "0"
 # CALC_SKIP_STATE_REFRESH: skip dws_calc_state UPSERT when history_fp unchanged on same calc_date
 CALC_SKIP_STATE_REFRESH = os.getenv("CALC_SKIP_STATE_REFRESH", "1").strip() != "0"
+# CALC_RECOVER_STATE: recover missing dws_calc_state from DWS data rows on cold preflight
+# path, avoiding spurious FULL recalculation after an interrupted calc run.
+CALC_RECOVER_STATE = os.getenv("CALC_RECOVER_STATE", "1").strip() != "0"
 # CALC_SKIP_LOG_VERBOSE: 1=每股写入 skip_log；0=同批 fingerprint_match 只写摘要行
 CALC_SKIP_LOG_VERBOSE = os.getenv("CALC_SKIP_LOG_VERBOSE", "0").strip() != "0"
 # CALC_STRICT_DATE: when on (default), reject calc_date > MAX(ods_daily). =0 caps to ods_max.
@@ -72,5 +75,20 @@ CALC_COLUMN_NARROW = os.getenv("CALC_COLUMN_NARROW", "1").strip() != "0"
 CALC_AUTO_SPEC_REFRESH = os.getenv("CALC_AUTO_SPEC_REFRESH", "1").strip() != "0"
 # EXPORT_SPEC_GATE: when on, export logs WARNING if state/DWS spec lags code (non-blocking).
 EXPORT_SPEC_GATE = os.getenv("EXPORT_SPEC_GATE", "0").strip() == "1"
+# DuckDB temp directory for out-of-core spill files.
+# Relative paths are resolved against the database directory (DUCKDB_PATH dir).
+# Default "tmp" → ./data/tmp/ next to the database file.
+DUCKDB_TEMP_DIRECTORY = os.getenv("DUCKDB_TEMP_DIRECTORY", "tmp")
+# DuckDB max memory in MB before spilling to temp_directory (default 4096 = 4 GiB).
+# Lower values spill earlier → smaller temp files, but may slow down large queries.
+DUCKDB_MAX_MEMORY_MB = int(os.getenv("DUCKDB_MAX_MEMORY_MB", "4096"))
+# Minimum free disk space (MB) on the data directory before pipeline start is refused.
+# Below this threshold, the pipeline aborts early instead of crashing mid-run.
+MIN_DISK_FREE_MB = int(os.getenv("MIN_DISK_FREE_MB", "5120"))
+# Number of old pre-* DuckDB backup files to retain during prune --cleanup-backups.
+PRUNE_KEEP_BACKUPS = int(os.getenv("PRUNE_KEEP_BACKUPS", "2"))
+# Number of most recent calc_date snapshots to retain during DWS pruning.
+# Mirrors the CLI --keep default; override-able for cron/automation.
+DWS_PRUNE_KEEP_RUNS = int(os.getenv("DWS_PRUNE_KEEP_RUNS", "2"))
 # DuckDB single-file lock forbids multi-process writes, so calc parallelism is
 # thread-based (shared in-process instance), not multiprocessing.

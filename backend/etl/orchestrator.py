@@ -93,7 +93,7 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
     """
     con = get_connection()
     try:
-        # 0. Self-check
+        # 0. Self-check (orphan temp cleanup happens automatically inside get_connection)
         health = check_connectivity()
         lid, t0 = log_etl_start(con, "health_check")
         if "fatal" in health.get("duckdb", ""):
@@ -965,13 +965,10 @@ def _calc_full_work_chunk(
     batch_ctx: Optional[dict] = None,
 ) -> int:
     """Worker: run FULL calc for indicator-level work items in a dedicated connection."""
-    import duckdb
-    from backend.config import DUCKDB_PATH
-
     if not work_items:
         return 0
 
-    con = duckdb.connect(DUCKDB_PATH)
+    con = get_connection()
     try:
         if incremental:
             daily_recalc = resolve_recalc_start(con, calc_date, "daily")
@@ -1077,10 +1074,7 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                       incremental: bool = True,
                       batch_ctx: Optional[dict] = None) -> int:
     """Worker: run all calculators for one stock chunk in a dedicated connection."""
-    import duckdb
-    from backend.config import DUCKDB_PATH
-
-    con = duckdb.connect(DUCKDB_PATH)
+    con = get_connection()
     try:
         if incremental:
             daily_recalc = resolve_recalc_start(con, calc_date, "daily")

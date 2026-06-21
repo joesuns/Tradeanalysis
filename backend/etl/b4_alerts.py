@@ -42,8 +42,8 @@ def compute_macd_hist_turn_alerts(macd_bar: np.ndarray) -> List[Optional[str]]:
     """Per-bar MACD histogram turn alerts (123 ``_eval_macd_hist_turn``).
 
     Returns TA enums:
-    - downturn_reverse: 柱线拐上 (h[i] > h[i-1] < h[i-2])
-    - upturn_reverse: 柱线拐下 (h[i] < h[i-1] > h[i-2])
+    - downturn_reverse: 下降趋势反弹（V 形，h[i-1] 为局部最小值，看多）
+    - upturn_reverse: 上升趋势回落（Λ 形，h[i-1] 为局部最大值，看空）
     """
     bar = np.asarray(macd_bar, dtype=float)
     n = len(bar)
