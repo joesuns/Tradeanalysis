@@ -299,6 +299,7 @@ def export_wide_to_excel(
     filter_st: bool = True,
     include_index: bool = True,
     ts_codes: list[str] = None,  # 可选，只导出指定股票
+    portfolio_stocks: list[dict] = None,  # [{"stockcode","stockname"}, ...]
 ) -> ExportResult:
     """Export horizontal daily+weekly merged analysis to Excel.
 
@@ -439,7 +440,7 @@ def export_wide_to_excel(
     logger.info("progress export: building sheets | rows=%d", len(merged))
     wb = Workbook()
     wb.remove(wb.active)
-    # ---- Signal-only analysis sheet (first sheet) ----
+    # ---- Signal-only analysis sheet layout (reused by portfolio) ----
     _signal_set = set(_SIGNAL_ONLY)
     daily_signal_only = [c for c in _SIGNAL_ONLY if c in daily_cols] + [
         c for c in daily_cols if c in basic_cols_outer and c not in _signal_set
@@ -450,8 +451,99 @@ def export_wide_to_excel(
     layout_signal = _resolve_sheet_layout(
         daily_signal_only, weekly_signal_only, merged.columns,
     )
-    display_signal = display_full[layout_signal.display_cols]
 
+    # ---- Portfolio sheet (first sheet, if portfolio_stocks provided) ----
+    if portfolio_stocks:
+        portfolio_codes = [s["stockcode"] for s in portfolio_stocks]
+        portfolio_name_map = {s["stockcode"]: s["stockname"] for s in portfolio_stocks}
+
+        # Filter merged data to portfolio stocks via stock_code column
+        if "stock_code" in merged.columns:
+            portfolio_df = merged[merged["stock_code"].isin(portfolio_codes)].copy()
+        else:
+            portfolio_df = merged[merged["ts_code"].isin(portfolio_codes)].copy()
+
+        # Detect which portfolio stocks have data
+        daily_stock_codes = set(portfolio_df["stock_code"].tolist()) if "stock_code" in portfolio_df.columns else set()
+
+        # Resolve remarks for ALL portfolio stocks
+        remarks = _resolve_portfolio_remarks(
+            con, portfolio_codes, trade_date, daily_stock_codes,
+        )
+
+        # Build placeholder rows for missing portfolio stocks
+        missing_codes = [c for c in portfolio_codes if c not in daily_stock_codes]
+        if missing_codes:
+            placeholder_rows = []
+            for code in missing_codes:
+                row = {col: None for col in layout_signal.display_cols}
+                row["stock_code"] = code
+                row["stock_name"] = portfolio_name_map.get(code, code)
+                row["ts_code"] = ""
+                placeholder_rows.append(row)
+            placeholder_df = pd.DataFrame(placeholder_rows)
+            # Ensure all display columns exist
+            for col in layout_signal.display_cols:
+                if col not in placeholder_df.columns:
+                    placeholder_df[col] = None
+            placeholder_df = placeholder_df[layout_signal.display_cols]
+            # Apply display nulls to placeholder rows
+            placeholder_df = apply_display_nulls(placeholder_df)
+            # Combine: data rows first, then placeholder rows
+            portfolio_display = pd.concat(
+                [portfolio_df[layout_signal.display_cols], placeholder_df],
+                ignore_index=True,
+            )
+        else:
+            portfolio_display = portfolio_df[layout_signal.display_cols]
+
+        # Apply display transformations to the portfolio subset
+        portfolio_display = _transform_display_values(portfolio_display)
+
+        # Append remark column
+        if "stock_code" in portfolio_df.columns:
+            data_codes = portfolio_df["stock_code"].tolist()
+        else:
+            data_codes = []
+        all_codes = data_codes + missing_codes
+        remark_values = [remarks.get(c, "") for c in all_codes]
+        portfolio_display["备注"] = remark_values
+
+        # Build layout for portfolio (same as signal, "备注" as trailing non-signal column)
+        portfolio_layout = SheetLayout(
+            display_cols=layout_signal.display_cols + ["备注"],
+            chinese_names=layout_signal.chinese_names + ["备注"],
+            basic_cols=layout_signal.basic_cols,
+            daily_signal=layout_signal.daily_signal,
+            weekly_signal=layout_signal.weekly_signal,
+            basic_names=layout_signal.basic_names,
+            daily_names=layout_signal.daily_names,
+            weekly_names=layout_signal.weekly_names,
+            n_basic=layout_signal.n_basic,
+            n_daily=layout_signal.n_daily,
+            n_weekly=layout_signal.n_weekly,
+        )
+
+        _write_sheet_from_display(wb, "持仓股分析", portfolio_display, portfolio_layout)
+
+        # Patch header for remark column (last column, merged rows 1-2 like basic cols)
+        ws = wb["持仓股分析"]
+        remark_col = layout_signal.n_basic + layout_signal.n_daily + layout_signal.n_weekly + 1
+        ws.merge_cells(start_row=1, start_column=remark_col, end_row=2, end_column=remark_col)
+        remark_cell = ws.cell(row=1, column=remark_col, value="备注")
+        remark_cell.font = Font(name="微软雅黑", color="FFFFFF", size=10)
+        remark_cell.fill = PatternFill(start_color=_BASIC_HEADER_FILL, end_color=_BASIC_HEADER_FILL, fill_type="solid")
+        remark_cell.alignment = Alignment(horizontal="center", vertical="center")
+        remark_cell.border = Border(bottom=Side(style="thin", color="5D6D7E"))
+        for r in (1, 2):
+            c2 = ws.cell(row=r, column=remark_col)
+            c2.fill = PatternFill(start_color=_BASIC_HEADER_FILL, end_color=_BASIC_HEADER_FILL, fill_type="solid")
+            c2.font = Font(name="微软雅黑", color="FFFFFF", size=10)
+            c2.alignment = Alignment(horizontal="center", vertical="center")
+            c2.border = Border(bottom=Side(style="thin", color="5D6D7E"))
+
+    # ---- Signal-only analysis sheet ----
+    display_signal = display_full[layout_signal.display_cols]
     _write_sheet_from_display(wb, "综合分析", display_signal, layout_signal)
     _write_sheet_from_display(wb, "个股分析", display_full, layout_full)
 
