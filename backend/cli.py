@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 import uuid
 import warnings
@@ -225,6 +226,66 @@ def cmd_calc(args, skip_stale_fetch=False):
         )
     finally:
         con.close()
+
+
+def _load_portfolio_stocks(filepath=None):
+    """Load portfolio stock list from xlsx file.
+
+    Auto-detects ``持仓股列表.xlsx`` in cwd if no path given.
+    Returns list of dicts with keys ``stockcode`` and ``stockname``.
+    Returns empty list on missing file, bad format, or missing columns.
+    """
+    if filepath is None:
+        filepath = os.path.join(os.getcwd(), "持仓股列表.xlsx")
+
+    if not os.path.exists(filepath):
+        logger.warning("portfolio file not found: %s", filepath)
+        return []
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        logger.warning("openpyxl not available; skipping portfolio load")
+        return []
+
+    try:
+        wb = load_workbook(filepath, read_only=True)
+        ws = wb.active
+    except Exception as exc:
+        logger.warning("failed to open portfolio file %s: %s", filepath, exc)
+        return []
+
+    # Read header row
+    rows = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    if not rows:
+        wb.close()
+        return []
+
+    header = [str(c).strip().lower() if c else "" for c in rows[0]]
+
+    try:
+        code_idx = header.index("stockcode")
+        name_idx = header.index("stockname")
+    except ValueError:
+        logger.warning(
+            "portfolio file missing required columns (stockcode, stockname); got %s",
+            header,
+        )
+        wb.close()
+        return []
+
+    result = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) <= max(code_idx, name_idx):
+            continue
+        code = str(row[code_idx]).strip() if row[code_idx] is not None else ""
+        name = str(row[name_idx]).strip() if row[name_idx] is not None else ""
+        if code and name:
+            result.append({"stockcode": code, "stockname": name})
+
+    wb.close()
+    logger.info("loaded %d portfolio stocks from %s", len(result), filepath)
+    return result
 
 
 # ── export ──
