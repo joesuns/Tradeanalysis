@@ -311,6 +311,7 @@ def cmd_export(args):
 
     db_path = args.db_path or "data/tradeanalysis.duckdb"
     ts_codes = args.ts_code if args.ts_code else None
+    portfolio_stocks = _load_portfolio_stocks(getattr(args, "portfolio_file", None))
     outputs = []
 
     for trade_date in dates:
@@ -322,6 +323,7 @@ def cmd_export(args):
             filter_st=not args.include_st,
             include_index=not args.no_index,
             ts_codes=ts_codes,
+            portfolio_stocks=portfolio_stocks or None,
         )
         _warn_export_coverage(
             db_path, trade_date, result.row_count,
@@ -662,6 +664,8 @@ def _cmd_run_single_day(args, date: str):
         logger.info("=== Step 3/3: Exporting analysis for %s ===", date)
         args.output = default_export_path(date, args.output)
 
+        portfolio_stocks = _load_portfolio_stocks(getattr(args, "portfolio_file", None))
+
         con = get_connection()
         try:
             lid, t0 = log_etl_start(con, "run_export")
@@ -672,6 +676,7 @@ def _cmd_run_single_day(args, date: str):
                 filter_st=not args.include_st,
                 include_index=not args.no_index,
                 ts_codes=ts_codes,
+                portfolio_stocks=portfolio_stocks or None,
             )
             log_etl_end(
                 con, lid, "run_export", t0, "success", row_count=result.row_count,
@@ -1460,6 +1465,8 @@ def main():
     xp.add_argument("--db-path")
     xp.add_argument("--include-st", action="store_true")
     xp.add_argument("--no-index", action="store_true")
+    xp.add_argument("--portfolio-file", default=None,
+                    help="Path to portfolio stock list xlsx (default: 持仓股列表.xlsx in cwd)")
 
     # query
     qp = sp.add_parser("query", help="Query DWS indicators")
@@ -1481,6 +1488,8 @@ def main():
                     help="Skip Excel export (same-day rerun when report unchanged)")
     rp.add_argument("--continue-on-error", action="store_true",
                     help="With --from/--to: continue after a failed day (default: fail-fast)")
+    rp.add_argument("--portfolio-file", default=None,
+                    help="Path to portfolio stock list xlsx (default: 持仓股列表.xlsx in cwd)")
 
     # refresh
     rfp = sp.add_parser(
