@@ -13,7 +13,7 @@ class TestSnapshotFreshness:
 
         con = MagicMock()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        con.execute.return_value.fetchone.return_value = [now_str]
+        con.execute.return_value.fetchone.return_value = [now_str, 183]
 
         assert _is_snapshot_fresh(con, "20260620", "tdx", "行业板块") is True
 
@@ -23,7 +23,7 @@ class TestSnapshotFreshness:
 
         con = MagicMock()
         stale = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
-        con.execute.return_value.fetchone.return_value = [stale]
+        con.execute.return_value.fetchone.return_value = [stale, 183]
 
         assert _is_snapshot_fresh(con, "20260620", "tdx", "行业板块") is False
 
@@ -45,7 +45,7 @@ class TestSnapshotFreshness:
         stale = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
 
         # First call → fresh, second call → stale
-        con.execute.return_value.fetchone.side_effect = [[now_str], [stale]]
+        con.execute.return_value.fetchone.side_effect = [[now_str, 183], [stale, 500]]
 
         assert _is_snapshot_fresh(con, "20260620", "tdx", "行业板块") is True
         assert _is_snapshot_fresh(con, "20260620", "dc", "概念板块") is False
@@ -56,7 +56,7 @@ class TestSnapshotFreshness:
 
         con = MagicMock()
         stale_4d = (datetime.now() - timedelta(days=4)).strftime("%Y-%m-%d %H:%M:%S")
-        con.execute.return_value.fetchone.return_value = [stale_4d]
+        con.execute.return_value.fetchone.return_value = [stale_4d, 500]
 
         assert _is_snapshot_fresh(con, "20260620", "dc", "概念板块", ttl_days=3) is False
 
@@ -66,7 +66,7 @@ class TestSnapshotFreshness:
 
         con = MagicMock()
         fresh_2d = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
-        con.execute.return_value.fetchone.return_value = [fresh_2d]
+        con.execute.return_value.fetchone.return_value = [fresh_2d, 500]
 
         assert _is_snapshot_fresh(con, "20260620", "dc", "概念板块", ttl_days=3) is True
 
@@ -76,6 +76,34 @@ class TestSnapshotFreshness:
 
         assert _PLATE_SOURCES["tdx"]["ttl_days"] == 7
         assert _PLATE_SOURCES["dc"]["ttl_days"] == 3
+
+    def test_zero_boards_is_stale(self):
+        """Snapshot with n_boards=0 is NEVER considered fresh.
+
+        An empty result at fetch time (e.g. queried before market close on a
+        trading day, or on a weekend) does not guarantee the API will still
+        return empty later. Such snapshots must be retried on every run.
+        """
+        from backend.fetch.ods_plate import _is_snapshot_fresh
+
+        con = MagicMock()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # fetched_at is within TTL, but n_boards=0 → must be stale
+        con.execute.return_value.fetchone.return_value = [now_str, 0]
+
+        assert _is_snapshot_fresh(con, "20260620", "tdx", "行业板块") is False
+
+    def test_zero_boards_stale_regardless_of_ttl(self):
+        """n_boards=0 stale even with a long TTL and fresh fetched_at."""
+        from backend.fetch.ods_plate import _is_snapshot_fresh
+
+        con = MagicMock()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # n_boards=0 must be stale regardless of TTL
+        con.execute.return_value.fetchone.return_value = [now_str, 0]
+
+        # Use a long TTL to prove it's not a timing issue
+        assert _is_snapshot_fresh(con, "20260620", "dc", "概念板块", ttl_days=30) is False
 
 
 class TestLoadPlateEnrichment:

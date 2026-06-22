@@ -40,16 +40,24 @@ _PLATE_SOURCES = {
 
 def _is_snapshot_fresh(con, trade_date: str, source: str, idx_type: str,
                        ttl_days: int = 7) -> bool:
-    """Check if a valid snapshot exists within *ttl_days* for (trade_date, source, idx_type)."""
+    """Check if a valid snapshot exists within *ttl_days* for (trade_date, source, idx_type).
+
+    Returns False for snapshots with n_boards=0 — an empty result at fetch time
+    does not guarantee the API will still return empty later (e.g. queried before
+    market close on a trading day, or on a weekend).
+    """
     cutoff = (datetime.now() - timedelta(days=ttl_days)).strftime("%Y-%m-%d %H:%M:%S")
     row = con.execute(
-        """SELECT fetched_at FROM ods_plate_snapshot
+        """SELECT fetched_at, n_boards FROM ods_plate_snapshot
            WHERE trade_date = ? AND source = ? AND idx_type = ?""",
         [trade_date, source, idx_type]
     ).fetchone()
     if row is None:
         return False
-    return row[0] >= cutoff
+    fetched_at, n_boards = row
+    if n_boards == 0:
+        return False
+    return fetched_at >= cutoff
 
 
 def _count_members_for_date(con, trade_date: str, source: str) -> int:
