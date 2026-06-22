@@ -141,6 +141,48 @@ _SIGNAL_ONLY = [
 ]
 
 
+def _resolve_portfolio_remarks(
+    con,
+    portfolio_codes: "List[str]",
+    trade_date: str,
+    daily_stock_codes: "set",
+) -> "Dict[str, str]":
+    """Resolve remark for each portfolio stock based on data presence.
+
+    Returns:
+        Dict mapping stock_code → remark label:
+        - ``"正常"`` — stock has daily data for trade_date
+        - ``"已退市"`` — stock in dim_stock with delist_date < trade_date
+        - ``"当日无数据（可能停牌）"`` — in dim_stock, not delisted, no daily data
+        - ``"未入库"`` — not in dim_stock at all
+    """
+    if not portfolio_codes:
+        return {}
+
+    placeholders = ",".join(["?" for _ in portfolio_codes])
+    dim_rows = con.execute(
+        f"SELECT stock_code, delist_date FROM dim_stock WHERE stock_code IN ({placeholders})",
+        portfolio_codes,
+    ).fetchall()
+
+    dim_map: dict = {}
+    for stock_code, delist_date in dim_rows:
+        dim_map[stock_code] = delist_date
+
+    result = {}
+    for code in portfolio_codes:
+        if code in daily_stock_codes:
+            result[code] = "正常"
+        elif code not in dim_map:
+            result[code] = "未入库"
+        elif dim_map[code] and str(dim_map[code]) < trade_date:
+            result[code] = "已退市"
+        else:
+            result[code] = "当日无数据（可能停牌）"
+
+    return result
+
+
 def _reorder_vol_signal(cols):
     """Place vol_signal adjacent to vol_divergence (fallback: after vol_trend)."""
     if "vol_signal" not in cols:
@@ -718,3 +760,5 @@ def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     """Write merged daily+weekly DataFrame with two-row header and zebra-striped data rows."""
     display, layout = _build_merged_display_df(df, daily_cols, weekly_cols)
     _write_sheet_from_display(wb, sheet_name, display, layout)
+
+
