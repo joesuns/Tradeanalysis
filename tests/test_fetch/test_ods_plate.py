@@ -128,6 +128,7 @@ class TestLoadPlateEnrichment:
         con.execute.return_value.fetchall.side_effect = [
             [("000001.SZ", "银行,金融")],   # TDX
             [("000001.SZ", "央企改革,深证100")],  # DC
+            [],                            # DC theme: none
         ]
 
         result = load_plate_enrichment(con, "20260620")
@@ -142,6 +143,7 @@ class TestLoadPlateEnrichment:
         con.execute.return_value.fetchall.side_effect = [
             [("830001.BJ", "制造业")],  # TDX
             [],                         # DC: no data for BSE stocks
+            [],                         # DC theme: no data for BSE stocks
         ]
 
         result = load_plate_enrichment(con, "20260620")
@@ -156,6 +158,7 @@ class TestLoadPlateEnrichment:
         con.execute.return_value.fetchall.side_effect = [
             [("000001.SZ", "银行"), ("000002.SZ", "房地产")],  # TDX
             [("000001.SZ", "央企改革,沪深300"), ("000002.SZ", "物业管理")],  # DC
+            [],  # DC theme: none
         ]
 
         result = load_plate_enrichment(con, "20260620")
