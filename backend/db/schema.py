@@ -133,6 +133,11 @@ _ODS_DDL = [
         PRIMARY KEY (trade_date, source, board_ts_code, con_code)
     )""",
 
+    # 3.9a Extension columns for dc_theme (2026-06-23)
+    """ALTER TABLE ods_plate_board ADD COLUMN IF NOT EXISTS hot INTEGER""",
+    """ALTER TABLE ods_plate_member ADD COLUMN IF NOT EXISTS reason TEXT""",
+    """ALTER TABLE ods_plate_member ADD COLUMN IF NOT EXISTS hot_num INTEGER""",
+
     # 12.2 ods_etl_log — UUID primary key avoids race conditions with concurrent ETL
     """CREATE TABLE IF NOT EXISTS ods_etl_log (
         id                TEXT PRIMARY KEY,
