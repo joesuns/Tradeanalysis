@@ -290,6 +290,22 @@ def export_wide_to_excel(
             return ExportResult(0, tradable_meta)
 
     daily = _format_numbers(daily)
+    # ── Market summary columns (上证/沪深300) ──
+    try:
+        idx_summary = con.execute("""
+            SELECT ts_code, pct_chg, macd_trend
+            FROM v_ads_market_index_daily
+            WHERE trade_date = ?
+              AND ts_code IN ('000001.SH', '000300.SH')
+        """, [trade_date]).df()
+        for _, row in idx_summary.iterrows():
+            code = row["ts_code"]
+            suffix = "000001" if code == "000001.SH" else "000300"
+            daily[f"index_{suffix}_pct_chg"] = row["pct_chg"]
+            macd_val = row.get("macd_trend")
+            daily[f"index_{suffix}_macd"] = macd_val if macd_val and not (isinstance(macd_val, float) and pd.isna(macd_val)) else None
+    except Exception:
+        pass  # index data not available
     daily, daily_enrich = enrich_tradable_columns(daily, con, freq="daily")
     tradable_meta["daily"] = daily_enrich.to_dict()
     log_tradable_enrich_progress(daily_enrich)
@@ -372,6 +388,18 @@ def export_wide_to_excel(
 
     _write_sheet_from_display(wb, "综合分析", display_signal, layout_signal)
     _write_sheet_from_display(wb, "个股分析", display_full, layout_full)
+
+    # ── Index overview sheet ──
+    t_idx = time.monotonic()
+    logger.info("progress export: building index sheet | date=%s", trade_date)
+    try:
+        from backend.export_index import export_index_sheet
+        ws_index = wb.create_sheet("指数概览")
+        n_idx = export_index_sheet(con, trade_date, ws_index)
+        logger.info("progress export: index sheet done | rows=%d | %.0fs",
+                    n_idx, time.monotonic() - t_idx)
+    except Exception as e:
+        logger.warning("progress export: index sheet skipped: %s", e)
 
     # ---- SH Index ----
     if include_index:
