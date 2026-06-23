@@ -161,6 +161,35 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             log_etl_end(con, lid, "data_completeness_check", t0, "success",
                         data_completeness=comp)
 
+            # ── Index data fetch — lowest priority, skip on failure ──
+            from backend.fetch.ods_index import (
+                fetch_index_basic, fetch_index_daily, fetch_index_dailybasic,
+            )
+
+            lid, t0 = log_etl_start(con, "fetch_index_basic")
+            try:
+                n = fetch_index_basic(client, con)
+                log_etl_end(con, lid, "fetch_index_basic", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_end(con, lid, "fetch_index_basic", t0, "degraded",
+                            error_msg=f"skipped: {e}")
+
+            lid, t0 = log_etl_start(con, "fetch_index_daily")
+            try:
+                n = fetch_index_daily(client, con, trade_date=end)
+                log_etl_end(con, lid, "fetch_index_daily", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_end(con, lid, "fetch_index_daily", t0, "degraded",
+                            error_msg=f"skipped: {e}")
+
+            lid, t0 = log_etl_start(con, "fetch_index_dailybasic")
+            try:
+                n = fetch_index_dailybasic(client, con, trade_date=end)
+                log_etl_end(con, lid, "fetch_index_dailybasic", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_end(con, lid, "fetch_index_dailybasic", t0, "degraded",
+                            error_msg=f"skipped: {e}")
+
         if step in ("build-dim", "build-all"):
             for dim_step, fn in [
                 ("build_dim_stock", build_dim_stock),
@@ -174,6 +203,15 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
                     log_etl_error(con, lid, dim_step, t0, 0, e)
                     raise
 
+            from backend.etl.build_dim_index import build_dim_index
+            lid, t0 = log_etl_start(con, "build_dim_index")
+            try:
+                n = build_dim_index(con)
+                log_etl_end(con, lid, "build_dim_index", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_error(con, lid, "build_dim_index", t0, 0, e)
+                raise
+
         if step in ("build-dwd", "build-all"):
             codes = ts_codes or get_all_active_codes(con)
             lid, t0 = log_etl_start(con, "build_dwd")
@@ -185,6 +223,16 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
                     log_etl_end(con, lid, f"build_dwd_{name}", t0, "success", row_count=n)
             except Exception as e:
                 log_etl_error(con, lid, "build_dwd", t0, 0, e)
+                raise
+
+            from backend.etl.build_dwd_index import build_dwd_index_all
+            lid, t0 = log_etl_start(con, "build_dwd_index")
+            try:
+                idx_dwd = build_dwd_index_all(con)
+                for name, n in idx_dwd.items():
+                    log_etl_end(con, lid, f"build_{name}", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_error(con, lid, "build_dwd_index", t0, 0, e)
                 raise
 
         if step in ("calc-dws", "build-all"):
@@ -240,6 +288,17 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             except Exception as e:
                 log_etl_error(con, lid, "calc_dws", t0, 0, e)
                 raise
+
+            # Index calc — low priority, skip on failure
+            from backend.etl.calc_index import calc_index_pipeline
+            lid, t0 = log_etl_start(con, "calc_index")
+            try:
+                idx_stats = calc_index_pipeline(con, calc_date)
+                total = sum(s["calculated"] for s in idx_stats.values())
+                log_etl_end(con, lid, "calc_index", t0, "success", row_count=total)
+            except Exception as e:
+                log_etl_end(con, lid, "calc_index", t0, "degraded",
+                            error_msg=f"skipped: {e}")
 
         # Final checkpoint
         run_checkpoint(con)

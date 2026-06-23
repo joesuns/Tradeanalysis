@@ -74,6 +74,40 @@ def _warn_export_coverage(db_path: str, trade_date: str, n_rows: int,
         con.close()
 
 
+# ── fetch-index ──
+
+def cmd_fetch_index(args):
+    """Fetch index data only (no calc)."""
+    from backend.db.connection import get_connection
+    from backend.fetch.client import TushareClient
+    from backend.fetch.ods_index import (
+        fetch_index_basic, fetch_index_daily, fetch_index_dailybasic,
+    )
+
+    con = get_connection(read_only=False)
+    client = TushareClient()
+    try:
+        fetch_index_basic(client, con)
+        fetch_index_daily(client, con, args.date)
+        fetch_index_dailybasic(client, con, args.date)
+    finally:
+        con.close()
+
+
+# ── calc-index ──
+
+def cmd_calc_index(args):
+    """Calculate index indicators only."""
+    from backend.db.connection import get_connection
+    from backend.etl.calc_index import calc_index_pipeline
+
+    con = get_connection(read_only=False)
+    try:
+        calc_index_pipeline(con, args.date)
+    finally:
+        con.close()
+
+
 # ── check ──
 
 def cmd_check(_args):
@@ -1592,6 +1626,16 @@ def main():
     )
     _add_refresh_state_args(rsp)
 
+    # fetch-index
+    sp_fetch_index = sp.add_parser("fetch-index", help="拉取指数数据")
+    sp_fetch_index.add_argument("--date")
+    sp_fetch_index.set_defaults(func=cmd_fetch_index)
+
+    # calc-index
+    sp_calc_index = sp.add_parser("calc-index", help="计算指数指标")
+    sp_calc_index.add_argument("--date", required=True)
+    sp_calc_index.set_defaults(func=cmd_calc_index)
+
     sp.add_parser("status", help="Show database table stats")
 
     args = p.parse_args()
@@ -1603,7 +1647,9 @@ def main():
     handlers = {
         "check": cmd_check,
         "fetch": cmd_fetch,
+        "fetch-index": cmd_fetch_index,
         "calc": cmd_calc,
+        "calc-index": cmd_calc_index,
         "export": cmd_export,
         "run": cmd_run,
         "refresh": cmd_refresh,
