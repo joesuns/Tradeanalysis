@@ -2,7 +2,7 @@
 Complete DDL for the stock analysis data model.
 
 Tables: ODS(7) + DIM(4) + DWD(3) + DWS(10) = 24
-Views: 10 latest views + 4 ADS wide views = 14
+Views: 18 latest views + 6 ADS wide views + 3 DQ views = 27
 Indexes: DWS(20) + DWD(3) + ODS(3) + DIM(1) = 27
 
 Usage:
@@ -1128,6 +1128,98 @@ _ADS_WIDE_VIEWS_DDL = [
     LEFT JOIN v_dws_price_position_weekly_latest pp ON c.ts_code = pp.ts_code AND c.trade_date = pp.trade_date
     LEFT JOIN dwd_weekly_quote            q ON c.ts_code = q.ts_code AND c.trade_date = q.trade_date
     WHERE c.ts_code = '000001.SH'""",
+
+    # 9.1 v_ads_market_index_daily — 市场指数日线分析宽表
+    """CREATE OR REPLACE VIEW v_ads_market_index_daily AS
+    SELECT
+        'D'             AS freq,
+        q.trade_date,
+        q.ts_code,
+        i.name           AS index_name,
+        i.category       AS index_category,
+        q.close,
+        q.open,
+        q.high,
+        q.low,
+        q.pct_chg,
+        q.vol,
+        q.amount,
+        q.total_mv,
+        q.pe_ttm,
+        q.pb,
+        q.turnover_rate,
+        c.dif,
+        c.dea,
+        c.macd_bar,
+        c.divergence     AS macd_divergence,
+        c.zone           AS macd_zone,
+        c.turning_point  AS macd_turning_point,
+        c.alert          AS macd_alert,
+        c.trend          AS macd_trend,
+        c.trend_strength AS macd_trend_strength,
+        a.ma_5, a.ma_10,
+        a.bias_ma5, a.bias_ma10,
+        a.ma5_slope, a.ma10_slope,
+        a.alignment      AS ma_alignment,
+        a.turning_point  AS ma_turning_point,
+        v.ma_vol_5,
+        v.pct_vol_rank,
+        v.zone           AS vol_zone,
+        v.trend          AS vol_trend,
+        v.volume_ratio,
+        v.trend_strength AS vol_trend_strength,
+        v.divergence     AS vol_divergence
+    FROM dwd_index_daily q
+    LEFT JOIN dim_index i ON q.ts_code = i.ts_code
+    LEFT JOIN v_dws_index_macd_daily_latest c
+        ON q.ts_code = c.ts_code AND q.trade_date = c.trade_date
+    LEFT JOIN v_dws_index_ma_daily_latest a
+        ON q.ts_code = a.ts_code AND q.trade_date = a.trade_date
+    LEFT JOIN v_dws_index_volume_daily_latest v
+        ON q.ts_code = v.ts_code AND q.trade_date = v.trade_date""",
+
+    # 9.2 v_ads_market_index_weekly — 市场指数周线分析宽表
+    """CREATE OR REPLACE VIEW v_ads_market_index_weekly AS
+    SELECT
+        'W'             AS freq,
+        q.trade_date,
+        q.ts_code,
+        i.name           AS index_name,
+        i.category       AS index_category,
+        q.close,
+        q.pct_chg,
+        q.vol,
+        q.amount,
+        q.total_mv,
+        q.pe_ttm,
+        q.turnover_rate,
+        q.active_days,
+        c.dif, c.dea, c.macd_bar,
+        c.divergence     AS macd_divergence,
+        c.zone           AS macd_zone,
+        c.turning_point  AS macd_turning_point,
+        c.alert          AS macd_alert,
+        c.trend          AS macd_trend,
+        c.trend_strength AS macd_trend_strength,
+        a.ma_5, a.ma_10,
+        a.bias_ma5, a.bias_ma10,
+        a.ma5_slope, a.ma10_slope,
+        a.alignment      AS ma_alignment,
+        a.turning_point  AS ma_turning_point,
+        v.ma_vol_5, v.pct_vol_rank,
+        v.zone           AS vol_zone,
+        v.trend          AS vol_trend,
+        v.volume_ratio,
+        v.trend_strength AS vol_trend_strength,
+        v.divergence     AS vol_divergence
+    FROM dwd_index_weekly q
+    LEFT JOIN dim_index i ON q.ts_code = i.ts_code
+    LEFT JOIN v_dws_index_macd_weekly_latest c
+        ON q.ts_code = c.ts_code AND q.trade_date = c.trade_date
+    LEFT JOIN v_dws_index_ma_weekly_latest a
+        ON q.ts_code = a.ts_code AND q.trade_date = a.trade_date
+    LEFT JOIN v_dws_index_volume_weekly_latest v
+        ON q.ts_code = v.ts_code AND q.trade_date = v.trade_date""",
 ]
 
 
@@ -1192,6 +1284,20 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # Latest views (10)
     for ddl in _LATEST_VIEW_DDL:
         con.execute(ddl)
+
+    # Index DWS latest views
+    for _indicator in ["index_macd", "index_ma", "index_volume"]:
+        for _freq in ["daily", "weekly"]:
+            _table = f"dws_{_indicator}_{_freq}"
+            _view = f"v_dws_{_indicator}_{_freq}_latest"
+            con.execute(f"""
+                CREATE OR REPLACE VIEW {_view} AS
+                SELECT *
+                FROM {_table}
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY ts_code, trade_date ORDER BY calc_date DESC
+                ) = 1
+            """)
 
     # Spec freshness DQ view (ops spec-status / health_check Section J)
     con.execute(_V_DQ_SPEC_FRESHNESS_DDL)
@@ -1283,14 +1389,18 @@ def _create_dws(con: duckdb.DuckDBPyConnection):
 
 def drop_all_tables(con: duckdb.DuckDBPyConnection):
     """Drop all tables and views in reverse dependency order (for testing only)."""
-    # Views first
+    # Views first — index views before stock views (no FK, but orderly)
     _all_views = (
         ["v_indicator_availability", "v_dq_spec_freshness",
+         "v_ads_market_index_weekly", "v_ads_market_index_daily",
          "v_ads_index_wide_weekly", "v_ads_index_wide",
          "v_ads_analysis_wide_weekly", "v_ads_analysis_wide_daily",
          "v_data_freshness"]
         + [f"v_dws_{ind}_{freq}_latest"
            for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
+           for freq in ["daily", "weekly"]]
+        + [f"v_dws_index_{ind}_{freq}_latest"
+           for ind in ["macd", "ma", "volume"]
            for freq in ["daily", "weekly"]]
     )
     for view in _all_views:
@@ -1298,17 +1408,23 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
 
     # Tables in reverse dependency order
     _all_tables = (
-        # DWS (10)
+        # DWS (10 stock)
         [f"dws_{ind}_{freq}"
          for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
          for freq in ["daily", "weekly"]]
+        # DWS (6 index)
+        + [f"dws_index_{ind}_{freq}"
+           for ind in ["macd", "ma", "volume"]
+           for freq in ["daily", "weekly"]]
         + ["dws_calc_state"]
-        # DWD (3)
-        + ["dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
-        # DIM (4) — FK tables first
-        + ["dim_concept_stock", "dim_concept", "dim_date", "dim_stock"]
-        # ODS (7)
-        + ["ods_etl_log", "ods_calc_skip_log", "ods_concept_detail", "ods_trade_cal",
+        # DWD (5)
+        + ["dwd_index_weekly", "dwd_index_daily",
+           "dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
+        # DIM (5) — FK tables first
+        + ["dim_concept_stock", "dim_concept", "dim_index", "dim_date", "dim_stock"]
+        # ODS (10)
+        + ["ods_index_dailybasic", "ods_index_daily", "ods_index_basic",
+           "ods_etl_log", "ods_calc_skip_log", "ods_concept_detail", "ods_trade_cal",
            "ods_moneyflow", "ods_daily_basic", "ods_daily", "ods_stock_basic"]
     )
     for table in _all_tables:
