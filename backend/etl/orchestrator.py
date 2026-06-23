@@ -143,6 +143,18 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
                 log_etl_end(con, lid, "fetch_plate_data", t0, "degraded",
                             error_msg=f"skipped (rate limited): {e}")
 
+            # DC theme data — low priority, skip on failure
+            from backend.fetch.ods_plate import fetch_theme_data
+
+            lid, t0 = log_etl_start(con, "fetch_theme_data")
+            try:
+                theme_result = fetch_theme_data(client, con, end)
+                log_etl_end(con, lid, "fetch_theme_data", t0, "success",
+                            row_count=theme_result.get("n_members", 0))
+            except Exception as e:
+                log_etl_end(con, lid, "fetch_theme_data", t0, "degraded",
+                            error_msg=f"skipped (rate limited): {e}")
+
             # Run data completeness check after fetch
             lid, t0 = log_etl_start(con, "data_completeness_check")
             comp = _check_ods_completeness(con)
