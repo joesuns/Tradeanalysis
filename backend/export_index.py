@@ -76,18 +76,19 @@ def export_index_sheet(con, trade_date: str, wb) -> int:
     daily = _format_numbers(daily)
 
     # ── Load weekly data ─────────────────────────────────────
-    # Index weekly uses Monday anchor (date_trunc('week', dt)), NOT week-end.
-    # Query the latest Monday ≤ trade_date directly from dwd_index_weekly.
-    week_monday = con.execute(
+    # Index weekly DWD stores trade_date as Friday (Monday anchor + 4 days).
+    # dim_date.is_week_end may differ (e.g. Thu if Fri is non-trading).
+    # Query the latest DWD weekly date directly.
+    week_date = con.execute(
         "SELECT MAX(trade_date) FROM dwd_index_weekly WHERE trade_date <= ?",
         [trade_date],
     ).fetchone()[0]
 
     weekly = pd.DataFrame()
-    if week_monday:
+    if week_date:
         weekly = con.execute(
             f"SELECT * FROM {_INDEX_WEEKLY_VIEW} WHERE trade_date = ?",
-            [week_monday],
+            [week_date],
         ).df()
         if not weekly.empty:
             weekly = _format_numbers(weekly)
