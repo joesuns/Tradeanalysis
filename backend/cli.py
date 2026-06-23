@@ -646,6 +646,25 @@ def _cmd_run_single_day(args, date: str):
         except Exception:
             pass  # defensive: plate fetch must never block run
 
+        # DC theme data — low priority, degrade on failure
+        from backend.fetch.ods_plate import fetch_theme_data
+
+        try:
+            theme_lid, theme_t0 = log_etl_start(con, "run_fetch_theme")
+            try:
+                theme_result = fetch_theme_data(plate_client, con, date)
+                log_etl_end(
+                    con, theme_lid, "run_fetch_theme", theme_t0, "success",
+                    row_count=theme_result.get("n_members", 0),
+                )
+            except Exception as e:
+                log_etl_end(
+                    con, theme_lid, "run_fetch_theme", theme_t0, "degraded",
+                    error_msg=f"skipped: {e}",
+                )
+        except Exception:
+            pass  # defensive: theme fetch must never block run
+
     finally:
         con.close()
 
