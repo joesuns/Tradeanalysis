@@ -301,6 +301,20 @@ _DIM_DDL = [
         ts_code        TEXT REFERENCES dim_stock(ts_code),
         PRIMARY KEY (concept_id, ts_code)
     )""",
+
+    # 4.4 dim_index
+    """CREATE TABLE IF NOT EXISTS dim_index (
+        ts_code        TEXT PRIMARY KEY,
+        index_code     TEXT,
+        name           TEXT,
+        fullname       TEXT,
+        market         TEXT,
+        category       TEXT,
+        list_date      TEXT,
+        exp_date       TEXT,
+        is_active      INTEGER DEFAULT 1,
+        has_valuation  INTEGER DEFAULT 0
+    )""",
 ]
 
 # ============================================================
@@ -359,6 +373,49 @@ _DWD_DDL = [
         sell_elg_vol   REAL,
         total_vol      REAL,
         net_amount_dc  REAL,
+        PRIMARY KEY (ts_code, trade_date)
+    )""",
+
+    # 5.4 dwd_index_daily — 指数日线宽表
+    # NOTE:
+    #  - close_qfq = close (指数无需复权, 列名对齐计算器 SIGNATURE_COLS)
+    #  - is_suspended 恒为 0 (指数无停牌, 列名对齐 load_quote_groups 日线过滤)
+    """CREATE TABLE IF NOT EXISTS dwd_index_daily (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        close          REAL,
+        open           REAL,
+        high           REAL,
+        low            REAL,
+        pre_close      REAL,
+        pct_chg        REAL,
+        vol            REAL,
+        amount         REAL,
+        close_qfq      REAL,
+        total_mv       REAL,
+        pe_ttm         REAL,
+        pb             REAL,
+        turnover_rate  REAL,
+        is_suspended   INTEGER DEFAULT 0,
+        PRIMARY KEY (ts_code, trade_date)
+    )""",
+
+    # 5.5 dwd_index_weekly — 指数周线宽表
+    """CREATE TABLE IF NOT EXISTS dwd_index_weekly (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        close          REAL,
+        open           REAL,
+        high           REAL,
+        low            REAL,
+        pct_chg        REAL,
+        vol            REAL,
+        amount         REAL,
+        close_qfq      REAL,
+        total_mv       REAL,
+        pe_ttm         REAL,
+        turnover_rate  REAL,
+        active_days    INTEGER,
         PRIMARY KEY (ts_code, trade_date)
     )""",
 ]
@@ -499,6 +556,75 @@ _DWS_DDL = {
         CHECK (price_position_120d IS NULL OR (price_position_120d >= 0 AND price_position_120d <= 100)),
         CHECK (price_position_250d IS NULL OR (price_position_250d >= 0 AND price_position_250d <= 100))
     )""",
+
+    # 6.7 Index MACD
+    "index_macd": """CREATE TABLE IF NOT EXISTS {table} (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        ema_12         REAL,
+        ema_26         REAL,
+        dif            REAL,
+        dea            REAL,
+        macd_bar       REAL,
+        divergence     TEXT,
+        zone           TEXT,
+        turning_point  TEXT,
+        alert          TEXT,
+        trend          TEXT,
+        trend_strength REAL,
+        calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v3',
+        PRIMARY KEY (ts_code, trade_date, calc_date),
+        CHECK (divergence IN ('top_divergence', 'bottom_divergence') OR divergence IS NULL),
+        CHECK (zone IN ('bull', 'bear') OR zone IS NULL),
+        CHECK (turning_point IN ('golden_cross', 'dead_cross', 'near_golden', 'near_dead') OR turning_point IS NULL),
+        CHECK (alert IN ('upturn_reverse', 'downturn_reverse', 'upturn_flat', 'downturn_flat') OR alert IS NULL),
+        CHECK (trend IN ('up', 'down', 'flat'))
+    )""",
+
+    # 6.8 Index MA
+    "index_ma": """CREATE TABLE IF NOT EXISTS {table} (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        ma_5           REAL,
+        ma_10          REAL,
+        bias_ma5       REAL,
+        bias_ma10      REAL,
+        ma5_slope      REAL,
+        ma10_slope     REAL,
+        alignment      TEXT,
+        turning_point  TEXT,
+        calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v2',
+        PRIMARY KEY (ts_code, trade_date, calc_date),
+        CHECK (alignment IN ('bull_strong', 'bull_building', 'bull_weakening', 'bull_rolling',
+                              'bear_strong', 'bear_building', 'bear_weakening', 'bear_rolling',
+                              'tangle', 'sideways') OR alignment IS NULL),
+        CHECK (turning_point IN ('golden_cross', 'dead_cross', 'near_golden', 'near_dead') OR turning_point IS NULL)
+    )""",
+
+    # 6.9 Index Volume
+    "index_volume": """CREATE TABLE IF NOT EXISTS {table} (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        ma_vol_5       REAL,
+        pct_vol_rank   REAL,
+        zone           TEXT,
+        trend          TEXT,
+        volume_ratio   REAL,
+        trend_strength REAL,
+        divergence     TEXT,
+        calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v2',
+        PRIMARY KEY (ts_code, trade_date, calc_date),
+        CHECK (pct_vol_rank >= 0 AND pct_vol_rank <= 100),
+        CHECK (zone IN ('explosive', 'low_volume', 'normal')),
+        CHECK (trend IN ('expanding', 'shrinking', 'flat')),
+        CHECK (divergence IN ('top_divergence', 'bottom_divergence') OR divergence IS NULL)
+    )""",
 }
 
 # ============================================================
@@ -520,6 +646,18 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
             f"ON {_table}(trade_date, ts_code)"
         )
 
+for _indicator in ["index_macd", "index_ma", "index_volume"]:
+    for _freq in ["daily", "weekly"]:
+        _table = f"dws_{_indicator}_{_freq}"
+        _DWS_INDEX_DDL.append(
+            f"CREATE INDEX IF NOT EXISTS idx_{_indicator}_{_freq}_cd "
+            f"ON {_table}(ts_code, trade_date DESC)"
+        )
+        _DWS_INDEX_DDL.append(
+            f"CREATE INDEX IF NOT EXISTS idx_{_indicator}_{_freq}_dc "
+            f"ON {_table}(trade_date, ts_code)"
+        )
+
 _DWD_INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_dwd_daily_cd ON dwd_daily_quote(ts_code, trade_date)",
     "CREATE INDEX IF NOT EXISTS idx_dwd_mf_cd ON dwd_daily_moneyflow(ts_code, trade_date)",
@@ -535,6 +673,8 @@ _ODS_INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_etl_log_status ON ods_etl_log(status)",
     "CREATE INDEX IF NOT EXISTS idx_skip_log_cd ON ods_calc_skip_log(calc_date)",
     "CREATE INDEX IF NOT EXISTS idx_skip_log_ind ON ods_calc_skip_log(indicator, reason)",
+    "CREATE INDEX IF NOT EXISTS idx_ods_index_daily_cd ON ods_index_daily(ts_code, trade_date)",
+    "CREATE INDEX IF NOT EXISTS idx_ods_index_dailybasic_cd ON ods_index_dailybasic(ts_code, trade_date)",
 ]
 
 _DIM_INDEX_DDL = [
@@ -1133,6 +1273,12 @@ def _create_dws(con: duckdb.DuckDBPyConnection):
             table = f"dws_{name}_{freq}"
             con.execute(ddl.format(table=table))
     ensure_calc_state_table(con)
+
+    # Index DWS tables (6 tables: 3 indicators × 2 frequencies)
+    for _indicator in ["index_macd", "index_ma", "index_volume"]:
+        for _freq in ["daily", "weekly"]:
+            _table = f"dws_{_indicator}_{_freq}"
+            con.execute(_DWS_DDL[_indicator].format(table=_table))
 
 
 def drop_all_tables(con: duckdb.DuckDBPyConnection):
