@@ -391,13 +391,15 @@ run（一站式入口）→ fetch（当日 ODS）→ rebuild DWD → refresh-sta
 - **公式：** `(close - N_bar_low) / (N_bar_high - N_bar_low) × 100`，值域 [0, 100]
 - **纯价格特征，独立 DWS 模块**，不依赖其他 DWS 表
 
-#### 板块/概念数据
+#### 板块/概念/题材数据
 
 - **板块数据源：**
   - TDX 行业板块：`tdx_index` → `tdx_member`（约 60-80 个行业板块）
   - DC 概念板块：`dc_index` → `dc_member`（约 400-500 个概念板块）
-- **缓存策略：** 7 天 TTL，`ods_plate_snapshot` 记录 fetch 时间
-- **导出列：** `tdx_industry_board`（行业板块）、`dc_concept_board`（概念板块），逗号分隔，空值显示 `N/A`
+  - DC 题材：`dc_concept` → `dc_concept_cons`（约 600+ 个题材，编码 000XXX.DC）
+- **题材 vs 概念：** 两套独立分类体系，编码规则不同（概念 BKXXXX.DC vs 题材 000XXX.DC），同一只股票可同时属于多概念+多题材
+- **缓存策略：** TDX 行业 7 天 TTL / DC 概念 3 天 TTL / DC 题材 7 天 TTL，`ods_plate_snapshot` 记录 fetch 时间
+- **导出列：** `tdx_industry_board`（通达信行业）、`dc_concept_board`（概念板块）、`dc_theme_board`（所属题材），逗号分隔，空值显示 `N/A`
 - **时间锚点：** 以分析日 `trade_date` 为准，通过 `ods_plate_member` 查询
 - **管道位置：** `cli run` fetch 末尾低优先级步骤，失败降级不阻断
 - **旧 concept 管线：** `ods_concept_detail` + `dim_concept` + `dim_concept_stock` 已废弃，DDL 保留但不再写入
