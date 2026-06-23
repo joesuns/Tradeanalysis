@@ -27,10 +27,6 @@ _INDEX_COL_NAME_OVERRIDES = {
     "pb": "市净率",
 }
 
-# Full index column-name map (baseline + overrides) — used to
-# inject into _ew._COL_NAMES before layout build.
-_INDEX_COL_NAMES = {**_ew._COL_NAMES, **_INDEX_COL_NAME_OVERRIDES}
-
 # ── Index-specific column sets ──────────────────────────────
 
 # 指数基本信息列（对齐综合分析基本面列语义，去掉个股专属列）
@@ -76,11 +72,11 @@ def export_index_sheet(con, trade_date: str, wb) -> int:
     daily = _format_numbers(daily)
 
     # ── Load weekly data ─────────────────────────────────────
-    # Index weekly DWD stores trade_date as Friday (Monday anchor + 4 days).
-    # dim_date.is_week_end may differ (e.g. Thu if Fri is non-trading).
-    # Query the latest DWD weekly date directly.
+    # Index weekly stores trade_date as Friday (Monday anchor + 4 days),
+    # which may differ from dim_date.is_week_end (Thu when Fri is non-trading).
+    # Query the view (not the base table) for the latest available week.
     week_date = con.execute(
-        "SELECT MAX(trade_date) FROM dwd_index_weekly WHERE trade_date <= ?",
+        f"SELECT MAX(trade_date) FROM {_INDEX_WEEKLY_VIEW} WHERE trade_date <= ?",
         [trade_date],
     ).fetchone()[0]
 
@@ -126,25 +122,26 @@ def export_index_sheet(con, trade_date: str, wb) -> int:
         ws.cell(row=1, column=1, value=f"No index data for {trade_date}")
         return 0
 
-    # ── Inject index-specific Chinese column names ────────────
-    # _resolve_sheet_layout and _write_sheet_headers look up _COL_NAMES
-    # for Chinese display names.  Inject index-only keys before layout build.
-    _orig_col_names = {}
-    for k, v in _INDEX_COL_NAMES.items():
-        _orig_col_names[k] = _ew._COL_NAMES.get(k)
-        _ew._COL_NAMES[k] = v
-
-    # ── Inject index identity columns into _FUND_COLS ─────────
-    # _resolve_sheet_layout splits daily_cols into basic (matched against
-    # _ID_COLS + _FUND_COLS) and signal (everything else).  We need
-    # index_name, index_category, pb in the basic group.
-    _extra_fund = []
-    for c in ["index_name", "index_category", "pb"]:
-        if c not in _ew._FUND_COLS:
-            _ew._FUND_COLS.append(c)
-            _extra_fund.append(c)
-
     try:
+        # ── Inject index-specific Chinese column names ────────
+        # _resolve_sheet_layout and _write_sheet_headers look up _COL_NAMES
+        # for Chinese display names.  Only 4 keys need overriding; the rest
+        # are already correct from stock _COL_NAMES.
+        _orig_col_names = {}
+        for k, v in _INDEX_COL_NAME_OVERRIDES.items():
+            _orig_col_names[k] = _ew._COL_NAMES.get(k)
+            _ew._COL_NAMES[k] = v
+
+        # ── Inject index identity columns into _FUND_COLS ─────
+        # _resolve_sheet_layout splits daily_cols into basic (matched against
+        # _ID_COLS + _FUND_COLS) and signal (everything else).  We need
+        # index_name, index_category, pb in the basic group.
+        _extra_fund = []
+        for c in ["index_name", "index_category", "pb"]:
+            if c not in _ew._FUND_COLS:
+                _ew._FUND_COLS.append(c)
+                _extra_fund.append(c)
+
         # ── Build layout + transform values ───────────────────
         layout = _resolve_sheet_layout(daily_cols, weekly_cols, merged.columns)
 
@@ -154,13 +151,16 @@ def export_index_sheet(con, trade_date: str, wb) -> int:
         # ── Write sheet ──────────────────────────────────────
         _write_sheet_from_display(wb, "指数概览", display, layout)
     finally:
-        # Restore _FUND_COLS
+        # Restore _FUND_COLS — guarded against concurrent mutation
         for c in _extra_fund:
-            _ew._FUND_COLS.remove(c)
+            try:
+                _ew._FUND_COLS.remove(c)
+            except ValueError:
+                pass
         # Restore _COL_NAMES
         for k, orig_val in _orig_col_names.items():
             if orig_val is None:
-                del _ew._COL_NAMES[k]
+                _ew._COL_NAMES.pop(k, None)
             else:
                 _ew._COL_NAMES[k] = orig_val
 

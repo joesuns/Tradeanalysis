@@ -576,8 +576,7 @@ def export_wide_to_excel(
     logger.info("progress export: building index sheet | date=%s", trade_date)
     try:
         from backend.export_index import export_index_sheet
-        ws_index = wb.create_sheet("指数概览")
-        n_idx = export_index_sheet(con, trade_date, ws_index)
+        n_idx = export_index_sheet(con, trade_date, wb)
         logger.info("progress export: index sheet done | rows=%d | %.0fs",
                     n_idx, time.monotonic() - t_idx)
     except Exception as e:
@@ -853,7 +852,7 @@ def _write_sheet_from_display(
 
     stock_name_idx = 1
     for i, c in enumerate(layout.basic_cols):
-        if c == "stock_name":
+        if c in ("stock_name", "index_name"):
             stock_name_idx = i + 2
             break
     ws.freeze_panes = f"{get_column_letter(stock_name_idx)}3"
@@ -882,6 +881,7 @@ def _write_sheet_from_display(
         ):
             for cell in row:
                 cell.font = data_font
+        ws.auto_filter.ref = data_range
 
 
 def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
