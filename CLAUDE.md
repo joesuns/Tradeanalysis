@@ -457,6 +457,7 @@ tushare index_basic/index_daily/index_dailybasic → ODS(3) → DIM(1) + DWD(2) 
 - **导出语义：** `-`=当日无事件信号；`N/A`=不可算或源端无数据（板块/概念列在源数据不可用时同样默认 `N/A`）
 - **Fetch 覆盖率：** `_compute_fetch_range` 要求 100% ODS 覆盖才跳过
 - **停牌缺口跳过（stock-batched）：** 落在 ODS `[first_ods, last_ods]` 内部的缺失日视为停牌，不再发 API；head/tail 缺口仍拉取
+- **多周期涨跌幅（pct_chg_3d/1m/1y）：** LAG 基于 DWD 行数而非交易日数，停牌日（`is_suspended=1` 且 close_qfq 沿用前日）计入窗口。连续停牌后复牌首日的 3 天指标可能失真（250 天指标影响可忽略），1-2 个交易日后自然修复。属已知设计取舍。
 - **同日复跑幂等闸门：** 全市场同 `calc_date` 已成功 calc 且无 stale ODS → `run_calc` 秒级退出
 - **周线 kpattern 历史残留：** 修复前曾遗漏 `is_week_end` 过滤产出幽灵行，修复后须 `DELETE FROM dws_kpattern_weekly` 再重算
 
