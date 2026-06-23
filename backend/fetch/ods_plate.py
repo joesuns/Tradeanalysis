@@ -138,6 +138,14 @@ def _fetch_theme_members_for_board(client, trade_date: str, theme_code: str) -> 
         trade_date=trade_date,
         theme_code=theme_code,
     )
+    # tushare default row limit is 3000; detect silent truncation
+    _TUSHARE_ROW_LIMIT = 3000
+    if len(records) >= _TUSHARE_ROW_LIMIT:
+        logger.warning(
+            "fetch.theme: dc_concept_cons(theme_code=%s) returned %d rows "
+            "(at tushare row limit); members beyond %d may be truncated",
+            theme_code, len(records), _TUSHARE_ROW_LIMIT,
+        )
     members = []
     for r in records:
         ts_code = r.get("ts_code", "")
@@ -190,6 +198,7 @@ def fetch_theme_data(client, con, trade_date: str) -> dict:
         )
 
         # Step B: fetch members per theme
+        n_boards_ok = 0
         total_members = 0
         for i, b in enumerate(boards):
             try:
@@ -216,6 +225,7 @@ def fetch_theme_data(client, con, trade_date: str) -> dict:
                          m.get("reason"), m.get("hot_num"), ts_now],
                     )
                     total_members += 1
+                n_boards_ok += 1
             except Exception as e:
                 logger.warning(
                     "fetch.theme: dc_theme member %s failed: %s",
@@ -233,17 +243,20 @@ def fetch_theme_data(client, con, trade_date: str) -> dict:
         result["n_members"] = total_members
 
         # Step C: write snapshot meta record
+        # Use n_boards_ok (successfully fetched) not len(boards), so a
+        # partially-failed run does not block retries for the full TTL.
         con.execute(
             """INSERT OR REPLACE INTO ods_plate_snapshot
                (trade_date, source, idx_type, n_boards, n_members, fetched_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            [trade_date, SOURCE, IDX_TYPE, len(boards), total_members, ts_now],
+            [trade_date, SOURCE, IDX_TYPE, n_boards_ok, total_members, ts_now],
         )
 
+        n_failed = len(boards) - n_boards_ok
         elapsed = time.monotonic() - t_start
         logger.info(
-            "progress fetch.theme: dc_theme done | boards=%d members=%d | %.0fs",
-            len(boards), total_members, elapsed,
+            "progress fetch.theme: dc_theme done | boards=%d ok=%d failed=%d members=%d | %.0fs",
+            len(boards), n_boards_ok, n_failed, total_members, elapsed,
         )
 
     except Exception as e:
@@ -294,6 +307,7 @@ def fetch_plate_data(client, con, trade_date: str) -> dict:
             )
 
             # Step B: fetch members per board
+            n_boards_ok = 0
             total_members = 0
             for i, b in enumerate(boards):
                 try:
@@ -317,6 +331,7 @@ def fetch_plate_data(client, con, trade_date: str) -> dict:
                              m["con_code"], m["con_name"], ts_now],
                         )
                         total_members += 1
+                    n_boards_ok += 1
                 except Exception as e:
                     logger.warning(
                         "fetch.plate: %s member %s failed: %s",
@@ -334,17 +349,20 @@ def fetch_plate_data(client, con, trade_date: str) -> dict:
             result["n_members"] = total_members
 
             # Step C: write snapshot meta record
+            # Use n_boards_ok (successfully fetched) not len(boards), so a
+            # partially-failed run does not block retries for the full TTL.
             con.execute(
                 """INSERT OR REPLACE INTO ods_plate_snapshot
                    (trade_date, source, idx_type, n_boards, n_members, fetched_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                [trade_date, source, idx_type, len(boards), total_members, ts_now],
+                [trade_date, source, idx_type, n_boards_ok, total_members, ts_now],
             )
 
+            n_failed = len(boards) - n_boards_ok
             elapsed = time.monotonic() - t_start
             logger.info(
-                "progress fetch.plate: %s %s done | boards=%d members=%d | %.0fs",
-                source, idx_type, len(boards), total_members, elapsed,
+                "progress fetch.plate: %s %s done | boards=%d ok=%d failed=%d members=%d | %.0fs",
+                source, idx_type, len(boards), n_boards_ok, n_failed, total_members, elapsed,
             )
 
         except Exception as e:
@@ -362,7 +380,8 @@ def fetch_plate_data(client, con, trade_date: str) -> dict:
 def load_plate_enrichment(con, trade_date: str) -> dict[str, dict[str, str]]:
     """Load plate enrichment for export.
 
-    Returns dict[ts_code -> {'tdx_industry_board': '...', 'dc_concept_board': '...'}].
+    Returns dict[ts_code -> {'tdx_industry_board': '...', 'dc_concept_board': '...',
+                              'dc_theme_board': '...'}].
 
     If no plate data exists for trade_date, returns empty dicts for all stocks.
     """
