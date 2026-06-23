@@ -8,14 +8,25 @@ logger = logging.getLogger(__name__)
 # View for index daily data
 _INDEX_VIEW = "v_ads_market_index_daily"
 
+# Borrow Chinese column names from stock sheet + add index-specific entries
+from backend.export_wide import _COL_NAMES as _STOCK_COL_NAMES
+
+_INDEX_COL_NAMES = {
+    **_STOCK_COL_NAMES,
+    "ts_code": "指数代码",
+    "index_name": "指数名称",
+    "index_category": "分类",
+    "pb": "市净率",
+}
+
 # Header styling constants — aligned with backend/export_wide.py
 _HEADER_FONT_11 = {"name": "微软雅黑", "color": "FFFFFF", "size": 11, "bold": True}
 _HEADER_FONT_10 = {"name": "微软雅黑", "color": "FFFFFF", "size": 10}
 _BASIC_FILL = "1A1A1A"
-_GROUP_FILL = "1A5276"  # same as daily group header in stock sheet
+_GROUP_FILL = "1A5276"
 
 # Indicator group colors — same palette as export_wide.py _GROUP_COLORS
-_COL_PREFIX_COLORS = {
+_COL_TINT = {
     "macd_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
     "ma_": "2980B9", "bias_": "2980B9", "ma5": "2980B9", "ma10": "2980B9",
     "vol_": "27AE60", "volume_": "27AE60", "pct_vol": "27AE60",
@@ -42,9 +53,14 @@ _COL_GROUPS = [
 ]
 
 
+def _chinese_name(col: str) -> str:
+    """Map English column key to Chinese display name."""
+    return _INDEX_COL_NAMES.get(col, col)
+
+
 def _tint_for_col(col: str) -> str:
     """Match column to indicator color prefix."""
-    for prefix, color in _COL_PREFIX_COLORS.items():
+    for prefix, color in _COL_TINT.items():
         if col.startswith(prefix):
             return color
     return _DEFAULT_TINT
@@ -55,10 +71,12 @@ def export_index_sheet(con, trade_date: str, ws) -> int:
 
     Styling matches the stock analysis sheets:
     - Row 1: merged group headers (blue fill, white 雅黑 11pt)
-    - Row 2: individual column names with indicator-colored fills
+    - Row 2: individual **Chinese** column names with indicator-colored fills
+             + hover comments from export-column-comments.yaml
     - Data from Row 3
     """
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from backend.export_wide import _attach_header_comment
 
     df = con.execute(f"""
         SELECT * FROM {_INDEX_VIEW}
@@ -88,7 +106,6 @@ def export_index_sheet(con, trade_date: str, ws) -> int:
     # ── styles ────────────────────────────────────────────
     group_font = Font(**_HEADER_FONT_11)
     col_font = Font(**_HEADER_FONT_10)
-    basic_fill = PatternFill(start_color=_BASIC_FILL, end_color=_BASIC_FILL, fill_type="solid")
     group_fill = PatternFill(start_color=_GROUP_FILL, end_color=_GROUP_FILL, fill_type="solid")
     center_align = Alignment(horizontal="center", vertical="center")
     header_border = Border(bottom=Side(style="thin", color="5D6D7E"))
@@ -110,14 +127,16 @@ def export_index_sheet(con, trade_date: str, ws) -> int:
         c.border = header_border
         col += n
 
-    # ── Row 2: individual column names ────────────────────
-    for j, col_name in enumerate(all_cols, 1):
-        tint = _tint_for_col(col_name)
-        cell = ws.cell(row=2, column=j, value=col_name)
+    # ── Row 2: individual column names (Chinese + comments) ─
+    for j, eng_name in enumerate(all_cols, 1):
+        cn_name = _chinese_name(eng_name)
+        tint = _tint_for_col(eng_name)
+        cell = ws.cell(row=2, column=j, value=cn_name)
         cell.font = col_font
         cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
         cell.alignment = center_align
         cell.border = header_border
+        _attach_header_comment(cell, eng_name, weekly=False)
 
     # ── Data rows ─────────────────────────────────────────
     for i, (_, row) in enumerate(df.iterrows()):
@@ -127,11 +146,12 @@ def export_index_sheet(con, trade_date: str, ws) -> int:
                 val = None
             ws.cell(row=i + 3, column=j, value=val)
 
-    # ── Column widths ─────────────────────────────────────
+    # ── Column widths (based on Chinese header) ────────────
     from openpyxl.utils import get_column_letter
-    for j, col_name in enumerate(all_cols, 1):
-        hdr_len = sum(2.2 if "一" <= c <= "鿿" else 1.0 for c in str(col_name))
-        ws.column_dimensions[get_column_letter(j)].width = min(hdr_len + 2, 22)
+    for j, eng_name in enumerate(all_cols, 1):
+        cn_name = _chinese_name(eng_name)
+        hdr_len = sum(2.2 if "一" <= c <= "鿿" else 1.0 for c in cn_name)
+        ws.column_dimensions[get_column_letter(j)].width = min(hdr_len + 3, 22)
 
     ws.auto_filter.ref = ws.dimensions
     return len(df)

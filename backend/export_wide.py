@@ -78,7 +78,9 @@ _COL_NAMES = {
     "sector": "上市板", "industry": "申万行业",
     "tdx_industry_board": "通达信行业", "dc_concept_board": "概念板块",
     "dc_theme_board": "所属题材", "is_st": "ST",
-    "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量(万手)", "amount": "成交额(亿)",
+    "close": "收盘价", "pct_chg": "涨跌幅%",
+    "pct_chg_3d": "最近3天涨跌幅", "pct_chg_1m": "最近1月涨跌幅", "pct_chg_1y": "最近1年涨跌幅",
+    "vol": "成交量(万手)", "amount": "成交额(亿)",
     "total_mv": "总市值(亿)", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
     "kpattern": "K线形态", "kpattern_strength": "形态强度",
     "ema_12": "EMA12", "ema_26": "EMA26", "dif": "DIF", "dea": "DEA",
@@ -116,7 +118,8 @@ _ID_COLS = [
     "dc_theme_board", "is_st",
 ]
 _FUND_COLS = [
-    "close", "pct_chg", "vol", "amount", "total_mv",
+    "close", "pct_chg", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y",
+    "vol", "amount", "total_mv",
     "pe_ttm", "turnover_rate", "volume_ratio",
 ]
 
@@ -275,14 +278,15 @@ _STATE_METRIC_COLS = {
     "vol_trend", "vol_trend_strength", "volume_ratio",
     "price_position_60d", "price_position_120d", "price_position_250d",
 }
-_FUNDAMENTAL_NA_COLS = {"pe_ttm"}
+_FUNDAMENTAL_NA_COLS = {"pe_ttm", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y"}
 # Classification columns — stock attributes not derived from signals; null → "N/A"
 _PLATE_CLASSIFICATION_COLS = {"tdx_industry_board", "dc_concept_board", "dc_theme_board"}
 # Backward-compatible union for highlight logic
 _SIGNAL_COLS = _EVENT_SIGNAL_COLS | _STATE_METRIC_COLS | _FUNDAMENTAL_NA_COLS
 
 # Columns to round to 2 decimal places
-_ROUND_2DP = {"close", "pct_chg", "pe_ttm", "turnover_rate", "net_mf_amount",
+_ROUND_2DP = {"close", "pct_chg", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y",
+              "pe_ttm", "turnover_rate", "net_mf_amount",
               "volume_ratio", "vol_trend_strength",
               "price_position_60d", "price_position_120d", "price_position_250d"}
 
