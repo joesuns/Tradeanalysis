@@ -106,8 +106,8 @@ def calc_index_pipeline(con, calc_date: str) -> dict:
                 "elapsed": elapsed,
             }
             logger.info(
-                "progress calc.index: %s | calculated=%d skipped=%d | %.1fs",
-                label, result.calculated, result.skipped, elapsed,
+                "progress calc.index: %s | calculated=%d skipped_reasons=%d | %.1fs",
+                label, result.calculated, len(result.skipped), elapsed,
             )
 
     return stats

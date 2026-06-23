@@ -3,8 +3,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# DuckDB week_trunc expression (Monday anchor, same as stock DWD)
-_WEEK_TRUNC = "CAST(date_trunc('week', CAST(trade_date AS DATE)) AS TEXT)"
+# DuckDB date parsing helper: YYYYMMDD → YYYY-MM-DD → DATE
+# (same approach as dwd_weekly_sql.py)
+_DATE_PARSE = "CAST(substr(trade_date,1,4)||'-'||substr(trade_date,5,2)||'-'||substr(trade_date,7,2) AS DATE)"
+
+# Week anchor: Monday (date_trunc('week', dt)), consistent with stock dwd_weekly_quote
+_WEEK_TRUNC = f"date_trunc('week', {_DATE_PARSE})"
 
 
 def build_dwd_index_daily(con) -> int:
@@ -68,7 +72,7 @@ def build_dwd_index_weekly(con) -> int:
         )
         SELECT
             ts_code,
-            {_WEEK_TRUNC} + INTERVAL 4 DAY AS trade_date,
+            strftime({_WEEK_TRUNC} + INTERVAL 4 DAY, '%Y%m%d') AS trade_date,
             LAST(close ORDER BY trade_date) AS close,
             FIRST(open ORDER BY trade_date) AS open,
             MAX(high) AS high,
@@ -84,7 +88,7 @@ def build_dwd_index_weekly(con) -> int:
         FROM dwd_index_daily
         WHERE close IS NOT NULL
         GROUP BY ts_code, {_WEEK_TRUNC}
-        ORDER BY ts_code, trade_date
+        ORDER BY ts_code, {_WEEK_TRUNC}
     """)
 
     n = con.execute("SELECT COUNT(*) FROM dwd_index_weekly").fetchone()[0]

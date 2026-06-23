@@ -35,7 +35,7 @@ def build_dim_index(con) -> int:
             exp_date,
             CASE
                 WHEN exp_date IS NULL OR exp_date = '' THEN 1
-                WHEN exp_date > CURRENT_DATE THEN 1
+                WHEN CAST(exp_date AS DATE) > CURRENT_DATE THEN 1
                 ELSE 0
             END AS is_active,
             CASE
