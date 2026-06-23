@@ -278,7 +278,7 @@ _STATE_METRIC_COLS = {
     "vol_trend", "vol_trend_strength", "volume_ratio",
     "price_position_60d", "price_position_120d", "price_position_250d",
 }
-_FUNDAMENTAL_NA_COLS = {"pe_ttm", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y"}
+_FUNDAMENTAL_NA_COLS = {"pe_ttm", "pb", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y"}
 # Classification columns — stock attributes not derived from signals; null → "N/A"
 _PLATE_CLASSIFICATION_COLS = {"tdx_industry_board", "dc_concept_board", "dc_theme_board"}
 # Backward-compatible union for highlight logic
@@ -286,7 +286,7 @@ _SIGNAL_COLS = _EVENT_SIGNAL_COLS | _STATE_METRIC_COLS | _FUNDAMENTAL_NA_COLS
 
 # Columns to round to 2 decimal places
 _ROUND_2DP = {"close", "pct_chg", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y",
-              "pe_ttm", "turnover_rate", "net_mf_amount",
+              "pe_ttm", "pb", "turnover_rate", "net_mf_amount",
               "volume_ratio", "vol_trend_strength",
               "price_position_60d", "price_position_120d", "price_position_250d"}
 
