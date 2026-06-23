@@ -813,15 +813,9 @@ _ADS_WIDE_VIEWS_DDL = [
         q.pct_chg        AS pct_chg,
 
         -- Multi-period returns (trading-day LAG over close_qfq)
-        ROUND((q.close_qfq / LAG(q.close_qfq, 3) OVER (
-            PARTITION BY q.ts_code ORDER BY q.trade_date
-        ) - 1) * 100, 2)   AS pct_chg_3d,
-        ROUND((q.close_qfq / LAG(q.close_qfq, 20) OVER (
-            PARTITION BY q.ts_code ORDER BY q.trade_date
-        ) - 1) * 100, 2)   AS pct_chg_1m,
-        ROUND((q.close_qfq / LAG(q.close_qfq, 250) OVER (
-            PARTITION BY q.ts_code ORDER BY q.trade_date
-        ) - 1) * 100, 2)   AS pct_chg_1y,
+        ROUND((q.close_qfq / LAG(q.close_qfq, 3) OVER w_period - 1) * 100, 2)   AS pct_chg_3d,
+        ROUND((q.close_qfq / LAG(q.close_qfq, 20) OVER w_period - 1) * 100, 2)   AS pct_chg_1m,
+        ROUND((q.close_qfq / LAG(q.close_qfq, 250) OVER w_period - 1) * 100, 2)   AS pct_chg_1y,
 
         q.vol            AS vol,
         q.amount         AS amount,
@@ -907,7 +901,8 @@ _ADS_WIDE_VIEWS_DDL = [
     LEFT JOIN v_dws_ma_daily_latest            a ON q.ts_code = a.ts_code AND q.trade_date = a.trade_date
     LEFT JOIN v_dws_dde_daily_latest           d ON q.ts_code = d.ts_code AND q.trade_date = d.trade_date
     LEFT JOIN v_dws_volume_daily_latest        v ON q.ts_code = v.ts_code AND q.trade_date = v.trade_date
-    LEFT JOIN v_dws_price_position_daily_latest pp ON q.ts_code = pp.ts_code AND q.trade_date = pp.trade_date""",
+    LEFT JOIN v_dws_price_position_daily_latest pp ON q.ts_code = pp.ts_code AND q.trade_date = pp.trade_date
+    WINDOW w_period AS (PARTITION BY q.ts_code ORDER BY q.trade_date)""",
 
     # 7.1 v_ads_analysis_wide_weekly
     """CREATE OR REPLACE VIEW v_ads_analysis_wide_weekly AS
