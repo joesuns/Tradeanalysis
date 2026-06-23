@@ -277,6 +277,13 @@ tushare index_basic/index_daily/index_dailybasic → ODS(3) → DIM(1) + DWD(2) 
 - **计算器复用：** `IndexMACDCalculator` / `IndexMACalculator` / `IndexVolumeCalculator` 继承个股计算器，仅覆盖 `src_table` 和 `dws_table`
 - **指数列表配置：** `config/indices.yaml`，分 core/sector 组，修改后下次 run 生效
 - **拉取策略：** 渐进式回填（首次 250 bar warmup，后续增量）; `cli run` 末尾低优先级，失败降级
+- **Excel 导出：** `export_index.py` 复用 `export_wide.py` 的格式化管线，与"综合分析"口径对齐：
+  - 信号聚焦（不含 EMA/MA/量能原始值，仅保留信号列；macd_divergence 保留全文因 tradable 未就绪）
+  - 枚举值中文化（复用 `_ENUM_VALUES` + `_transform_display_values`）
+  - 单位换算统一（复用 `_format_numbers`：vol→万手, amount→亿, total_mv→亿）
+  - 空值语义（复用 `apply_display_nulls`：事件信号 `-`，状态/基本面 `N/A`）
+  - 日线+周线水平合并（`__w__` 前缀，Row 1 三大区：基本信息/日线指标/周线指标）
+  - ⚠️ 指数 `total_mv` ODS 单位为**元**（个股为万元），`_format_numbers` 对两者均 `/10000`，导致指数市值显示偏大约 10000 倍（预存问题）
 
 ## 关键技术细节
 
