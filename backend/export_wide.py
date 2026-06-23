@@ -75,7 +75,9 @@ def default_export_path(trade_date: str, output: str = None) -> str:
 _COL_NAMES = {
     "freq": "周期", "trade_date": "交易日期", "ts_code": "股票代码",
     "stock_code": "代码", "stock_name": "股票名称", "exchange": "交易所",
-    "sector": "上市板", "industry": "申万行业", "tdx_industry_board": "通达信行业", "dc_concept_board": "概念板块", "is_st": "ST",
+    "sector": "上市板", "industry": "申万行业",
+    "tdx_industry_board": "通达信行业", "dc_concept_board": "概念板块",
+    "dc_theme_board": "所属题材", "is_st": "ST",
     "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量(万手)", "amount": "成交额(亿)",
     "total_mv": "总市值(亿)", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
     "kpattern": "K线形态", "kpattern_strength": "形态强度",
@@ -110,7 +112,8 @@ _BASIC_HEADER_FILL = "1A1A1A"
 
 _ID_COLS = [
     "ts_code", "trade_date", "stock_code", "stock_name",
-    "exchange", "sector", "industry", "tdx_industry_board", "dc_concept_board", "is_st",
+    "exchange", "sector", "industry", "tdx_industry_board", "dc_concept_board",
+    "dc_theme_board", "is_st",
 ]
 _FUND_COLS = [
     "close", "pct_chg", "vol", "amount", "total_mv",
@@ -274,7 +277,7 @@ _STATE_METRIC_COLS = {
 }
 _FUNDAMENTAL_NA_COLS = {"pe_ttm"}
 # Classification columns — stock attributes not derived from signals; null → "N/A"
-_PLATE_CLASSIFICATION_COLS = {"tdx_industry_board", "dc_concept_board"}
+_PLATE_CLASSIFICATION_COLS = {"tdx_industry_board", "dc_concept_board", "dc_theme_board"}
 # Backward-compatible union for highlight logic
 _SIGNAL_COLS = _EVENT_SIGNAL_COLS | _STATE_METRIC_COLS | _FUNDAMENTAL_NA_COLS
 
@@ -361,6 +364,7 @@ def export_wide_to_excel(
                 "ts_code": ts_code,
                 "tdx_industry_board": cols.get("tdx_industry_board"),
                 "dc_concept_board": cols.get("dc_concept_board"),
+                "dc_theme_board": cols.get("dc_theme_board"),
             })
         plate_df = pd.DataFrame(plate_df_data)
         daily = daily.merge(plate_df, on="ts_code", how="left")
@@ -373,7 +377,7 @@ def export_wide_to_excel(
                     trade_date, time.monotonic() - t_plate)
 
     # Fill missing plate/concept values with "N/A"
-    for col in ["tdx_industry_board", "dc_concept_board"]:
+    for col in ["tdx_industry_board", "dc_concept_board", "dc_theme_board"]:
         if col in daily.columns:
             daily[col] = daily[col].fillna("N/A")
 
