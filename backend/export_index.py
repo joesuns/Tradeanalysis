@@ -132,15 +132,24 @@ def export_index_sheet(con, trade_date: str, wb) -> int:
             _orig_col_names[k] = _ew._COL_NAMES.get(k)
             _ew._COL_NAMES[k] = v
 
-        # ── Inject index identity columns into _FUND_COLS ─────
+        # ── Inject index identity columns into _ID_COLS / _FUND_COLS ─────
         # _resolve_sheet_layout splits daily_cols into basic (matched against
-        # _ID_COLS + _FUND_COLS) and signal (everything else).  We need
-        # index_name, index_category, pb in the basic group.
+        # _ID_COLS + _FUND_COLS in list order) and signal (everything else).
+        # Insert (not append) so index_name/index_category appear right after
+        # ts_code, and pb appears right after pe_ttm.
+        _extra_id = []
+        if "index_name" not in _ew._ID_COLS:
+            _ew._ID_COLS.insert(1, "index_name")
+            _extra_id.append("index_name")
+        if "index_category" not in _ew._ID_COLS:
+            _ew._ID_COLS.insert(2, "index_category")
+            _extra_id.append("index_category")
+
         _extra_fund = []
-        for c in ["index_name", "index_category", "pb"]:
-            if c not in _ew._FUND_COLS:
-                _ew._FUND_COLS.append(c)
-                _extra_fund.append(c)
+        if "pb" not in _ew._FUND_COLS:
+            # pe_ttm is at _FUND_COLS index 8; insert pb after it
+            _ew._FUND_COLS.insert(9, "pb")
+            _extra_fund.append("pb")
 
         # ── Build layout + transform values ───────────────────
         layout = _resolve_sheet_layout(daily_cols, weekly_cols, merged.columns)
@@ -151,7 +160,13 @@ def export_index_sheet(con, trade_date: str, wb) -> int:
         # ── Write sheet ──────────────────────────────────────
         _write_sheet_from_display(wb, "指数概览", display, layout)
     finally:
-        # Restore _FUND_COLS — guarded against concurrent mutation
+        # Restore _ID_COLS
+        for c in _extra_id:
+            try:
+                _ew._ID_COLS.remove(c)
+            except ValueError:
+                pass
+        # Restore _FUND_COLS
         for c in _extra_fund:
             try:
                 _ew._FUND_COLS.remove(c)
