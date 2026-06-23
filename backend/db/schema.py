@@ -1169,7 +1169,19 @@ _ADS_WIDE_VIEWS_DDL = [
         a.ma_5, a.ma_10,
         a.bias_ma5, a.bias_ma10,
         a.ma5_slope, a.ma10_slope,
-        a.alignment      AS ma_alignment,
+        CASE a.alignment
+            WHEN 'bull_strong'    THEN '多头强势 — 两线同步上行，持仓舒适区'
+            WHEN 'bull_building'  THEN '多头初建 — MA5已拐头向上，MA10惯性下行'
+            WHEN 'bull_weakening' THEN '多头衰竭 — MA5先拐头向下，即将死叉前兆'
+            WHEN 'bull_rolling'   THEN '多头翻转 — 两线均下行，死叉边缘'
+            WHEN 'bear_strong'    THEN '空头强势 — 两线同步下行，持币观望区'
+            WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
+            WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
+            WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'       THEN '均线走平 — 双斜率近零，方向待定'
+            WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
+            ELSE NULL
+        END              AS ma_alignment,
         a.turning_point  AS ma_turning_point,
         v.ma_vol_5,
         v.pct_vol_rank,
@@ -1213,7 +1225,19 @@ _ADS_WIDE_VIEWS_DDL = [
         a.ma_5, a.ma_10,
         a.bias_ma5, a.bias_ma10,
         a.ma5_slope, a.ma10_slope,
-        a.alignment      AS ma_alignment,
+        CASE a.alignment
+            WHEN 'bull_strong'    THEN '多头强势 — 两线同步上行，持仓舒适区'
+            WHEN 'bull_building'  THEN '多头初建 — MA5已拐头向上，MA10惯性下行'
+            WHEN 'bull_weakening' THEN '多头衰竭 — MA5先拐头向下，即将死叉前兆'
+            WHEN 'bull_rolling'   THEN '多头翻转 — 两线均下行，死叉边缘'
+            WHEN 'bear_strong'    THEN '空头强势 — 两线同步下行，持币观望区'
+            WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
+            WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
+            WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'       THEN '均线走平 — 双斜率近零，方向待定'
+            WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
+            ELSE NULL
+        END              AS ma_alignment,
         a.turning_point  AS ma_turning_point,
         v.ma_vol_5, v.pct_vol_rank,
         v.zone           AS vol_zone,
