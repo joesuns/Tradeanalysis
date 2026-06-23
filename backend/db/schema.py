@@ -811,6 +811,18 @@ _ADS_WIDE_VIEWS_DDL = [
 
         q.close_qfq      AS close,
         q.pct_chg        AS pct_chg,
+
+        -- Multi-period returns (trading-day LAG over close_qfq)
+        ROUND((q.close_qfq / LAG(q.close_qfq, 3) OVER (
+            PARTITION BY q.ts_code ORDER BY q.trade_date
+        ) - 1) * 100, 2)   AS pct_chg_3d,
+        ROUND((q.close_qfq / LAG(q.close_qfq, 20) OVER (
+            PARTITION BY q.ts_code ORDER BY q.trade_date
+        ) - 1) * 100, 2)   AS pct_chg_1m,
+        ROUND((q.close_qfq / LAG(q.close_qfq, 250) OVER (
+            PARTITION BY q.ts_code ORDER BY q.trade_date
+        ) - 1) * 100, 2)   AS pct_chg_1y,
+
         q.vol            AS vol,
         q.amount         AS amount,
         q.total_mv       AS total_mv,
