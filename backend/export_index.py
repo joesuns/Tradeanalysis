@@ -1,4 +1,4 @@
-"""Export index analysis to Excel — standalone sheet."""
+"""Export index analysis to Excel — standalone sheet matching stock sheet styling."""
 import logging
 
 import pandas as pd
@@ -8,24 +8,57 @@ logger = logging.getLogger(__name__)
 # View for index daily data
 _INDEX_VIEW = "v_ads_market_index_daily"
 
-# Column order for index export sheet
-_INDEX_COL_ORDER = [
-    "ts_code", "index_name", "index_category",
-    "close", "pct_chg", "vol", "amount",
-    "pe_ttm", "pb", "total_mv",
-    # MACD
-    "dif", "dea", "macd_bar", "macd_zone", "macd_turning_point",
-    "macd_trend", "macd_trend_strength", "macd_divergence",
-    # MA
-    "ma_5", "ma_10", "bias_ma5", "ma5_slope", "ma_alignment",
-    # Volume
-    "volume_ratio", "vol_trend_strength", "vol_zone", "vol_trend",
+# Header styling constants — aligned with backend/export_wide.py
+_HEADER_FONT_11 = {"name": "微软雅黑", "color": "FFFFFF", "size": 11, "bold": True}
+_HEADER_FONT_10 = {"name": "微软雅黑", "color": "FFFFFF", "size": 10}
+_BASIC_FILL = "1A1A1A"
+_GROUP_FILL = "1A5276"  # same as daily group header in stock sheet
+
+# Indicator group colors — same palette as export_wide.py _GROUP_COLORS
+_COL_PREFIX_COLORS = {
+    "macd_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
+    "ma_": "2980B9", "bias_": "2980B9", "ma5": "2980B9", "ma10": "2980B9",
+    "vol_": "27AE60", "volume_": "27AE60", "pct_vol": "27AE60",
+}
+_DEFAULT_TINT = "7F8C8D"
+
+# Column order + group labels (Row 1 merge spans)
+_COL_GROUPS = [
+    ("基本信息", [
+        "ts_code", "index_name", "index_category",
+        "close", "pct_chg", "vol", "amount",
+        "pe_ttm", "pb", "total_mv",
+    ]),
+    ("MACD 指标", [
+        "dif", "dea", "macd_bar", "macd_zone", "macd_turning_point",
+        "macd_trend", "macd_trend_strength", "macd_divergence",
+    ]),
+    ("MA 均线", [
+        "ma_5", "ma_10", "bias_ma5", "ma5_slope", "ma_alignment",
+    ]),
+    ("量能信号", [
+        "volume_ratio", "vol_trend_strength", "vol_zone", "vol_trend",
+    ]),
 ]
 
 
+def _tint_for_col(col: str) -> str:
+    """Match column to indicator color prefix."""
+    for prefix, color in _COL_PREFIX_COLORS.items():
+        if col.startswith(prefix):
+            return color
+    return _DEFAULT_TINT
+
+
 def export_index_sheet(con, trade_date: str, ws) -> int:
-    """Write index overview to an openpyxl worksheet. Returns row count."""
-    from openpyxl.styles import Font, PatternFill, Alignment
+    """Write index overview to an openpyxl worksheet. Returns row count.
+
+    Styling matches the stock analysis sheets:
+    - Row 1: merged group headers (blue fill, white 雅黑 11pt)
+    - Row 2: individual column names with indicator-colored fills
+    - Data from Row 3
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     df = con.execute(f"""
         SELECT * FROM {_INDEX_VIEW}
@@ -44,35 +77,61 @@ def export_index_sheet(con, trade_date: str, ws) -> int:
         ws.cell(row=1, column=1, value=f"No index data for {trade_date}")
         return 0
 
-    # Select columns that exist
-    cols = [c for c in _INDEX_COL_ORDER if c in df.columns]
-    df = df[cols]
+    # Flatten column order from groups
+    all_cols = []
+    for _, cols in _COL_GROUPS:
+        for c in cols:
+            if c in df.columns and c not in all_cols:
+                all_cols.append(c)
+    df = df[all_cols]
 
-    # Header styling
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font = Font(bold=True, size=11, color="FFFFFF")
-    center_align = Alignment(horizontal="center")
+    # ── styles ────────────────────────────────────────────
+    group_font = Font(**_HEADER_FONT_11)
+    col_font = Font(**_HEADER_FONT_10)
+    basic_fill = PatternFill(start_color=_BASIC_FILL, end_color=_BASIC_FILL, fill_type="solid")
+    group_fill = PatternFill(start_color=_GROUP_FILL, end_color=_GROUP_FILL, fill_type="solid")
+    center_align = Alignment(horizontal="center", vertical="center")
+    header_border = Border(bottom=Side(style="thin", color="5D6D7E"))
 
-    # Write header
-    for j, col in enumerate(cols, 1):
-        cell = ws.cell(row=1, column=j, value=col)
-        cell.font = header_font
-        cell.fill = header_fill
+    # ── Row 1: merged group headers ───────────────────────
+    col = 1
+    for group_name, group_cols in _COL_GROUPS:
+        present = [c for c in group_cols if c in all_cols]
+        if not present:
+            continue
+        n = len(present)
+        if n > 1:
+            ws.merge_cells(start_row=1, start_column=col,
+                           end_row=1, end_column=col + n - 1)
+        c = ws.cell(row=1, column=col, value=group_name)
+        c.fill = group_fill
+        c.font = group_font
+        c.alignment = center_align
+        c.border = header_border
+        col += n
+
+    # ── Row 2: individual column names ────────────────────
+    for j, col_name in enumerate(all_cols, 1):
+        tint = _tint_for_col(col_name)
+        cell = ws.cell(row=2, column=j, value=col_name)
+        cell.font = col_font
+        cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
         cell.alignment = center_align
+        cell.border = header_border
 
-    # Write data rows
+    # ── Data rows ─────────────────────────────────────────
     for i, (_, row) in enumerate(df.iterrows()):
-        for j, col in enumerate(cols, 1):
-            val = row[col]
+        for j, col_name in enumerate(all_cols, 1):
+            val = row[col_name]
             if isinstance(val, float) and pd.isna(val):
                 val = None
-            ws.cell(row=i + 2, column=j, value=val)
+            ws.cell(row=i + 3, column=j, value=val)
 
-    # Auto-fit column widths
+    # ── Column widths ─────────────────────────────────────
     from openpyxl.utils import get_column_letter
-    for j, col in enumerate(cols, 1):
-        max_width = max(len(str(col)), 12)
-        ws.column_dimensions[get_column_letter(j)].width = min(max_width + 2, 22)
+    for j, col_name in enumerate(all_cols, 1):
+        hdr_len = sum(2.2 if "一" <= c <= "鿿" else 1.0 for c in str(col_name))
+        ws.column_dimensions[get_column_letter(j)].width = min(hdr_len + 2, 22)
 
     ws.auto_filter.ref = ws.dimensions
     return len(df)
