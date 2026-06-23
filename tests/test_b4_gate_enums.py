@@ -19,3 +19,8 @@ def test_vol_trend_compound_label():
 
 def test_macd_alert_hist_turn():
     assert normalize_value("macd_alert", "柱线拐上", "123") == "downturn_reverse"
+
+
+def test_dde_alert_hist_turn():
+    assert normalize_value("dde_alert", "斜率拐头看多", "123") == "downturn_reverse"
+    assert normalize_value("dde_alert", "斜率拐头看空", "123") == "upturn_reverse"

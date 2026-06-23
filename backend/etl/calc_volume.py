@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import pandas as pd
 from backend.etl.base import (
     sma, linear_regression_slope, to_float_safe,
@@ -146,24 +147,146 @@ def compute_volume_trend_series(
 ) -> list:
     """Per-bar ``volume_trend_v2`` on expanding prefixes; None until anchor met.
 
-    When ``target_indices`` is set (APPEND path), only those bar indices are
-    computed — each call uses ``vol[:i+1]`` identical to the full-series path.
-    Volume uses an ordered index **list**; MACD/DDE divergence uses a **set**
-    for output cropping only.
+    Delegates to the vectorized implementation that pre-computes SMA and
+    direction slopes once, then does a lightweight per-bar pass for
+    percentile/regime classification only.
     """
+    return _compute_volume_trend_series_vectorized(
+        vol_series, params, target_indices=target_indices,
+    )
+
+
+def _compute_volume_trend_series_vectorized(
+    vol_series,
+    params: dict,
+    target_indices: Optional[list] = None,
+) -> list:
+    """Pre-computed SMA + direction slopes version of compute_volume_trend_series.
+
+    Avoids per-bar ``pd.Series.rolling()`` and ``np.polyfit`` by:
+    1. Computing the full MA5 rolling series ONCE (via pandas, then .to_numpy())
+    2. Pre-computing 5-bar OLS direction slopes for ALL bars via
+       ``weighted_window_slopes(decay=0)`` / ``sliding_window_mean_abs``
+    Then the per-bar loop only does percentile / regime classification,
+    which are cheap (anchor: 60 or 30 elements).
+
+    Semantically identical to compute_volume_trend_series; verified by
+    test_compute_volume_trend_series_vectorized_matches_original.
+    """
+    from backend.etl.base import weighted_window_slopes, sliding_window_mean_abs
+
     vol = np.asarray(vol_series, dtype=float)
     n = len(vol)
-    anchor = int(params["anchor_bars"])
+    anchor_bars = int(params["anchor_bars"])
+    ma_window = int(params.get("ma_window", 5))
     result = [None] * n
-    kw = {k: params[k] for k in params if k != "anchor_bars"}
+    kw = {k: params[k] for k in params if k not in ("anchor_bars", "ma_window")}
+
+    # ---- pre-compute once on NaN-free array ----
+    # volume_trend_v2 drops NaN via y = y[np.isfinite(y)] before computing
+    # SMA and direction; match that behaviour so the per-bar loop only needs
+    # index-mapping via cumulative finite counts.
+    finite_mask = np.isfinite(vol)
+    vol_clean = vol[finite_mask]
+    cumsum_finite = np.cumsum(finite_mask)
+
+    # 1. Full MA5 series on clean data (same semantics as volume_trend_v2)
+    ma_clean = (
+        pd.Series(vol_clean)
+        .rolling(window=ma_window, min_periods=ma_window)
+        .mean()
+        .to_numpy(dtype=float)
+    )
+
+    # 2. Per-bar direction slopes for obs_5 (window=5, unweighted, on clean data)
+    dir_slopes_clean = weighted_window_slopes(vol_clean, window=5, decay=0.0)
+    dir_scales_clean = sliding_window_mean_abs(vol_clean, window=5)
+    dir_vals_clean = np.full(len(vol_clean), np.nan)
+    with np.errstate(invalid="ignore"):
+        dir_ok = np.isfinite(dir_slopes_clean) & (dir_scales_clean > 1e-9)
+        dir_vals_clean[dir_ok] = (
+            dir_slopes_clean[dir_ok] / dir_scales_clean[dir_ok]
+        )
+
+    vol_flat_eps = float(kw.get("vol_flat_eps", 0.001))
+    high_percentile = float(kw.get("high_percentile", 80))
+    low_percentile = float(kw.get("low_percentile", 20))
+    amp_threshold = float(kw.get("amp_threshold", 1.4))
+    fast_count = int(kw.get("fast_count", 3))
+    recent_count = int(kw.get("recent_count", 2))
+    confirm_window = int(kw.get("confirm_window", 10))
+    confirm_count = int(kw.get("confirm_count", 3))
+
+    # ---- per-bar loop (only percentile + regime, no polyfit / rolling) ----
     indices = range(n) if target_indices is None else target_indices
     for i in indices:
         if i < 0 or i >= n:
             continue
-        if i + 1 < anchor:
+        # number of finite (non-NaN) values in vol[:i+1]
+        n_finite_i = int(cumsum_finite[i])
+        if n_finite_i < anchor_bars:
             continue
-        _, label = volume_trend_v2(vol[: i + 1], anchor_bars=anchor, **kw)
+        # valid SMA values = clean SMA minus leading NaN from min_periods
+        n_valid_sma = n_finite_i - ma_window + 1
+        if n_valid_sma < anchor_bars:
+            continue
+
+        valid_ma = ma_clean[ma_window - 1 : n_finite_i]
+        anchor = valid_ma[-anchor_bars:]
+        p80 = float(np.percentile(anchor, high_percentile))
+        p20 = float(np.percentile(anchor, low_percentile))
+
+        amp = p80 / max(p20, 1e-9)
+        if amp < amp_threshold:
+            regime = "振幅不足"
+        else:
+            recent_ma = (
+                valid_ma[-confirm_window:]
+                if len(valid_ma) >= confirm_window
+                else valid_ma
+            )
+            if len(recent_ma) >= fast_count and bool(
+                np.all(recent_ma[-fast_count:] >= p80)
+            ):
+                regime = "爆量区"
+            elif len(recent_ma) >= fast_count and bool(
+                np.all(recent_ma[-fast_count:] <= p20)
+            ):
+                regime = "地量区"
+            else:
+                boom_days = int(np.sum(recent_ma >= p80))
+                dry_days = int(np.sum(recent_ma <= p20))
+                boom_recent = (
+                    int(np.sum(recent_ma[-5:] >= p80))
+                    if len(recent_ma) >= 5
+                    else 0
+                )
+                dry_recent = (
+                    int(np.sum(recent_ma[-5:] <= p20))
+                    if len(recent_ma) >= 5
+                    else 0
+                )
+                if boom_days >= confirm_count and boom_recent >= recent_count:
+                    regime = "爆量区"
+                elif dry_days >= confirm_count and dry_recent >= recent_count:
+                    regime = "地量区"
+                else:
+                    regime = "正常区"
+
+        # direction: map original index to clean-array position
+        dir_val = dir_vals_clean[n_finite_i - 1]
+        if not np.isfinite(dir_val):
+            dir_val = 0.0
+        if dir_val > vol_flat_eps:
+            direction = "放量中"
+        elif dir_val < -vol_flat_eps:
+            direction = "缩量中"
+        else:
+            direction = "平量"
+
+        label = f"{regime}·{direction}"
         result[i] = trend_from_v2_label(label)
+
     return result
 
 
@@ -201,6 +324,43 @@ def require_trend_target_indices(
             f"new_bars={new_bars} mapped={len(indices)}"
         )
     return indices
+
+
+def _compute_pct_rank_vectorized(ma_vol_5: np.ndarray, window: int = 120) -> np.ndarray:
+    """Percentile rank (vectorized, single-pass).
+
+    For each bar ``i >= window-1``, computes the fraction of valid values
+    in ``ma_vol_5[i-window+1 : i+1]`` that are <= ``ma_vol_5[i]``, then
+    multiplies by 100.  Uses ``sliding_window_view`` to compare all bars
+    against their respective windows in one broadcast operation.
+
+    Matches the original per-bar loop exactly (verified by
+    ``test_pct_rank_vectorized_matches_original``).
+    """
+    n = len(ma_vol_5)
+    result = np.full(n, np.nan)
+
+    if n < window:
+        return result
+
+    # sliding_window_view(x, w) returns shape (n-w+1, w):
+    #   row k = x[k : k+w]  for k = 0 .. n-w
+    # For bar i, the trailing window is ma_vol_5[i-window+1 : i+1],
+    # which is row (i-window+1) of the view.
+    windows = sliding_window_view(ma_vol_5, window)               # (n-w+1, window)
+    cur = ma_vol_5[window - 1:]                                    # (n-w+1,)
+
+    valid_mask = ~np.isnan(windows)                                # (n-w+1, window)
+    valid_count = valid_mask.sum(axis=1)                           # (n-w+1,)
+
+    cur_2d = cur[:, np.newaxis]                                    # (n-w+1, 1)
+    le = (windows <= cur_2d) & valid_mask                          # (n-w+1, window)
+    rank = le.sum(axis=1) / np.maximum(valid_count, 1) * 100.0    # (n-w+1,)
+
+    apply_mask = (valid_count >= 2) & np.isfinite(cur)
+    result[window - 1:][apply_mask] = rank[apply_mask]
+
+    return result
 
 
 class VolumeCalculator:
@@ -296,7 +456,7 @@ class VolumeCalculator:
         v = df["vol"].values.astype(float)
         df["ma_vol_5"] = sma(v, 5)
         df["volume_ratio"] = self._compute_volume_ratio(df)
-        df["pct_vol_rank"] = self._compute_pct_rank(df["ma_vol_5"].values, 120)
+        df["pct_vol_rank"] = _compute_pct_rank_vectorized(df["ma_vol_5"].values, 120)
         return df
 
     def _compute_volume_derived(
@@ -394,7 +554,8 @@ class VolumeCalculator:
             result.calculated += 1
         return result
 
-    def _compute_pct_rank(self, ma_vol_5: np.ndarray, window: int) -> np.ndarray:
+    @staticmethod
+    def _compute_pct_rank(ma_vol_5: np.ndarray, window: int) -> np.ndarray:
         """Percentile rank of current MA5_vol within the last `window` valid values."""
         n = len(ma_vol_5)
         result = np.full(n, np.nan)

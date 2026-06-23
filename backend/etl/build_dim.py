@@ -66,22 +66,4 @@ def build_dim_date(con) -> int:
     return con.execute("SELECT COUNT(*) FROM dim_date").fetchone()[0]
 
 
-def build_dim_concept(con) -> tuple[int, int]:
-    """Build dim_concept + dim_concept_stock from ods_concept_detail.
-    Returns (concept_count, mapping_count)."""
-    con.execute("DELETE FROM dim_concept_stock")
-    con.execute("DELETE FROM dim_concept")
-    con.execute("""
-    INSERT INTO dim_concept (concept_id, concept_name)
-    SELECT ROW_NUMBER() OVER (ORDER BY concept_name), concept_name
-    FROM (SELECT DISTINCT concept_name FROM ods_concept_detail)
-    """)
-    con.execute("""
-    INSERT INTO dim_concept_stock (concept_id, ts_code)
-    SELECT c.concept_id, o.ts_code
-    FROM ods_concept_detail o
-    JOIN dim_concept c ON o.concept_name = c.concept_name
-    """)
-    concepts = con.execute("SELECT COUNT(*) FROM dim_concept").fetchone()[0]
-    mappings = con.execute("SELECT COUNT(*) FROM dim_concept_stock").fetchone()[0]
-    return concepts, mappings
+

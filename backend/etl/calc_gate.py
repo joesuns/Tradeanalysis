@@ -110,8 +110,16 @@ def _step_caused_data_mutation(step_name: str, row_count: int, comp: Dict[str, A
     if step_name in _FETCH_STEPS:
         if "ods_rows_written" in comp or "changed_codes_count" in comp:
             written = int(comp.get("ods_rows_written") or 0)
-            changed = int(comp.get("changed_codes_count") or 0)
-            return written > 0 or changed > 0
+            if written <= 0:
+                changed = int(comp.get("changed_codes_count") or 0)
+                return changed > 0
+            affected_cols = comp.get("affected_ods_columns")
+            if affected_cols is not None:
+                from backend.etl.column_indicator_deps import (
+                    affected_ods_column_names_block_calc,
+                )
+                return affected_ods_column_names_block_calc(affected_cols)
+            return written > 0
         return row_count > 0
 
     if step_name in _REBUILD_STEPS:

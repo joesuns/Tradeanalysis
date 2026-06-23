@@ -57,13 +57,3 @@ def test_is_week_end_cross_year_week_single_marker(temp_db):
         f"跨年周应只有一个周末标记 20260102，实际为 {week_ends}"
     )
 
-
-def test_build_dim_concept(temp_db):
-    create_all_tables(temp_db)
-    temp_db.execute("INSERT INTO dim_stock (ts_code,stock_code,symbol,name,exchange) VALUES ('000001.SZ','000001','000001','平安银行','深圳')")
-    temp_db.execute("INSERT INTO ods_concept_detail (concept_name,ts_code) VALUES ('人工智能','000001.SZ')")
-
-    from backend.etl.build_dim import build_dim_concept
-    c, m = build_dim_concept(temp_db)
-    assert c == 1
-    assert m == 1

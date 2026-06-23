@@ -1043,7 +1043,7 @@ def test_calc_stock_chunk_reuses_batch_ctx_without_reload(monkeypatch):
     monkeypatch.setattr("backend.etl.calc_fast_skip.batch_load_quote_tails", spy_quote_tails)
     monkeypatch.setattr("backend.etl.calc_fast_skip.batch_load_dde_tails", spy_dde_tails)
     real_connect = duckdb.connect
-    monkeypatch.setattr("duckdb.connect", lambda path: real_connect(":memory:"))
+    monkeypatch.setattr("duckdb.connect", lambda path, **kw: real_connect(":memory:"))
     monkeypatch.setattr("backend.etl.orchestrator.resolve_recalc_start", lambda *a, **k: None)
 
     def fake_preflight(ts_code, state_map, daily_q, weekly_q, daily_dde, weekly_dde, **kwargs):
@@ -1120,7 +1120,7 @@ def test_calc_stock_chunk_passes_dwd_fp_cache_to_preflight(monkeypatch):
     monkeypatch.setattr("backend.etl.calc_state.upsert_calc_state_batch", lambda *a, **k: 0)
 
     real_connect = __import__("duckdb").connect
-    monkeypatch.setattr("duckdb.connect", lambda path: real_connect(":memory:"))
+    monkeypatch.setattr("duckdb.connect", lambda path, **kw: real_connect(":memory:"))
 
     _calc_stock_chunk(["A.SZ"], "20260609", incremental=True, batch_ctx=None)
 

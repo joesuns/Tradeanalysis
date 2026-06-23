@@ -75,8 +75,12 @@ def default_export_path(trade_date: str, output: str = None) -> str:
 _COL_NAMES = {
     "freq": "周期", "trade_date": "交易日期", "ts_code": "股票代码",
     "stock_code": "代码", "stock_name": "股票名称", "exchange": "交易所",
-    "sector": "板块", "industry": "行业", "is_st": "ST",
-    "close": "收盘价", "pct_chg": "涨跌幅%", "vol": "成交量(万手)", "amount": "成交额(亿)",
+    "sector": "上市板", "industry": "申万行业",
+    "tdx_industry_board": "通达信行业", "dc_concept_board": "概念板块",
+    "dc_theme_board": "所属题材", "is_st": "ST",
+    "close": "收盘价", "pct_chg": "涨跌幅%",
+    "pct_chg_3d": "最近3天涨跌幅", "pct_chg_1m": "最近1月涨跌幅", "pct_chg_1y": "最近1年涨跌幅",
+    "vol": "成交量(万手)", "amount": "成交额(亿)",
     "total_mv": "总市值(亿)", "pe_ttm": "市盈率", "turnover_rate": "换手率%",
     "kpattern": "K线形态", "kpattern_strength": "形态强度",
     "ema_12": "EMA12", "ema_26": "EMA26", "dif": "DIF", "dea": "DEA",
@@ -103,16 +107,19 @@ _COL_NAMES = {
     "price_position_60d": "60日价格滚动分位(%)", "price_position_120d": "120日价格滚动分位(%)",
     "price_position_250d": "250日价格滚动分位(%)",
     "vol_signal": "量价信号",
+    "risk_alert": "风险预警",
 }
 
 _BASIC_HEADER_FILL = "1A1A1A"
 
 _ID_COLS = [
     "ts_code", "trade_date", "stock_code", "stock_name",
-    "exchange", "sector", "industry", "is_st",
+    "exchange", "sector", "industry", "tdx_industry_board", "dc_concept_board",
+    "dc_theme_board", "is_st",
 ]
 _FUND_COLS = [
-    "close", "pct_chg", "vol", "amount", "total_mv",
+    "close", "pct_chg", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y",
+    "vol", "amount", "total_mv",
     "pe_ttm", "turnover_rate", "volume_ratio",
 ]
 
@@ -135,9 +142,51 @@ _SIGNAL_ONLY = [
     "macd_zone", "macd_turning_point", "macd_alert", "macd_trend", "macd_trend_strength",
     "ma_alignment", "ma_turning_point", "bias_ma5", "bias_ma10",
     "dde_divergence_tradable",
-    "dde_trend", "dde_trend_strength", "dde_alert",
+    "dde_trend", "dde_trend_strength", "dde_alert", "risk_alert",
     "vol_zone", "vol_trend", "vol_divergence", "vol_signal",
 ]
+
+
+def _resolve_portfolio_remarks(
+    con,
+    portfolio_codes: "List[str]",
+    trade_date: str,
+    daily_stock_codes: "set",
+) -> "Dict[str, str]":
+    """Resolve remark for each portfolio stock based on data presence.
+
+    Returns:
+        Dict mapping stock_code → remark label:
+        - ``"正常"`` — stock has daily data for trade_date
+        - ``"已退市"`` — stock in dim_stock with delist_date < trade_date
+        - ``"当日无数据（可能停牌）"`` — in dim_stock, not delisted, no daily data
+        - ``"未入库"`` — not in dim_stock at all
+    """
+    if not portfolio_codes:
+        return {}
+
+    placeholders = ",".join(["?" for _ in portfolio_codes])
+    dim_rows = con.execute(
+        f"SELECT stock_code, delist_date FROM dim_stock WHERE stock_code IN ({placeholders})",
+        portfolio_codes,
+    ).fetchall()
+
+    dim_map: dict = {}
+    for stock_code, delist_date in dim_rows:
+        dim_map[stock_code] = delist_date
+
+    result = {}
+    for code in portfolio_codes:
+        if code in daily_stock_codes:
+            result[code] = "正常"
+        elif code not in dim_map:
+            result[code] = "未入库"
+        elif dim_map[code] and str(dim_map[code]) < trade_date:
+            result[code] = "已退市"
+        else:
+            result[code] = "当日无数据（可能停牌）"
+
+    return result
 
 
 def _reorder_vol_signal(cols):
@@ -169,6 +218,14 @@ def _attach_header_comment(cell, col_key, weekly=False):
     width, height = comment_box_size()
     cell.comment = Comment(text, comment_author(), width=width, height=height)
 
+# Shared alert enum labels — macd_alert and dde_alert use identical translations.
+_ALERT_LABELS = {
+    "upturn_reverse": "上升趋势回落",
+    "downturn_reverse": "下降趋势反弹",
+    "upturn_flat": "上升趋势走平",
+    "downturn_flat": "下降趋势走平",
+}
+
 # Enum value translations (English → Chinese). NULL = no signal, shown as "-"
 _ENUM_VALUES = {
     "kpattern": {"yang_bao_yin": "阳包阴", "yang_ke_yin": "阳克阴",
@@ -184,21 +241,21 @@ _ENUM_VALUES = {
     "macd_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "macd_divergence_tradable": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "macd_divergence_reject": {"skip_peak": "隔峰", "tg_lag": "滞后", "zone_mismatch": "区域"},
-    "macd_alert": {"upturn_reverse": "上升拐头", "downturn_reverse": "下降拐头",
-                   "upturn_flat": "上升走平", "downturn_flat": "下降走平"},
+    "macd_alert": _ALERT_LABELS,
     "ma_turning_point": {"golden_cross": "金叉", "dead_cross": "死叉",
                          "near_golden": "近金叉", "near_dead": "近死叉"},
     "dde_trend": {"up": "上升", "down": "下降", "flat": "走平"},
     "dde_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "dde_divergence_tradable": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "dde_divergence_reject": {"skip_peak": "隔峰", "tg_lag": "滞后", "zone_mismatch": "区域"},
-    "dde_alert": {"upturn_reverse": "上升拐头", "downturn_reverse": "下降拐头",
-                  "upturn_flat": "上升走平", "downturn_flat": "下降走平"},
+    "dde_alert": _ALERT_LABELS,
     "vol_zone": {"explosive": "爆量", "low_volume": "地量", "normal": "正常"},
     "vol_trend": {"expanding": "放量", "shrinking": "缩量", "flat": "平量"},
     "vol_divergence": {"top_divergence": "顶背离", "bottom_divergence": "底背离"},
     "vol_signal": {
-        "breakout_confirmed": "突破确认", "volume_climax": "放量滞涨",
+        "breakout_tight": "缩量突破", "breakout_moderate": "温和突破",
+        "breakout_heavy": "爆量突破",
+        "volume_climax": "放量滞涨",
         "volume_dry_up": "缩量止跌",
         "golden_cross_weakened": "金叉量弱", "dead_cross_weakened": "死叉量弱",
     },
@@ -211,7 +268,7 @@ _EVENT_SIGNAL_COLS = {
     "macd_turning_point", "macd_alert",
     "ma_turning_point", "dde_alert",
     "dde_divergence", "dde_divergence_tradable", "dde_divergence_reject",
-    "vol_divergence", "vol_signal",
+    "vol_divergence", "vol_signal", "risk_alert",
 }
 # State metrics — NULL means "not computable / insufficient history" (shown as "N/A")
 _STATE_METRIC_COLS = {
@@ -221,12 +278,15 @@ _STATE_METRIC_COLS = {
     "vol_trend", "vol_trend_strength", "volume_ratio",
     "price_position_60d", "price_position_120d", "price_position_250d",
 }
-_FUNDAMENTAL_NA_COLS = {"pe_ttm"}
+_FUNDAMENTAL_NA_COLS = {"pe_ttm", "pb", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y"}
+# Classification columns — stock attributes not derived from signals; null → "N/A"
+_PLATE_CLASSIFICATION_COLS = {"tdx_industry_board", "dc_concept_board", "dc_theme_board"}
 # Backward-compatible union for highlight logic
 _SIGNAL_COLS = _EVENT_SIGNAL_COLS | _STATE_METRIC_COLS | _FUNDAMENTAL_NA_COLS
 
 # Columns to round to 2 decimal places
-_ROUND_2DP = {"close", "pct_chg", "pe_ttm", "turnover_rate", "net_mf_amount",
+_ROUND_2DP = {"close", "pct_chg", "pct_chg_3d", "pct_chg_1m", "pct_chg_1y",
+              "pe_ttm", "pb", "turnover_rate", "net_mf_amount",
               "volume_ratio", "vol_trend_strength",
               "price_position_60d", "price_position_120d", "price_position_250d"}
 
@@ -246,6 +306,7 @@ def export_wide_to_excel(
     filter_st: bool = True,
     include_index: bool = True,
     ts_codes: list[str] = None,  # 可选，只导出指定股票
+    portfolio_stocks: list[dict] = None,  # [{"stockcode","stockname"}, ...]
 ) -> ExportResult:
     """Export horizontal daily+weekly merged analysis to Excel.
 
@@ -290,9 +351,55 @@ def export_wide_to_excel(
             return ExportResult(0, tradable_meta)
 
     daily = _format_numbers(daily)
+    # ── Market summary columns (上证/沪深300) ──
+    try:
+        idx_summary = con.execute("""
+            SELECT ts_code, pct_chg, macd_trend
+            FROM v_ads_market_index_daily
+            WHERE trade_date = ?
+              AND ts_code IN ('000001.SH', '000300.SH')
+        """, [trade_date]).df()
+        for _, row in idx_summary.iterrows():
+            code = row["ts_code"]
+            suffix = "000001" if code == "000001.SH" else "000300"
+            daily[f"index_{suffix}_pct_chg"] = row["pct_chg"]
+            macd_val = row.get("macd_trend")
+            daily[f"index_{suffix}_macd"] = macd_val if macd_val and not (isinstance(macd_val, float) and pd.isna(macd_val)) else None
+    except Exception:
+        pass  # index data not available
     daily, daily_enrich = enrich_tradable_columns(daily, con, freq="daily")
     tradable_meta["daily"] = daily_enrich.to_dict()
     log_tradable_enrich_progress(daily_enrich)
+
+    # ---- Enrich with plate/concept data ----
+    from backend.fetch.ods_plate import load_plate_enrichment
+
+    t_plate = time.monotonic()
+    logger.info("progress export: loading plate enrichment | date=%s", trade_date)
+    plate_enrichment = load_plate_enrichment(con, trade_date)
+    if plate_enrichment:
+        plate_df_data = []
+        for ts_code, cols in plate_enrichment.items():
+            plate_df_data.append({
+                "ts_code": ts_code,
+                "tdx_industry_board": cols.get("tdx_industry_board"),
+                "dc_concept_board": cols.get("dc_concept_board"),
+                "dc_theme_board": cols.get("dc_theme_board"),
+            })
+        plate_df = pd.DataFrame(plate_df_data)
+        daily = daily.merge(plate_df, on="ts_code", how="left")
+        logger.info(
+            "progress export: plate enrichment done | enriched=%d rows | %.0fs",
+            len(plate_df), time.monotonic() - t_plate,
+        )
+    else:
+        logger.info("progress export: no plate data for %s | %.0fs",
+                    trade_date, time.monotonic() - t_plate)
+
+    # Fill missing plate/concept values with "N/A"
+    for col in ["tdx_industry_board", "dc_concept_board", "dc_theme_board"]:
+        if col in daily.columns:
+            daily[col] = daily[col].fillna("N/A")
 
     # ---- Weekly data: use latest week-end ≤ trade_date ----
     t_weekly = time.monotonic()
@@ -357,7 +464,7 @@ def export_wide_to_excel(
     logger.info("progress export: building sheets | rows=%d", len(merged))
     wb = Workbook()
     wb.remove(wb.active)
-    # ---- Signal-only analysis sheet (first sheet) ----
+    # ---- Signal-only analysis sheet layout (reused by portfolio) ----
     _signal_set = set(_SIGNAL_ONLY)
     daily_signal_only = [c for c in _SIGNAL_ONLY if c in daily_cols] + [
         c for c in daily_cols if c in basic_cols_outer and c not in _signal_set
@@ -368,10 +475,112 @@ def export_wide_to_excel(
     layout_signal = _resolve_sheet_layout(
         daily_signal_only, weekly_signal_only, merged.columns,
     )
-    display_signal = display_full[layout_signal.display_cols]
 
+    # ---- Portfolio sheet (first sheet, if portfolio_stocks provided) ----
+    if portfolio_stocks:
+        portfolio_codes = [s["stockcode"] for s in portfolio_stocks]
+        portfolio_name_map = {s["stockcode"]: s["stockname"] for s in portfolio_stocks}
+
+        # Filter merged data to portfolio stocks via stock_code column
+        if "stock_code" in merged.columns:
+            portfolio_df = merged[merged["stock_code"].isin(portfolio_codes)].copy()
+        else:
+            portfolio_df = merged[merged["ts_code"].isin(portfolio_codes)].copy()
+
+        # Detect which portfolio stocks have data
+        daily_stock_codes = set(portfolio_df["stock_code"].tolist()) if "stock_code" in portfolio_df.columns else set()
+
+        # Resolve remarks for ALL portfolio stocks
+        remarks = _resolve_portfolio_remarks(
+            con, portfolio_codes, trade_date, daily_stock_codes,
+        )
+
+        # Build placeholder rows for missing portfolio stocks
+        missing_codes = [c for c in portfolio_codes if c not in daily_stock_codes]
+        if missing_codes:
+            placeholder_rows = []
+            for code in missing_codes:
+                row = {col: None for col in layout_signal.display_cols}
+                row["stock_code"] = code
+                row["stock_name"] = portfolio_name_map.get(code, code)
+                row["ts_code"] = ""
+                placeholder_rows.append(row)
+            placeholder_df = pd.DataFrame(placeholder_rows)
+            # Ensure all display columns exist
+            for col in layout_signal.display_cols:
+                if col not in placeholder_df.columns:
+                    placeholder_df[col] = None
+            placeholder_df = placeholder_df[layout_signal.display_cols]
+            # Apply display nulls to placeholder rows
+            placeholder_df = apply_display_nulls(placeholder_df)
+            # Combine: data rows first, then placeholder rows
+            portfolio_display = pd.concat(
+                [portfolio_df[layout_signal.display_cols], placeholder_df],
+                ignore_index=True,
+            )
+        else:
+            portfolio_display = portfolio_df[layout_signal.display_cols]
+
+        # Apply display transformations to the portfolio subset
+        portfolio_display = _transform_display_values(portfolio_display)
+
+        # Append remark column
+        if "stock_code" in portfolio_df.columns:
+            data_codes = portfolio_df["stock_code"].tolist()
+        else:
+            data_codes = []
+        all_codes = data_codes + missing_codes
+        remark_values = [remarks.get(c, "") for c in all_codes]
+        portfolio_display["备注"] = remark_values
+
+        # Build layout for portfolio (same as signal, "备注" as trailing non-signal column)
+        portfolio_layout = SheetLayout(
+            display_cols=layout_signal.display_cols + ["备注"],
+            chinese_names=layout_signal.chinese_names + ["备注"],
+            basic_cols=layout_signal.basic_cols,
+            daily_signal=layout_signal.daily_signal,
+            weekly_signal=layout_signal.weekly_signal,
+            basic_names=layout_signal.basic_names,
+            daily_names=layout_signal.daily_names,
+            weekly_names=layout_signal.weekly_names,
+            n_basic=layout_signal.n_basic,
+            n_daily=layout_signal.n_daily,
+            n_weekly=layout_signal.n_weekly,
+        )
+
+        _write_sheet_from_display(wb, "持仓股分析", portfolio_display, portfolio_layout)
+
+        # Patch header for remark column (last column, merged rows 1-2 like basic cols)
+        ws = wb["持仓股分析"]
+        remark_col = layout_signal.n_basic + layout_signal.n_daily + layout_signal.n_weekly + 1
+        ws.merge_cells(start_row=1, start_column=remark_col, end_row=2, end_column=remark_col)
+        remark_cell = ws.cell(row=1, column=remark_col, value="备注")
+        remark_cell.font = Font(name="微软雅黑", color="FFFFFF", size=10)
+        remark_cell.fill = PatternFill(start_color=_BASIC_HEADER_FILL, end_color=_BASIC_HEADER_FILL, fill_type="solid")
+        remark_cell.alignment = Alignment(horizontal="center", vertical="center")
+        remark_cell.border = Border(bottom=Side(style="thin", color="5D6D7E"))
+        for r in (1, 2):
+            c2 = ws.cell(row=r, column=remark_col)
+            c2.fill = PatternFill(start_color=_BASIC_HEADER_FILL, end_color=_BASIC_HEADER_FILL, fill_type="solid")
+            c2.font = Font(name="微软雅黑", color="FFFFFF", size=10)
+            c2.alignment = Alignment(horizontal="center", vertical="center")
+            c2.border = Border(bottom=Side(style="thin", color="5D6D7E"))
+
+    # ---- Signal-only analysis sheet ----
+    display_signal = display_full[layout_signal.display_cols]
     _write_sheet_from_display(wb, "综合分析", display_signal, layout_signal)
     _write_sheet_from_display(wb, "个股分析", display_full, layout_full)
+
+    # ── Index overview sheet ──
+    t_idx = time.monotonic()
+    logger.info("progress export: building index sheet | date=%s", trade_date)
+    try:
+        from backend.export_index import export_index_sheet
+        n_idx = export_index_sheet(con, trade_date, wb)
+        logger.info("progress export: index sheet done | rows=%d | %.0fs",
+                    n_idx, time.monotonic() - t_idx)
+    except Exception as e:
+        logger.warning("progress export: index sheet skipped: %s", e)
 
     # ---- SH Index ----
     if include_index:
@@ -643,7 +852,7 @@ def _write_sheet_from_display(
 
     stock_name_idx = 1
     for i, c in enumerate(layout.basic_cols):
-        if c == "stock_name":
+        if c in ("stock_name", "index_name"):
             stock_name_idx = i + 2
             break
     ws.freeze_panes = f"{get_column_letter(stock_name_idx)}3"
@@ -672,9 +881,12 @@ def _write_sheet_from_display(
         ):
             for cell in row:
                 cell.font = data_font
+        ws.auto_filter.ref = data_range
 
 
 def _write_sheet_merged(wb, sheet_name, df, daily_cols, weekly_cols):
     """Write merged daily+weekly DataFrame with two-row header and zebra-striped data rows."""
     display, layout = _build_merged_display_df(df, daily_cols, weekly_cols)
     _write_sheet_from_display(wb, sheet_name, display, layout)
+
+

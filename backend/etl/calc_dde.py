@@ -26,7 +26,7 @@ DDE_COMPENSATION_FACTOR = 60.1953
 # 123 main_batch_analyzer extends moneyflow/circ history for weekly DDE EMA(60)
 DDE_WEEKLY_TREND_HISTORY_DAYS = 900
 # TA-native derived signals (not 123 B4 hard-gate parity for alert)
-DDE_ALERT_WINDOW = 2
+DDE_ALERT_WINDOW = 3
 DDE_TREND_STRENGTH_WINDOW = 5
 
 # Shared weekly SQL fragments (_load_weekly + _load_weekly_batch).
@@ -61,12 +61,12 @@ class DDECalculator:
     """DDE (Data Display Estimate) indicator calculator.
 
     Computes DDX, DDX2 from moneyflow data, plus divergence, trend, and alerts.
-    Divergence uses structure pipeline; alert uses TA-native short DDX2 inflection.
+    Divergence uses structure pipeline; alert uses TA-native 3-bar DDX2 slope inflection.
     Works for both daily and weekly frequencies.
     """
 
-    # v3: alert 2-bar + trend_strength 5-bar (TA-native; bump invalidates fingerprint skip).
-    SPEC_VERSION = "v3"
+    # v4: alert 3-bar + trend_strength 5-bar (TA-native; 2-bar→3-bar for noise reduction).
+    SPEC_VERSION = "v4"
 
     RECALC_SPEC_DAILY = RecalcSpec(lookback=250, seed=5, event_tail=10, min_rows=10)
     RECALC_SPEC_WEEKLY = RecalcSpec(lookback=250, seed=5, event_tail=10, min_rows=2)
@@ -642,26 +642,26 @@ class DDECalculator:
         ddx = (net / mv * 100.0).where(mv > 0)
         ddx1 = ddx.ewm(span=DDE_DDX1_EMA_SPAN, adjust=False).mean() * DDE_COMPENSATION_FACTOR
         ddx3 = ddx1.rolling(DDE_DDX3_WINDOW).mean()
+        # Vectorized OLS slopes: DDX3 primary, DDX fallback (handles NaN segments)
+        ddx3_slopes = weighted_window_slopes(
+            ddx3.values.astype(float), reg_w, decay=0.0,
+        )
+        ddx_slopes = weighted_window_slopes(
+            ddx.values.astype(float), reg_w, decay=0.0,
+        )
+        slopes = np.where(np.isnan(ddx3_slopes), ddx_slopes, ddx3_slopes)
+
         for i in range(n):
             if skip_mask is not None and skip_mask[i]:
                 continue
             if i < reg_w - 1:
                 continue
-            seg = ddx3.iloc[i - reg_w + 1:i + 1]
-            if seg.isna().any():
-                seg = ddx.iloc[i - reg_w + 1:i + 1]
-            if seg.isna().any():
+            s = slopes[i]
+            if not np.isfinite(s):
                 continue
-            x = np.arange(reg_w, dtype=float)
-            try:
-                slope = float(np.polyfit(x, seg.values.astype(float), 1)[0])
-            except (np.linalg.LinAlgError, ValueError, TypeError):
-                continue
-            if not np.isfinite(slope):
-                continue
-            if slope > 0:
+            if s > 0:
                 result[i] = "up"
-            elif slope < 0:
+            elif s < 0:
                 result[i] = "down"
             else:
                 result[i] = "flat"

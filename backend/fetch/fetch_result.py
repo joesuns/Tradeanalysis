@@ -62,12 +62,22 @@ class FetchResult:
     def changed_codes_for_date(self, trade_date: str) -> List[str]:
         return self.changed_codes_by_date().get(trade_date, [])
 
+    def calc_affecting_changed_codes_for_date(self, trade_date: str) -> List[str]:
+        from backend.etl.column_indicator_deps import calc_affecting_changed_codes
+
+        return calc_affecting_changed_codes(self.changed_field_events, trade_date)
+
     @property
     def changed_codes_count(self) -> int:
         return len(self.changed_codes)
 
     def to_completeness(self) -> dict:
         affected_cols = sorted({ev[3] for ev in self.changed_field_events})
+        all_calc_affecting: set = set()
+        for td in self.changed_codes_by_date():
+            all_calc_affecting.update(
+                self.calc_affecting_changed_codes_for_date(td),
+            )
         return {
             "ods_api_rows": self.api_rows,
             "ods_rows_written": self.rows_written,
@@ -75,4 +85,5 @@ class FetchResult:
             "changed_codes_count": self.changed_codes_count,
             "changed_field_events_count": len(self.changed_field_events),
             "affected_ods_columns": affected_cols,
+            "calc_affecting_changed_codes_count": len(all_calc_affecting),
         }

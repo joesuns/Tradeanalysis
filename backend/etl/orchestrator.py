@@ -24,7 +24,7 @@ from backend.etl.error_handler import (
 from backend.etl.base import SkipReason, CalcResult
 from backend.fetch.client import TushareClient
 from backend.fetch.ods_daily import fetch_by_date_range_parallel, get_all_active_codes
-from backend.etl.build_dim import build_dim_stock, build_dim_date, build_dim_concept
+from backend.etl.build_dim import build_dim_stock, build_dim_date
 from backend.etl.build_dwd import rebuild_all_dwd, rebuild_dwd_for_stale
 from backend.etl.calc_macd import MACDCalculator
 from backend.etl.calc_ma import MACalculator
@@ -44,6 +44,12 @@ QUOTE_CALCULATORS = [
     MACDCalculator, MACalculator, KPatternCalculator,
     VolumeCalculator, PricePositionCalculator,
 ]
+
+# Per-process negative cache: stocks whose auto_fetch returned 0 rows.
+# Keyed by (ts_code, YYYYMM) — resets on process restart. Prevents
+# repeated API calls for stocks tushare cannot fill (e.g., short-history
+# stocks lacking week-end bars in the fetchable range).
+_weekly_fetch_neg_cache: dict = {}
 
 
 def resolve_calc_workers() -> int:
@@ -87,7 +93,7 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
     """
     con = get_connection()
     try:
-        # 0. Self-check
+        # 0. Self-check (orphan temp cleanup happens automatically inside get_connection)
         health = check_connectivity()
         lid, t0 = log_etl_start(con, "health_check")
         if "fatal" in health.get("duckdb", ""):
@@ -104,7 +110,6 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             # Global dimension data — always needed regardless of --ts-code
             from backend.fetch.ods_stock_basic import fetch_stock_basic
             from backend.fetch.ods_trade_cal import fetch_trade_cal
-            from backend.fetch.ods_concept import fetch_concept_detail
 
             lid, t0 = log_etl_start(con, "fetch_stock_basic")
             n = fetch_stock_basic(client, con)
@@ -125,13 +130,29 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
                         row_count=int(rows),
                         min_trade_date=start, max_trade_date=end)
 
-            # Concept detail LAST — per-stock calls, low priority, skip on failure
-            lid, t0 = log_etl_start(con, "fetch_concept_detail")
+            # Plate (board/concept) data — low priority, skip on failure
+            from backend.fetch.ods_plate import fetch_plate_data
+
+            lid, t0 = log_etl_start(con, "fetch_plate_data")
             try:
-                n = fetch_concept_detail(client, con, ts_codes=codes)
-                log_etl_end(con, lid, "fetch_concept_detail", t0, "success", row_count=n)
+                plate_results = fetch_plate_data(client, con, end)
+                total_members = sum(r.get("n_members", 0) for r in plate_results.values())
+                log_etl_end(con, lid, "fetch_plate_data", t0, "success",
+                            row_count=total_members)
             except Exception as e:
-                log_etl_end(con, lid, "fetch_concept_detail", t0, "degraded",
+                log_etl_end(con, lid, "fetch_plate_data", t0, "degraded",
+                            error_msg=f"skipped (rate limited): {e}")
+
+            # DC theme data — low priority, skip on failure
+            from backend.fetch.ods_plate import fetch_theme_data
+
+            lid, t0 = log_etl_start(con, "fetch_theme_data")
+            try:
+                theme_result = fetch_theme_data(client, con, end)
+                log_etl_end(con, lid, "fetch_theme_data", t0, "success",
+                            row_count=theme_result.get("n_members", 0))
+            except Exception as e:
+                log_etl_end(con, lid, "fetch_theme_data", t0, "degraded",
                             error_msg=f"skipped (rate limited): {e}")
 
             # Run data completeness check after fetch
@@ -140,23 +161,56 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             log_etl_end(con, lid, "data_completeness_check", t0, "success",
                         data_completeness=comp)
 
+            # ── Index data fetch — lowest priority, skip on failure ──
+            from backend.fetch.ods_index import (
+                fetch_index_basic, fetch_index_daily, fetch_index_dailybasic,
+            )
+
+            lid, t0 = log_etl_start(con, "fetch_index_basic")
+            try:
+                n = fetch_index_basic(client, con)
+                log_etl_end(con, lid, "fetch_index_basic", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_end(con, lid, "fetch_index_basic", t0, "degraded",
+                            error_msg=f"skipped: {e}")
+
+            lid, t0 = log_etl_start(con, "fetch_index_daily")
+            try:
+                n = fetch_index_daily(client, con, trade_date=end)
+                log_etl_end(con, lid, "fetch_index_daily", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_end(con, lid, "fetch_index_daily", t0, "degraded",
+                            error_msg=f"skipped: {e}")
+
+            lid, t0 = log_etl_start(con, "fetch_index_dailybasic")
+            try:
+                n = fetch_index_dailybasic(client, con, trade_date=end)
+                log_etl_end(con, lid, "fetch_index_dailybasic", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_end(con, lid, "fetch_index_dailybasic", t0, "degraded",
+                            error_msg=f"skipped: {e}")
+
         if step in ("build-dim", "build-all"):
             for dim_step, fn in [
                 ("build_dim_stock", build_dim_stock),
                 ("build_dim_date", build_dim_date),
-                ("build_dim_concept", build_dim_concept),
             ]:
                 lid, t0 = log_etl_start(con, dim_step)
                 try:
-                    if dim_step == "build_dim_concept":
-                        nc, nm = fn(con)
-                        n = nc + nm
-                    else:
-                        n = fn(con)
+                    n = fn(con)
                     log_etl_end(con, lid, dim_step, t0, "success", row_count=n)
                 except Exception as e:
                     log_etl_error(con, lid, dim_step, t0, 0, e)
                     raise
+
+            from backend.etl.build_dim_index import build_dim_index
+            lid, t0 = log_etl_start(con, "build_dim_index")
+            try:
+                n = build_dim_index(con)
+                log_etl_end(con, lid, "build_dim_index", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_error(con, lid, "build_dim_index", t0, 0, e)
+                raise
 
         if step in ("build-dwd", "build-all"):
             codes = ts_codes or get_all_active_codes(con)
@@ -164,9 +218,21 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             try:
                 result = rebuild_all_dwd(con, codes)
                 for name, n in result.items():
+                    if name == "changed_codes":
+                        continue
                     log_etl_end(con, lid, f"build_dwd_{name}", t0, "success", row_count=n)
             except Exception as e:
                 log_etl_error(con, lid, "build_dwd", t0, 0, e)
+                raise
+
+            from backend.etl.build_dwd_index import build_dwd_index_all
+            lid, t0 = log_etl_start(con, "build_dwd_index")
+            try:
+                idx_dwd = build_dwd_index_all(con)
+                for name, n in idx_dwd.items():
+                    log_etl_end(con, lid, f"build_{name}", t0, "success", row_count=n)
+            except Exception as e:
+                log_etl_error(con, lid, "build_dwd_index", t0, 0, e)
                 raise
 
         if step in ("calc-dws", "build-all"):
@@ -222,6 +288,17 @@ def run_etl(step: str = "build-all", ts_codes: Optional[list[str]] = None,
             except Exception as e:
                 log_etl_error(con, lid, "calc_dws", t0, 0, e)
                 raise
+
+            # Index calc — low priority, skip on failure
+            from backend.etl.calc_index import calc_index_pipeline
+            lid, t0 = log_etl_start(con, "calc_index")
+            try:
+                idx_stats = calc_index_pipeline(con, calc_date)
+                total = sum(s["calculated"] for s in idx_stats.values())
+                log_etl_end(con, lid, "calc_index", t0, "success", row_count=total)
+            except Exception as e:
+                log_etl_end(con, lid, "calc_index", t0, "degraded",
+                            error_msg=f"skipped: {e}")
 
         # Final checkpoint
         run_checkpoint(con)
@@ -511,12 +588,15 @@ def find_stale_dwd_codes(con, ts_codes: list[str], analysis_date: str) -> list[s
     return [r[0] for r in rows]
 
 
-def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str) -> int:
-    """Fetch missing tail ODS for stale stocks; rebuild their DWD."""
+def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str):
+    """Fetch missing tail ODS for stale stocks; rebuild their DWD.
+
+    Returns (n_fetched, dwd_result) where dwd_result is the rebuild dict.
+    """
     from backend.fetch.ods_daily import fetch_stocks_incremental
 
     if not stale_codes:
-        return 0
+        return 0, {}
 
     placeholders = ",".join(["?" for _ in stale_codes])
     max_rows = con.execute(f"""
@@ -569,12 +649,12 @@ def _auto_fetch_stale_ods(con, stale_codes: list[str], analysis_date: str) -> in
         stocks=len(stale_codes),
         extra=f"{seg_start}~{analysis_date}",
     )
-    log_timed_step(
+    dwd_result = log_timed_step(
         "calc.stale_fetch", "rebuild_dwd",
         lambda: rebuild_dwd_for_stale(con, stale_codes, analysis_date),
         stocks=len(stale_codes),
     )
-    return int(n_fetched)
+    return int(n_fetched), dwd_result
 
 
 def _compute_fetch_range(con, ts_code: str, calc_date: str,
@@ -954,13 +1034,10 @@ def _calc_full_work_chunk(
     batch_ctx: Optional[dict] = None,
 ) -> int:
     """Worker: run FULL calc for indicator-level work items in a dedicated connection."""
-    import duckdb
-    from backend.config import DUCKDB_PATH
-
     if not work_items:
         return 0
 
-    con = duckdb.connect(DUCKDB_PATH)
+    con = get_connection()
     try:
         if incremental:
             daily_recalc = resolve_recalc_start(con, calc_date, "daily")
@@ -1066,10 +1143,7 @@ def _calc_stock_chunk(chunk: list[str], calc_date: str,
                       incremental: bool = True,
                       batch_ctx: Optional[dict] = None) -> int:
     """Worker: run all calculators for one stock chunk in a dedicated connection."""
-    import duckdb
-    from backend.config import DUCKDB_PATH
-
-    con = duckdb.connect(DUCKDB_PATH)
+    con = get_connection()
     try:
         if incremental:
             daily_recalc = resolve_recalc_start(con, calc_date, "daily")
@@ -1498,6 +1572,23 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
         logger.info("Missing breakdown by reason: %s", reason_counts)
 
     if auto_fetch and (completeness["missing"] or weekly_fetch):
+        # Filter weekly_fetch through negative cache
+        cache_month = calc_date[:6]  # YYYYMM
+        if weekly_fetch:
+            filtered_weekly = {}
+            skipped_neg = 0
+            for ts_code, info in weekly_fetch.items():
+                if _weekly_fetch_neg_cache.get((ts_code, cache_month)):
+                    skipped_neg += 1
+                else:
+                    filtered_weekly[ts_code] = info
+            if skipped_neg:
+                logger.info(
+                    "progress calc.auto_fetch: weekly negative cache skip %d stocks",
+                    skipped_neg,
+                )
+            weekly_fetch = filtered_weekly
+
         fetch_candidates = list(completeness["missing"].keys()) + list(weekly_fetch.keys())
         to_fetch = []
         for ts_code in fetch_candidates:
@@ -1554,6 +1645,9 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                     logger.info(
                         "progress calc.auto_fetch: bucket done | rows=%d", int(rows),
                     )
+                    if int(rows) == 0:
+                        for ts_code in bucket_codes:
+                            _weekly_fetch_neg_cache[(ts_code, cache_month)] = True
                     attempted_codes.update(bucket_codes)
                     if int(rows) > 0:
                         n_fetched += int(rows)
@@ -1610,7 +1704,11 @@ def run_calc(con, ts_codes: list[str] = None, auto_fetch: bool = True,
                 "Stale ODS: %d/%d stocks missing data through %s",
                 len(stale_ods), len(ts_codes), calc_date,
             )
-            n_stale = _auto_fetch_stale_ods(con, stale_ods, calc_date)
+            n_stale, dwd_result = _auto_fetch_stale_ods(con, stale_ods, calc_date)
+            if dwd_result:
+                preflight_ctx = _merge_preflight_after_dwd_rebuild(
+                    con, stale_ods, calc_date, dwd_result, preflight_ctx,
+                )
             logger.info("Stale auto-fetch complete: %d ODS rows", n_stale)
         else:
             stale_dwd = find_stale_dwd_codes(con, ts_codes, calc_date)

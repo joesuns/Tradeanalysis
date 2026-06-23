@@ -255,7 +255,9 @@ def run_refresh_pipeline(
         dwd_result, stale_rebuilt = _rebuild_dwd_after_fetch(
             con, codes, analysis_date, fetch_result,
         )
-        rebuild_rows = sum(dwd_result.values()) if dwd_result else 0
+        from backend.etl.build_dwd import _dwd_rebuild_row_count
+
+        rebuild_rows = _dwd_rebuild_row_count(dwd_result) if dwd_result else 0
         log_etl_end(
             con, lid, "refresh_rebuild_dwd", t0, "success",
             row_count=rebuild_rows,

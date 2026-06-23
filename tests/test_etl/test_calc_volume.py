@@ -388,3 +388,130 @@ def test_weekly_pct_vol_rank_with_130_week_end_bars():
     ranks = out["pct_vol_rank"].values
     assert np.isfinite(ranks[-1])
     assert out["zone"].iloc[-1] in ("normal", "explosive", "low_volume")
+
+
+def test_pct_rank_vectorized_matches_original():
+    """向量化版 _compute_pct_rank 与原始逐根循环逐值一致 (atol=1e-9)."""
+    from backend.etl.calc_volume import VolumeCalculator, _compute_pct_rank_vectorized
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    # 原始实现（拷贝自 calc_volume.py:397-415）
+    def _compute_pct_rank_original(ma_vol_5: np.ndarray, window: int) -> np.ndarray:
+        n = len(ma_vol_5)
+        result = np.full(n, np.nan)
+        for i in range(window - 1, n):
+            start = max(0, i - window + 1)
+            window_vals = ma_vol_5[start:i + 1]
+            valid = window_vals[~np.isnan(window_vals)]
+            if len(valid) < 2:
+                continue
+            cur = ma_vol_5[i]
+            if np.isnan(cur):
+                continue
+            rank = np.sum(valid <= cur) / len(valid) * 100.0
+            result[i] = rank
+        return result
+
+    rng = np.random.default_rng(42)
+
+    # Case 1: all-finite, normal data
+    for _ in range(20):
+        n = rng.integers(130, 300)
+        data = rng.lognormal(11.0, 0.5, size=n)
+        for w in [60, 120]:
+            orig = _compute_pct_rank_original(data, w)
+            vec = _compute_pct_rank_vectorized(data, w)
+            np.testing.assert_allclose(
+                vec[~np.isnan(orig)], orig[~np.isnan(orig)],
+                atol=1e-9,
+                err_msg=f"pct_rank mismatch: n={n}, w={w}",
+            )
+            # NaN positions must match
+            np.testing.assert_array_equal(np.isnan(vec), np.isnan(orig))
+
+    # Case 2: with NaN holes
+    data_with_nan = rng.lognormal(11.0, 0.5, size=200)
+    data_with_nan[rng.integers(0, 200, 15)] = np.nan
+    orig = _compute_pct_rank_original(data_with_nan, 120)
+    vec = _compute_pct_rank_vectorized(data_with_nan, 120)
+    np.testing.assert_allclose(
+        vec[~np.isnan(orig)], orig[~np.isnan(orig)], atol=1e-9,
+    )
+    np.testing.assert_array_equal(np.isnan(vec), np.isnan(orig))
+
+    # Case 3: short data (< window)
+    short = rng.lognormal(11.0, 0.5, size=50)
+    orig = _compute_pct_rank_original(short, 120)
+    vec = _compute_pct_rank_vectorized(short, 120)
+    assert np.all(np.isnan(vec)), "short data should be all-NaN"
+    np.testing.assert_array_equal(np.isnan(vec), np.isnan(orig))
+
+
+def test_compute_volume_trend_series_vectorized_matches_original():
+    """预计算版 trend series 与逐 bar 调 volume_trend_v2 的原始实现完全一致."""
+    from backend.etl.calc_volume import (
+        _compute_volume_trend_series_vectorized,
+        volume_trend_v2,
+        trend_from_v2_label,
+        VOLUME_TREND_V2_DAILY,
+        VOLUME_TREND_V2_WEEKLY,
+    )
+
+    # ---- independent oracle: per-bar call to volume_trend_v2 ----
+    def _compute_trend_series_oracle(vol, params, target_indices=None):
+        """Original per-bar loop calling volume_trend_v2 on expanding prefixes."""
+        vol_arr = np.asarray(vol, dtype=float)
+        n = len(vol_arr)
+        anchor = int(params["anchor_bars"])
+        result = [None] * n
+        kw = {k: params[k] for k in params if k != "anchor_bars"}
+        indices = range(n) if target_indices is None else target_indices
+        for i in indices:
+            if i < 0 or i >= n:
+                continue
+            if i + 1 < anchor:
+                continue
+            _, label = volume_trend_v2(vol_arr[: i + 1], anchor_bars=anchor, **kw)
+            result[i] = trend_from_v2_label(label)
+        return result
+
+    rng = np.random.default_rng(77)
+
+    for label, params in [("daily", VOLUME_TREND_V2_DAILY),
+                           ("weekly", VOLUME_TREND_V2_WEEKLY)]:
+        anchor = params["anchor_bars"]
+        for _ in range(30):
+            n = rng.integers(anchor + 10, anchor + 80)
+            vol = rng.lognormal(11.0, 0.5, size=n)
+
+            # Full range (target_indices=None)
+            oracle = _compute_trend_series_oracle(vol, params)
+            vec = _compute_volume_trend_series_vectorized(vol, params)
+            assert len(oracle) == len(vec) == n
+            for i in range(n):
+                assert oracle[i] == vec[i], (
+                    f"[{label}] mismatch at i={i}: oracle={oracle[i]}, vec={vec[i]}"
+                )
+
+            # Subset indices (APPEND path)
+            subset_size = min(10, n - anchor)
+            if subset_size > 0:
+                indices = sorted(set(rng.integers(anchor, n, size=subset_size)))
+                oracle_sub = _compute_trend_series_oracle(
+                    vol, params, target_indices=indices,
+                )
+                vec_sub = _compute_volume_trend_series_vectorized(
+                    vol, params, target_indices=indices,
+                )
+                for i in range(n):
+                    assert oracle_sub[i] == vec_sub[i], (
+                        f"[{label}] subset mismatch at i={i}"
+                    )
+
+    # Case: data with NaN
+    vol_nan = rng.lognormal(11.0, 0.5, size=120)
+    vol_nan[rng.integers(0, 120, 5)] = np.nan
+    oracle = _compute_trend_series_oracle(vol_nan, VOLUME_TREND_V2_DAILY)
+    vec = _compute_volume_trend_series_vectorized(vol_nan, VOLUME_TREND_V2_DAILY)
+    for i in range(len(vol_nan)):
+        assert oracle[i] == vec[i], f"NaN case mismatch at i={i}"

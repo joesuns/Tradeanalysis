@@ -9,14 +9,18 @@ class TestSchemaCreation:
         tables = {r[0] for r in db_with_schema.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
-        # ODS (7)
+        # ODS (11)
         assert "ods_stock_basic" in tables
         assert "ods_daily" in tables
         assert "ods_daily_basic" in tables
         assert "ods_moneyflow" in tables
         assert "ods_trade_cal" in tables
         assert "ods_concept_detail" in tables
+        assert "ods_plate_snapshot" in tables
+        assert "ods_plate_board" in tables
+        assert "ods_plate_member" in tables
         assert "ods_etl_log" in tables
+        assert "ods_calc_skip_log" in tables
 
         # DIM (4)
         assert "dim_stock" in tables
@@ -29,8 +33,8 @@ class TestSchemaCreation:
         assert "dwd_weekly_quote" in tables
         assert "dwd_daily_moneyflow" in tables
 
-        # DWS (10)
-        for indicator in ["kpattern", "macd", "ma", "dde", "volume"]:
+        # DWS (12)
+        for indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
             for freq in ["daily", "weekly"]:
                 assert f"dws_{indicator}_{freq}" in tables
 

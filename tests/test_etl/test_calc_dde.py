@@ -234,20 +234,20 @@ def test_dde_alert_uses_ddx2():
 
 
 def test_dde_slope_inflection_bull_alert():
-    """2-bar adjacent-window slope flip → upturn_reverse."""
+    """3-bar adjacent-window slope flip → downturn_reverse."""
     calc = DDECalculator.__new__(DDECalculator)
-    ddx2 = np.array([0.0, 0.0, 1.0, 0.0, 5.0], dtype=float)
+    ddx2 = np.array([0.0, 0.0, -2.0, -1.0, 3.0], dtype=float)
     df = pd.DataFrame({"trade_date": [f"d{i}" for i in range(len(ddx2))], "ddx2": ddx2})
     result = calc._compute_alerts(df)
-    assert result[-1] == "upturn_reverse"
+    assert result[-1] == "downturn_reverse"
 
 
 def test_dde_slope_inflection_bear_alert():
     calc = DDECalculator.__new__(DDECalculator)
-    ddx2 = np.array([0.0, 0.0, -1.0, 0.0, -5.0], dtype=float)
+    ddx2 = np.array([0.0, 0.0, 2.0, 1.0, -3.0], dtype=float)
     df = pd.DataFrame({"trade_date": [f"d{i}" for i in range(len(ddx2))], "ddx2": ddx2})
     result = calc._compute_alerts(df)
-    assert result[-1] == "downturn_reverse"
+    assert result[-1] == "upturn_reverse"
 
 
 def test_dde_trend_8bar_window():

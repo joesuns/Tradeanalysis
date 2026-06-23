@@ -178,6 +178,25 @@ def find_stocks_needing_full_daily_rebuild(
     return sorted(full_set)
 
 
+def _check_daily_basic_coverage(con, ts_codes: list, trade_date: str,
+                                 min_ratio: float = 0.80) -> bool:
+    """Return True if ods_daily_basic covers >= min_ratio of ts_codes for trade_date.
+
+    Uses total_mv IS NOT NULL as the liveness signal (pe_ttm is naturally NULL for
+    loss-making stocks).
+    """
+    if not ts_codes:
+        return True
+    placeholders = ",".join(["?" for _ in ts_codes])
+    covered = con.execute(f"""
+        SELECT COUNT(DISTINCT b.ts_code)
+        FROM ods_daily_basic b
+        WHERE b.trade_date = ? AND b.ts_code IN ({placeholders})
+          AND b.total_mv IS NOT NULL
+    """, [trade_date] + list(ts_codes)).fetchone()[0]
+    return covered / len(ts_codes) >= min_ratio
+
+
 def refresh_qfq_prices(con, ts_codes: List[str]) -> int:
     """UPDATE dwd_daily_quote qfq columns from ODS adj factors (no DELETE)."""
     if not ts_codes:
@@ -234,7 +253,7 @@ def rebuild_dwd_incremental(con, ts_codes: List[str], trade_date: str) -> dict:
     moneyflow tail INSERT.
     """
     if not ts_codes:
-        return {"daily_quote": 0, "weekly_quote": 0, "moneyflow": 0}
+        return {"daily_quote": 0, "weekly_quote": 0, "moneyflow": 0, "changed_codes": []}
 
     logger.info(
         "progress dwd.rebuild_incremental: started | stocks=%d date=%s",
@@ -262,13 +281,37 @@ def rebuild_dwd_incremental(con, ts_codes: List[str], trade_date: str) -> dict:
         )
         n_daily += build_dwd_daily_quote(con, insert_codes)
     if tail_daily_codes:
-        logger.info(
-            "dwd incremental: tail INSERT for %d stocks on %s",
-            len(tail_daily_codes), trade_date,
-        )
-        n_daily += build_dwd_daily_quote(
-            con, tail_daily_codes, incremental_trade_date=trade_date,
-        )
+        from backend.config import DWD_DAILY_BASIC_MIN_COVERAGE
+        if not _check_daily_basic_coverage(
+            con, tail_daily_codes, trade_date, DWD_DAILY_BASIC_MIN_COVERAGE,
+        ):
+            placeholders = ",".join(["?" for _ in tail_daily_codes])
+            covered = con.execute(f"""
+                SELECT COUNT(DISTINCT b.ts_code)
+                FROM ods_daily_basic b
+                WHERE b.trade_date = ? AND b.ts_code IN ({placeholders})
+                  AND b.total_mv IS NOT NULL
+            """, [trade_date] + list(tail_daily_codes)).fetchone()[0]
+            ratio = covered / len(tail_daily_codes) if tail_daily_codes else 0
+            logger.warning(
+                "dwd incremental: daily_basic coverage %.1f%% below threshold %.0f%% — "
+                "deferring tail INSERT for %d stocks (will retry on next run)",
+                ratio * 100, DWD_DAILY_BASIC_MIN_COVERAGE * 100,
+                len(tail_daily_codes),
+            )
+            deferred = set(tail_daily_codes)
+            tail_daily_codes.clear()
+            tail_weekly_codes = [
+                c for c in tail_weekly_codes if c not in deferred
+            ]
+        if tail_daily_codes:
+            logger.info(
+                "dwd incremental: tail INSERT for %d stocks on %s",
+                len(tail_daily_codes), trade_date,
+            )
+            n_daily += build_dwd_daily_quote(
+                con, tail_daily_codes, incremental_trade_date=trade_date,
+            )
 
     n_weekly = 0
     if tail_weekly_codes:
@@ -284,6 +327,10 @@ def rebuild_dwd_incremental(con, ts_codes: List[str], trade_date: str) -> dict:
         "daily_quote": n_daily,
         "weekly_quote": n_weekly,
         "moneyflow": n_mf,
+        "changed_codes": sorted(
+            set(qfq_codes) | set(insert_codes) | set(tail_daily_codes)
+            | set(full_weekly_codes) | set(tail_weekly_codes)
+        ),
     }
     logger.info(
         "progress dwd.rebuild_incremental: done | %.0fs | %s",
@@ -309,12 +356,26 @@ def rebuild_all_dwd(con, ts_codes=None) -> dict:
         "daily_quote": build_dwd_daily_quote(con, ts_codes),
         "weekly_quote": build_dwd_weekly_quote(con, ts_codes),
         "moneyflow": build_dwd_daily_moneyflow(con, ts_codes),
+        "changed_codes": sorted(ts_codes) if ts_codes else [],
     }
     logger.info(
         "progress dwd.rebuild: done | %.0fs | %s",
         time.monotonic() - t0, result,
     )
     return result
+
+
+def _dwd_rebuild_row_count(result: dict) -> int:
+    """Sum only numeric DWD rebuild counts, skipping ``changed_codes``.
+
+    ``rebuild_dwd_incremental`` and ``rebuild_all_dwd`` both return a dict
+    with integer row-count fields *and* a ``changed_codes`` list.  Callers
+    that need a total row count should use this helper instead of
+    ``sum(result.values())``, which raises ``TypeError``.
+    """
+    return sum(
+        result.get(k, 0) for k in ("daily_quote", "weekly_quote", "moneyflow")
+    )
 
 
 def build_dwd_daily_quote(

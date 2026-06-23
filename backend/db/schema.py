@@ -2,7 +2,7 @@
 Complete DDL for the stock analysis data model.
 
 Tables: ODS(7) + DIM(4) + DWD(3) + DWS(10) = 24
-Views: 10 latest views + 4 ADS wide views = 14
+Views: 18 latest views + 6 ADS wide views + 3 DQ views = 27
 Indexes: DWS(20) + DWD(3) + ODS(3) + DIM(1) = 27
 
 Usage:
@@ -124,6 +124,58 @@ _ODS_DDL = [
         reason         TEXT NOT NULL,
         detail         TEXT,
         PRIMARY KEY (calc_date, ts_code, indicator, freq)
+    )""",
+
+    # 13.1 ods_index_basic — 指数基本信息
+    """CREATE TABLE IF NOT EXISTS ods_index_basic (
+        ts_code        TEXT PRIMARY KEY,
+        name           TEXT,
+        fullname       TEXT,
+        market         TEXT,
+        publisher      TEXT,
+        category       TEXT,
+        base_date      TEXT,
+        base_point     REAL,
+        list_date      TEXT,
+        exp_date       TEXT,
+        weight_rule    TEXT,
+        raw_json       TEXT,
+        fetched_at     TEXT DEFAULT (now())
+    )""",
+
+    # 13.2 ods_index_daily — 指数日线行情
+    """CREATE TABLE IF NOT EXISTS ods_index_daily (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        close          REAL,
+        open           REAL,
+        high           REAL,
+        low            REAL,
+        pre_close      REAL,
+        change         REAL,
+        pct_chg        REAL,
+        vol            REAL,
+        amount         REAL,
+        fetched_at     TEXT DEFAULT (now()),
+        PRIMARY KEY (ts_code, trade_date)
+    )""",
+
+    # 13.3 ods_index_dailybasic — 指数每日估值（仅六只核心指数有数据）
+    """CREATE TABLE IF NOT EXISTS ods_index_dailybasic (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        total_mv       REAL,
+        float_mv       REAL,
+        total_share    REAL,
+        float_share    REAL,
+        free_share     REAL,
+        turnover_rate  REAL,
+        turnover_rate_f REAL,
+        pe             REAL,
+        pe_ttm         REAL,
+        pb             REAL,
+        fetched_at     TEXT DEFAULT (now()),
+        PRIMARY KEY (ts_code, trade_date)
     )""",
 ]
 
@@ -249,6 +301,20 @@ _DIM_DDL = [
         ts_code        TEXT REFERENCES dim_stock(ts_code),
         PRIMARY KEY (concept_id, ts_code)
     )""",
+
+    # 4.4 dim_index
+    """CREATE TABLE IF NOT EXISTS dim_index (
+        ts_code        TEXT PRIMARY KEY,
+        index_code     TEXT,
+        name           TEXT,
+        fullname       TEXT,
+        market         TEXT,
+        category       TEXT,
+        list_date      TEXT,
+        exp_date       TEXT,
+        is_active      INTEGER DEFAULT 1,
+        has_valuation  INTEGER DEFAULT 0
+    )""",
 ]
 
 # ============================================================
@@ -307,6 +373,49 @@ _DWD_DDL = [
         sell_elg_vol   REAL,
         total_vol      REAL,
         net_amount_dc  REAL,
+        PRIMARY KEY (ts_code, trade_date)
+    )""",
+
+    # 5.4 dwd_index_daily — 指数日线宽表
+    # NOTE:
+    #  - close_qfq = close (指数无需复权, 列名对齐计算器 SIGNATURE_COLS)
+    #  - is_suspended 恒为 0 (指数无停牌, 列名对齐 load_quote_groups 日线过滤)
+    """CREATE TABLE IF NOT EXISTS dwd_index_daily (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        close          REAL,
+        open           REAL,
+        high           REAL,
+        low            REAL,
+        pre_close      REAL,
+        pct_chg        REAL,
+        vol            REAL,
+        amount         REAL,
+        close_qfq      REAL,
+        total_mv       REAL,
+        pe_ttm         REAL,
+        pb             REAL,
+        turnover_rate  REAL,
+        is_suspended   INTEGER DEFAULT 0,
+        PRIMARY KEY (ts_code, trade_date)
+    )""",
+
+    # 5.5 dwd_index_weekly — 指数周线宽表
+    """CREATE TABLE IF NOT EXISTS dwd_index_weekly (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        close          REAL,
+        open           REAL,
+        high           REAL,
+        low            REAL,
+        pct_chg        REAL,
+        vol            REAL,
+        amount         REAL,
+        close_qfq      REAL,
+        total_mv       REAL,
+        pe_ttm         REAL,
+        turnover_rate  REAL,
+        active_days    INTEGER,
         PRIMARY KEY (ts_code, trade_date)
     )""",
 ]
@@ -447,6 +556,75 @@ _DWS_DDL = {
         CHECK (price_position_120d IS NULL OR (price_position_120d >= 0 AND price_position_120d <= 100)),
         CHECK (price_position_250d IS NULL OR (price_position_250d >= 0 AND price_position_250d <= 100))
     )""",
+
+    # 6.7 Index MACD
+    "index_macd": """CREATE TABLE IF NOT EXISTS {table} (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        ema_12         REAL,
+        ema_26         REAL,
+        dif            REAL,
+        dea            REAL,
+        macd_bar       REAL,
+        divergence     TEXT,
+        zone           TEXT,
+        turning_point  TEXT,
+        alert          TEXT,
+        trend          TEXT,
+        trend_strength REAL,
+        calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v3',
+        PRIMARY KEY (ts_code, trade_date, calc_date),
+        CHECK (divergence IN ('top_divergence', 'bottom_divergence') OR divergence IS NULL),
+        CHECK (zone IN ('bull', 'bear') OR zone IS NULL),
+        CHECK (turning_point IN ('golden_cross', 'dead_cross', 'near_golden', 'near_dead') OR turning_point IS NULL),
+        CHECK (alert IN ('upturn_reverse', 'downturn_reverse', 'upturn_flat', 'downturn_flat') OR alert IS NULL),
+        CHECK (trend IN ('up', 'down', 'flat'))
+    )""",
+
+    # 6.8 Index MA
+    "index_ma": """CREATE TABLE IF NOT EXISTS {table} (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        ma_5           REAL,
+        ma_10          REAL,
+        bias_ma5       REAL,
+        bias_ma10      REAL,
+        ma5_slope      REAL,
+        ma10_slope     REAL,
+        alignment      TEXT,
+        turning_point  TEXT,
+        calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v2',
+        PRIMARY KEY (ts_code, trade_date, calc_date),
+        CHECK (alignment IN ('bull_strong', 'bull_building', 'bull_weakening', 'bull_rolling',
+                              'bear_strong', 'bear_building', 'bear_weakening', 'bear_rolling',
+                              'tangle', 'sideways') OR alignment IS NULL),
+        CHECK (turning_point IN ('golden_cross', 'dead_cross', 'near_golden', 'near_dead') OR turning_point IS NULL)
+    )""",
+
+    # 6.9 Index Volume
+    "index_volume": """CREATE TABLE IF NOT EXISTS {table} (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        ma_vol_5       REAL,
+        pct_vol_rank   REAL,
+        zone           TEXT,
+        trend          TEXT,
+        volume_ratio   REAL,
+        trend_strength REAL,
+        divergence     TEXT,
+        calc_date      TEXT,
+        input_fingerprint TEXT,
+        spec_version     TEXT DEFAULT 'v2',
+        PRIMARY KEY (ts_code, trade_date, calc_date),
+        CHECK (pct_vol_rank >= 0 AND pct_vol_rank <= 100),
+        CHECK (zone IN ('explosive', 'low_volume', 'normal')),
+        CHECK (trend IN ('expanding', 'shrinking', 'flat')),
+        CHECK (divergence IN ('top_divergence', 'bottom_divergence') OR divergence IS NULL)
+    )""",
 }
 
 # ============================================================
@@ -468,6 +646,18 @@ for _indicator in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]:
             f"ON {_table}(trade_date, ts_code)"
         )
 
+for _indicator in ["index_macd", "index_ma", "index_volume"]:
+    for _freq in ["daily", "weekly"]:
+        _table = f"dws_{_indicator}_{_freq}"
+        _DWS_INDEX_DDL.append(
+            f"CREATE INDEX IF NOT EXISTS idx_{_indicator}_{_freq}_cd "
+            f"ON {_table}(ts_code, trade_date DESC)"
+        )
+        _DWS_INDEX_DDL.append(
+            f"CREATE INDEX IF NOT EXISTS idx_{_indicator}_{_freq}_dc "
+            f"ON {_table}(trade_date, ts_code)"
+        )
+
 _DWD_INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_dwd_daily_cd ON dwd_daily_quote(ts_code, trade_date)",
     "CREATE INDEX IF NOT EXISTS idx_dwd_mf_cd ON dwd_daily_moneyflow(ts_code, trade_date)",
@@ -483,6 +673,8 @@ _ODS_INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_etl_log_status ON ods_etl_log(status)",
     "CREATE INDEX IF NOT EXISTS idx_skip_log_cd ON ods_calc_skip_log(calc_date)",
     "CREATE INDEX IF NOT EXISTS idx_skip_log_ind ON ods_calc_skip_log(indicator, reason)",
+    "CREATE INDEX IF NOT EXISTS idx_ods_index_daily_cd ON ods_index_daily(ts_code, trade_date)",
+    "CREATE INDEX IF NOT EXISTS idx_ods_index_dailybasic_cd ON ods_index_dailybasic(ts_code, trade_date)",
 ]
 
 _DIM_INDEX_DDL = [
@@ -619,6 +811,12 @@ _ADS_WIDE_VIEWS_DDL = [
 
         q.close_qfq      AS close,
         q.pct_chg        AS pct_chg,
+
+        -- Multi-period returns (trading-day LAG over close_qfq)
+        ROUND((q.close_qfq / LAG(q.close_qfq, 3) OVER w_period - 1) * 100, 2)   AS pct_chg_3d,
+        ROUND((q.close_qfq / LAG(q.close_qfq, 20) OVER w_period - 1) * 100, 2)   AS pct_chg_1m,
+        ROUND((q.close_qfq / LAG(q.close_qfq, 250) OVER w_period - 1) * 100, 2)   AS pct_chg_1y,
+
         q.vol            AS vol,
         q.amount         AS amount,
         q.total_mv       AS total_mv,
@@ -703,7 +901,8 @@ _ADS_WIDE_VIEWS_DDL = [
     LEFT JOIN v_dws_ma_daily_latest            a ON q.ts_code = a.ts_code AND q.trade_date = a.trade_date
     LEFT JOIN v_dws_dde_daily_latest           d ON q.ts_code = d.ts_code AND q.trade_date = d.trade_date
     LEFT JOIN v_dws_volume_daily_latest        v ON q.ts_code = v.ts_code AND q.trade_date = v.trade_date
-    LEFT JOIN v_dws_price_position_daily_latest pp ON q.ts_code = pp.ts_code AND q.trade_date = pp.trade_date""",
+    LEFT JOIN v_dws_price_position_daily_latest pp ON q.ts_code = pp.ts_code AND q.trade_date = pp.trade_date
+    WINDOW w_period AS (PARTITION BY q.ts_code ORDER BY q.trade_date)""",
 
     # 7.1 v_ads_analysis_wide_weekly
     """CREATE OR REPLACE VIEW v_ads_analysis_wide_weekly AS
@@ -936,6 +1135,124 @@ _ADS_WIDE_VIEWS_DDL = [
     LEFT JOIN v_dws_price_position_weekly_latest pp ON c.ts_code = pp.ts_code AND c.trade_date = pp.trade_date
     LEFT JOIN dwd_weekly_quote            q ON c.ts_code = q.ts_code AND c.trade_date = q.trade_date
     WHERE c.ts_code = '000001.SH'""",
+
+    # 9.1 v_ads_market_index_daily — 市场指数日线分析宽表
+    """CREATE OR REPLACE VIEW v_ads_market_index_daily AS
+    SELECT
+        'D'             AS freq,
+        q.trade_date,
+        q.ts_code,
+        i.name           AS index_name,
+        i.category       AS index_category,
+        q.close,
+        q.open,
+        q.high,
+        q.low,
+        q.pct_chg,
+        q.vol,
+        q.amount,
+        q.total_mv,
+        q.pe_ttm,
+        q.pb,
+        q.turnover_rate,
+        c.ema_12,
+        c.ema_26,
+        c.dif,
+        c.dea,
+        c.macd_bar,
+        c.divergence     AS macd_divergence,
+        c.zone           AS macd_zone,
+        c.turning_point  AS macd_turning_point,
+        c.alert          AS macd_alert,
+        c.trend          AS macd_trend,
+        c.trend_strength AS macd_trend_strength,
+        a.ma_5, a.ma_10,
+        a.bias_ma5, a.bias_ma10,
+        a.ma5_slope, a.ma10_slope,
+        CASE a.alignment
+            WHEN 'bull_strong'    THEN '多头强势 — 两线同步上行，持仓舒适区'
+            WHEN 'bull_building'  THEN '多头初建 — MA5已拐头向上，MA10惯性下行'
+            WHEN 'bull_weakening' THEN '多头衰竭 — MA5先拐头向下，即将死叉前兆'
+            WHEN 'bull_rolling'   THEN '多头翻转 — 两线均下行，死叉边缘'
+            WHEN 'bear_strong'    THEN '空头强势 — 两线同步下行，持币观望区'
+            WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
+            WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
+            WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'       THEN '均线走平 — 双斜率近零，方向待定'
+            WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
+            ELSE NULL
+        END              AS ma_alignment,
+        a.turning_point  AS ma_turning_point,
+        v.ma_vol_5,
+        v.pct_vol_rank,
+        v.zone           AS vol_zone,
+        v.trend          AS vol_trend,
+        v.volume_ratio,
+        v.trend_strength AS vol_trend_strength,
+        v.divergence     AS vol_divergence
+    FROM dwd_index_daily q
+    LEFT JOIN dim_index i ON q.ts_code = i.ts_code
+    LEFT JOIN v_dws_index_macd_daily_latest c
+        ON q.ts_code = c.ts_code AND q.trade_date = c.trade_date
+    LEFT JOIN v_dws_index_ma_daily_latest a
+        ON q.ts_code = a.ts_code AND q.trade_date = a.trade_date
+    LEFT JOIN v_dws_index_volume_daily_latest v
+        ON q.ts_code = v.ts_code AND q.trade_date = v.trade_date""",
+
+    # 9.2 v_ads_market_index_weekly — 市场指数周线分析宽表
+    """CREATE OR REPLACE VIEW v_ads_market_index_weekly AS
+    SELECT
+        'W'             AS freq,
+        q.trade_date,
+        q.ts_code,
+        i.name           AS index_name,
+        i.category       AS index_category,
+        q.close,
+        q.pct_chg,
+        q.vol,
+        q.amount,
+        q.total_mv,
+        q.pe_ttm,
+        q.turnover_rate,
+        q.active_days,
+        c.ema_12, c.ema_26, c.dif, c.dea, c.macd_bar,
+        c.divergence     AS macd_divergence,
+        c.zone           AS macd_zone,
+        c.turning_point  AS macd_turning_point,
+        c.alert          AS macd_alert,
+        c.trend          AS macd_trend,
+        c.trend_strength AS macd_trend_strength,
+        a.ma_5, a.ma_10,
+        a.bias_ma5, a.bias_ma10,
+        a.ma5_slope, a.ma10_slope,
+        CASE a.alignment
+            WHEN 'bull_strong'    THEN '多头强势 — 两线同步上行，持仓舒适区'
+            WHEN 'bull_building'  THEN '多头初建 — MA5已拐头向上，MA10惯性下行'
+            WHEN 'bull_weakening' THEN '多头衰竭 — MA5先拐头向下，即将死叉前兆'
+            WHEN 'bull_rolling'   THEN '多头翻转 — 两线均下行，死叉边缘'
+            WHEN 'bear_strong'    THEN '空头强势 — 两线同步下行，持币观望区'
+            WHEN 'bear_building'  THEN '空头初建 — 死叉后MA10惯性未消，下跌中继'
+            WHEN 'bear_weakening' THEN '空头衰竭 — MA5尝试上拐，空方减弱'
+            WHEN 'bear_rolling'   THEN '空头翻转 — 两线均上行，金叉边缘'
+            WHEN 'sideways'       THEN '均线走平 — 双斜率近零，方向待定'
+            WHEN 'tangle'         THEN '均线缠绕 — 方向不明，观望'
+            ELSE NULL
+        END              AS ma_alignment,
+        a.turning_point  AS ma_turning_point,
+        v.ma_vol_5, v.pct_vol_rank,
+        v.zone           AS vol_zone,
+        v.trend          AS vol_trend,
+        v.volume_ratio,
+        v.trend_strength AS vol_trend_strength,
+        v.divergence     AS vol_divergence
+    FROM dwd_index_weekly q
+    LEFT JOIN dim_index i ON q.ts_code = i.ts_code
+    LEFT JOIN v_dws_index_macd_weekly_latest c
+        ON q.ts_code = c.ts_code AND q.trade_date = c.trade_date
+    LEFT JOIN v_dws_index_ma_weekly_latest a
+        ON q.ts_code = a.ts_code AND q.trade_date = a.trade_date
+    LEFT JOIN v_dws_index_volume_weekly_latest v
+        ON q.ts_code = v.ts_code AND q.trade_date = v.trade_date""",
 ]
 
 
@@ -1000,6 +1317,20 @@ def create_all_tables(con: duckdb.DuckDBPyConnection):
     # Latest views (10)
     for ddl in _LATEST_VIEW_DDL:
         con.execute(ddl)
+
+    # Index DWS latest views
+    for _indicator in ["index_macd", "index_ma", "index_volume"]:
+        for _freq in ["daily", "weekly"]:
+            _table = f"dws_{_indicator}_{_freq}"
+            _view = f"v_dws_{_indicator}_{_freq}_latest"
+            con.execute(f"""
+                CREATE OR REPLACE VIEW {_view} AS
+                SELECT *
+                FROM {_table}
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY ts_code, trade_date ORDER BY calc_date DESC
+                ) = 1
+            """)
 
     # Spec freshness DQ view (ops spec-status / health_check Section J)
     con.execute(_V_DQ_SPEC_FRESHNESS_DDL)
@@ -1082,17 +1413,27 @@ def _create_dws(con: duckdb.DuckDBPyConnection):
             con.execute(ddl.format(table=table))
     ensure_calc_state_table(con)
 
+    # Index DWS tables (6 tables: 3 indicators × 2 frequencies)
+    for _indicator in ["index_macd", "index_ma", "index_volume"]:
+        for _freq in ["daily", "weekly"]:
+            _table = f"dws_{_indicator}_{_freq}"
+            con.execute(_DWS_DDL[_indicator].format(table=_table))
+
 
 def drop_all_tables(con: duckdb.DuckDBPyConnection):
     """Drop all tables and views in reverse dependency order (for testing only)."""
-    # Views first
+    # Views first — index views before stock views (no FK, but orderly)
     _all_views = (
         ["v_indicator_availability", "v_dq_spec_freshness",
+         "v_ads_market_index_weekly", "v_ads_market_index_daily",
          "v_ads_index_wide_weekly", "v_ads_index_wide",
          "v_ads_analysis_wide_weekly", "v_ads_analysis_wide_daily",
          "v_data_freshness"]
         + [f"v_dws_{ind}_{freq}_latest"
            for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
+           for freq in ["daily", "weekly"]]
+        + [f"v_dws_index_{ind}_{freq}_latest"
+           for ind in ["macd", "ma", "volume"]
            for freq in ["daily", "weekly"]]
     )
     for view in _all_views:
@@ -1100,17 +1441,23 @@ def drop_all_tables(con: duckdb.DuckDBPyConnection):
 
     # Tables in reverse dependency order
     _all_tables = (
-        # DWS (10)
+        # DWS (10 stock)
         [f"dws_{ind}_{freq}"
          for ind in ["kpattern", "macd", "ma", "dde", "volume", "price_position"]
          for freq in ["daily", "weekly"]]
+        # DWS (6 index)
+        + [f"dws_index_{ind}_{freq}"
+           for ind in ["macd", "ma", "volume"]
+           for freq in ["daily", "weekly"]]
         + ["dws_calc_state"]
-        # DWD (3)
-        + ["dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
-        # DIM (4) — FK tables first
-        + ["dim_concept_stock", "dim_concept", "dim_date", "dim_stock"]
-        # ODS (7)
-        + ["ods_etl_log", "ods_calc_skip_log", "ods_concept_detail", "ods_trade_cal",
+        # DWD (5)
+        + ["dwd_index_weekly", "dwd_index_daily",
+           "dwd_daily_moneyflow", "dwd_weekly_quote", "dwd_daily_quote"]
+        # DIM (5) — FK tables first
+        + ["dim_concept_stock", "dim_concept", "dim_index", "dim_date", "dim_stock"]
+        # ODS (10)
+        + ["ods_index_dailybasic", "ods_index_daily", "ods_index_basic",
+           "ods_etl_log", "ods_calc_skip_log", "ods_concept_detail", "ods_trade_cal",
            "ods_moneyflow", "ods_daily_basic", "ods_daily", "ods_stock_basic"]
     )
     for table in _all_tables:

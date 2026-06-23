@@ -87,13 +87,22 @@ def compute_skip_dwd_calc(
         )
         return False
     fr = coerce_fetch_result(fetch_result)
-    if fr.rows_written > 0:
+    from backend.etl.column_indicator_deps import fetch_blocks_dwd_calc
+
+    if fetch_blocks_dwd_calc(fr):
         logger.info(
             "pipeline L0 gate: skip_dwd_calc=false reason=fetch_rows_written "
             "date=%s rows=%d",
             analysis_date, fr.rows_written,
         )
         return False
+    if fr.rows_written > 0:
+        affected = sorted({ev[3] for ev in fr.changed_field_events})
+        logger.info(
+            "pipeline L0 gate: cosmetic ODS drift ignored date=%s rows=%d "
+            "affected=%s",
+            analysis_date, fr.rows_written, affected,
+        )
     from backend.etl.calc_gate import has_prior_calc_snapshot
     from backend.etl.calc_spec_gate import has_spec_stale_indicators
     from backend.etl.orchestrator import find_stale_dwd_codes

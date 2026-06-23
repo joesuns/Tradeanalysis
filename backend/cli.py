@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 import uuid
 import warnings
@@ -73,6 +74,40 @@ def _warn_export_coverage(db_path: str, trade_date: str, n_rows: int,
         con.close()
 
 
+# ── fetch-index ──
+
+def cmd_fetch_index(args):
+    """Fetch index data only (no calc)."""
+    from backend.db.connection import get_connection
+    from backend.fetch.client import TushareClient
+    from backend.fetch.ods_index import (
+        fetch_index_basic, fetch_index_daily, fetch_index_dailybasic,
+    )
+
+    con = get_connection(read_only=False)
+    client = TushareClient()
+    try:
+        fetch_index_basic(client, con)
+        fetch_index_daily(client, con, args.date)
+        fetch_index_dailybasic(client, con, args.date)
+    finally:
+        con.close()
+
+
+# ── calc-index ──
+
+def cmd_calc_index(args):
+    """Calculate index indicators only."""
+    from backend.db.connection import get_connection
+    from backend.etl.calc_index import calc_index_pipeline
+
+    con = get_connection(read_only=False)
+    try:
+        calc_index_pipeline(con, args.date)
+    finally:
+        con.close()
+
+
 # ── check ──
 
 def cmd_check(_args):
@@ -80,9 +115,14 @@ def cmd_check(_args):
     from backend.db.connection import check_connectivity
     from backend.fetch.client import TushareClient
 
+    # Orphan temp cleanup happens automatically in get_connection()
     db = check_connectivity()
     print(f"DuckDB: {db['duckdb']} (v{db['version']})")
-    print(f"Disk free: {db['disk_free_mb']} MB | DB size: {db['db_size_mb']} MB")
+    print(f"Disk free: {db['disk_free_mb']:,} MB | DB size: {db['db_size_mb']:,} MB")
+    print(f"Temp disk free: {db.get('temp_disk_free_mb', '?'):,} MB")
+    if db.get('backup_count', 0) > 0:
+        print(f"Old backups: {db.get('backup_count', 0)} files "
+              f"({db.get('backup_size_mb', 0):,} MB)")
     try:
         TushareClient().call("stock_basic", exchange="", list_status="L", limit=1)
         print("tushare: connected")
@@ -126,6 +166,50 @@ def cmd_fetch(args):
                 start, end, workers=3, ts_codes=codes, con=con
             )
             mode = "date"
+
+        # Plate (board/concept) data — low priority, skip on failure
+        from backend.fetch.ods_plate import fetch_plate_data
+        from datetime import datetime as _dt
+
+        try:
+            plate_date = _dt.now().strftime("%Y%m%d")
+            plate_lid, plate_t0 = log_etl_start(con, "cli_fetch_plate")
+            try:
+                plate_results = fetch_plate_data(client, con, plate_date)
+                total_members = sum(
+                    r.get("n_members", 0) for r in plate_results.values()
+                )
+                log_etl_end(
+                    con, plate_lid, "cli_fetch_plate", plate_t0, "success",
+                    row_count=total_members,
+                )
+            except Exception as e:
+                log_etl_end(
+                    con, plate_lid, "cli_fetch_plate", plate_t0, "degraded",
+                    error_msg=f"skipped: {e}",
+                )
+        except Exception:
+            pass  # defensive: plate fetch must never block fetch
+
+        # DC theme data — low priority, degrade on failure
+        from backend.fetch.ods_plate import fetch_theme_data
+
+        try:
+            theme_lid, theme_t0 = log_etl_start(con, "cli_fetch_theme")
+            try:
+                theme_result = fetch_theme_data(client, con, plate_date)
+                log_etl_end(
+                    con, theme_lid, "cli_fetch_theme", theme_t0, "success",
+                    row_count=theme_result.get("n_members", 0),
+                )
+            except Exception as e:
+                log_etl_end(
+                    con, theme_lid, "cli_fetch_theme", theme_t0, "degraded",
+                    error_msg=f"skipped: {e}",
+                )
+        except Exception:
+            pass  # defensive: theme fetch must never block fetch
+
         rows_written = int(n)
         completeness = {"mode": mode, "start": start, "end": end}
         if hasattr(n, "to_completeness"):
@@ -197,6 +281,66 @@ def cmd_calc(args, skip_stale_fetch=False):
         con.close()
 
 
+def _load_portfolio_stocks(filepath=None):
+    """Load portfolio stock list from xlsx file.
+
+    Auto-detects ``持仓股列表.xlsx`` in cwd if no path given.
+    Returns list of dicts with keys ``stockcode`` and ``stockname``.
+    Returns empty list on missing file, bad format, or missing columns.
+    """
+    if filepath is None:
+        filepath = os.path.join(os.getcwd(), "持仓股列表.xlsx")
+
+    if not os.path.exists(filepath):
+        logger.warning("portfolio file not found: %s", filepath)
+        return []
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        logger.warning("openpyxl not available; skipping portfolio load")
+        return []
+
+    try:
+        wb = load_workbook(filepath, read_only=True)
+        ws = wb.active
+    except Exception as exc:
+        logger.warning("failed to open portfolio file %s: %s", filepath, exc)
+        return []
+
+    # Read header row
+    rows = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    if not rows:
+        wb.close()
+        return []
+
+    header = [str(c).strip().lower() if c else "" for c in rows[0]]
+
+    try:
+        code_idx = header.index("stockcode")
+        name_idx = header.index("stockname")
+    except ValueError:
+        logger.warning(
+            "portfolio file missing required columns (stockcode, stockname); got %s",
+            header,
+        )
+        wb.close()
+        return []
+
+    result = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) <= max(code_idx, name_idx):
+            continue
+        code = str(row[code_idx]).strip() if row[code_idx] is not None else ""
+        name = str(row[name_idx]).strip() if row[name_idx] is not None else ""
+        if code and name:
+            result.append({"stockcode": code, "stockname": name})
+
+    wb.close()
+    logger.info("loaded %d portfolio stocks from %s", len(result), filepath)
+    return result
+
+
 # ── export ──
 
 def cmd_export(args):
@@ -220,6 +364,7 @@ def cmd_export(args):
 
     db_path = args.db_path or "data/tradeanalysis.duckdb"
     ts_codes = args.ts_code if args.ts_code else None
+    portfolio_stocks = _load_portfolio_stocks(getattr(args, "portfolio_file", None))
     outputs = []
 
     for trade_date in dates:
@@ -231,6 +376,7 @@ def cmd_export(args):
             filter_st=not args.include_st,
             include_index=not args.no_index,
             ts_codes=ts_codes,
+            portfolio_stocks=portfolio_stocks or None,
         )
         _warn_export_coverage(
             db_path, trade_date, result.row_count,
@@ -254,8 +400,18 @@ def _rebuild_dwd_for_run(con, codes: list[str], date: str, fetch_result) -> tupl
     from backend.etl.orchestrator import find_stale_dwd_codes
     from backend.etl.pipeline_context import coerce_fetch_result
 
+    from backend.etl.column_indicator_deps import (
+        calc_affecting_changed_codes,
+        fetch_blocks_dwd_calc,
+    )
+
     fr = coerce_fetch_result(fetch_result)
-    changed = fr.changed_codes_for_date(date)
+    if fr.changed_field_events:
+        changed = calc_affecting_changed_codes(fr.changed_field_events, date)
+    elif fetch_blocks_dwd_calc(fr):
+        changed = fr.changed_codes_for_date(date)
+    else:
+        changed = []
     stale = find_stale_dwd_codes(con, codes, date)
     stale_extra = sorted(set(stale) - set(changed))
     to_rebuild = sorted(set(changed) | set(stale))
@@ -419,7 +575,9 @@ def _cmd_run_single_day(args, date: str):
             dwd_result, stale_rebuilt, dwd_meta = _rebuild_dwd_for_run(
                 con, codes, date, fetch_result,
             )
-            rebuild_rows = sum(dwd_result.values()) if dwd_result else 0
+            from backend.etl.build_dwd import _dwd_rebuild_row_count
+
+            rebuild_rows = _dwd_rebuild_row_count(dwd_result) if dwd_result else 0
             log_etl_end(
                 con, lid, "run_rebuild_dwd", t0, "success", row_count=rebuild_rows,
                 data_completeness={
@@ -517,6 +675,49 @@ def _cmd_run_single_day(args, date: str):
                 calc_routes_narrowed=narrowed,
                 active_routes=active_route_keys(indicator_filter),
             )
+
+        # Plate (board/concept) fetch — low priority, degrade on failure
+        from backend.fetch.ods_plate import fetch_plate_data
+
+        try:
+            plate_client = TushareClient()
+            plate_lid, plate_t0 = log_etl_start(con, "run_fetch_plate")
+            try:
+                plate_results = fetch_plate_data(plate_client, con, date)
+                total_members = sum(
+                    r.get("n_members", 0) for r in plate_results.values()
+                )
+                log_etl_end(
+                    con, plate_lid, "run_fetch_plate", plate_t0, "success",
+                    row_count=total_members,
+                )
+            except Exception as e:
+                log_etl_end(
+                    con, plate_lid, "run_fetch_plate", plate_t0, "degraded",
+                    error_msg=f"skipped: {e}",
+                )
+        except Exception:
+            pass  # defensive: plate fetch must never block run
+
+        # DC theme data — low priority, degrade on failure
+        from backend.fetch.ods_plate import fetch_theme_data
+
+        try:
+            theme_lid, theme_t0 = log_etl_start(con, "run_fetch_theme")
+            try:
+                theme_result = fetch_theme_data(plate_client, con, date)
+                log_etl_end(
+                    con, theme_lid, "run_fetch_theme", theme_t0, "success",
+                    row_count=theme_result.get("n_members", 0),
+                )
+            except Exception as e:
+                log_etl_end(
+                    con, theme_lid, "run_fetch_theme", theme_t0, "degraded",
+                    error_msg=f"skipped: {e}",
+                )
+        except Exception:
+            pass  # defensive: theme fetch must never block run
+
     finally:
         con.close()
 
@@ -535,6 +736,8 @@ def _cmd_run_single_day(args, date: str):
         logger.info("=== Step 3/3: Exporting analysis for %s ===", date)
         args.output = default_export_path(date, args.output)
 
+        portfolio_stocks = _load_portfolio_stocks(getattr(args, "portfolio_file", None))
+
         con = get_connection()
         try:
             lid, t0 = log_etl_start(con, "run_export")
@@ -545,6 +748,7 @@ def _cmd_run_single_day(args, date: str):
                 filter_st=not args.include_st,
                 include_index=not args.no_index,
                 ts_codes=ts_codes,
+                portfolio_stocks=portfolio_stocks or None,
             )
             log_etl_end(
                 con, lid, "run_export", t0, "success", row_count=result.row_count,
@@ -777,8 +981,34 @@ def cmd_prune(args):
     latest-per-key value for every (ts_code, trade_date) is always kept,
     so v_*_latest views are unchanged. Runs a CHECKPOINT afterwards to
     reclaim space within the database file.
+
+    With --cleanup-backups: remove old pre-* DuckDB backup files
+    instead of DWS pruning, retaining the most recent N (default 2,
+    via PRUNE_KEEP_BACKUPS).
     """
-    from backend.db.connection import get_connection, prune_dws_snapshots, run_checkpoint
+    from backend.db.connection import get_connection, prune_dws_snapshots, run_checkpoint, cleanup_backup_files
+    from backend.config import DUCKDB_PATH
+    import os
+
+    if args.cleanup_backups:
+        data_dir = os.path.dirname(os.path.abspath(DUCKDB_PATH)) or "."
+        result = cleanup_backup_files(data_dir, keep=args.keep_backups, dry_run=args.dry_run)
+        if args.dry_run:
+            if result["deleted"]:
+                print(f"Would delete {len(result['deleted'])} backup(s) "
+                      f"({result['freed_mb']:,} MB):")
+                for name in result["deleted"]:
+                    print(f"  - {name}")
+                print(f"Would retain: {', '.join(result['retained']) or 'none'}")
+            else:
+                print(f"No backup files to clean (retained: {result.get('retained', [])})")
+            return
+        if result["deleted"]:
+            print(f"Deleted {len(result['deleted'])} backup(s) "
+                  f"({result['freed_mb']:,} MB freed)")
+        else:
+            print("No old backup files to delete")
+        return
 
     con = get_connection()
     try:
@@ -1155,8 +1385,16 @@ def _add_refresh_state_args(p):
 
 
 def _add_prune_args(p):
-    p.add_argument("--keep", type=int, default=5,
-                   help="Number of most recent calc runs to retain (default 5)")
+    from backend.config import DWS_PRUNE_KEEP_RUNS
+    p.add_argument("--keep", type=int, default=DWS_PRUNE_KEEP_RUNS,
+                   help=f"Number of most recent calc runs to retain "
+                        f"(default {DWS_PRUNE_KEEP_RUNS}, env DWS_PRUNE_KEEP_RUNS)")
+    p.add_argument("--cleanup-backups", action="store_true",
+                   help="Remove old pre-* DuckDB backup files instead of DWS pruning")
+    p.add_argument("--keep-backups", type=int, default=None,
+                   help="Backup files to retain (default: PRUNE_KEEP_BACKUPS=2)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Preview cleanup-backups without deleting")
 
 
 def _add_repair_weekly_args(p):
@@ -1299,6 +1537,8 @@ def main():
     xp.add_argument("--db-path")
     xp.add_argument("--include-st", action="store_true")
     xp.add_argument("--no-index", action="store_true")
+    xp.add_argument("--portfolio-file", default=None,
+                    help="Path to portfolio stock list xlsx (default: 持仓股列表.xlsx in cwd)")
 
     # query
     qp = sp.add_parser("query", help="Query DWS indicators")
@@ -1320,6 +1560,8 @@ def main():
                     help="Skip Excel export (same-day rerun when report unchanged)")
     rp.add_argument("--continue-on-error", action="store_true",
                     help="With --from/--to: continue after a failed day (default: fail-fast)")
+    rp.add_argument("--portfolio-file", default=None,
+                    help="Path to portfolio stock list xlsx (default: 持仓股列表.xlsx in cwd)")
 
     # refresh
     rfp = sp.add_parser(
@@ -1384,6 +1626,16 @@ def main():
     )
     _add_refresh_state_args(rsp)
 
+    # fetch-index
+    sp_fetch_index = sp.add_parser("fetch-index", help="拉取指数数据")
+    sp_fetch_index.add_argument("--date")
+    sp_fetch_index.set_defaults(func=cmd_fetch_index)
+
+    # calc-index
+    sp_calc_index = sp.add_parser("calc-index", help="计算指数指标")
+    sp_calc_index.add_argument("--date", required=True)
+    sp_calc_index.set_defaults(func=cmd_calc_index)
+
     sp.add_parser("status", help="Show database table stats")
 
     args = p.parse_args()
@@ -1395,7 +1647,9 @@ def main():
     handlers = {
         "check": cmd_check,
         "fetch": cmd_fetch,
+        "fetch-index": cmd_fetch_index,
         "calc": cmd_calc,
+        "calc-index": cmd_calc_index,
         "export": cmd_export,
         "run": cmd_run,
         "refresh": cmd_refresh,
