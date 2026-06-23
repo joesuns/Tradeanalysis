@@ -106,6 +106,155 @@ def _fetch_members_for_board(client, trade_date: str, board_ts_code: str,
     return members
 
 
+def _fetch_theme_boards(client, trade_date: str) -> list[dict]:
+    """Fetch DC theme list via dc_concept API.
+
+    dc_concept does NOT accept idx_type — it returns all themes for the date.
+    Returns list of {board_ts_code, board_name, hot}.
+    """
+    records = client.call("dc_concept", trade_date=trade_date)
+    boards = []
+    for r in records:
+        theme_code = r.get("theme_code", "")
+        name = r.get("name", "")
+        hot = r.get("hot")
+        if theme_code and name:
+            boards.append({
+                "board_ts_code": theme_code,
+                "board_name": name,
+                "hot": hot,
+            })
+    return boards
+
+
+def _fetch_theme_members_for_board(client, trade_date: str, theme_code: str) -> list[dict]:
+    """Fetch member stocks for a single DC theme via dc_concept_cons.
+
+    Returns list of {con_code, con_name, reason, hot_num}.
+    Note: dc_concept_cons uses 'theme_code' parameter (not 'ts_code' or 'con_code').
+    """
+    records = client.call(
+        "dc_concept_cons",
+        trade_date=trade_date,
+        theme_code=theme_code,
+    )
+    members = []
+    for r in records:
+        ts_code = r.get("ts_code", "")
+        name = r.get("name", "")
+        reason = r.get("reason")
+        hot_num = r.get("hot_num")
+        if ts_code:
+            members.append({
+                "con_code": ts_code,
+                "con_name": name or "",
+                "reason": reason,
+                "hot_num": hot_num,
+            })
+    return members
+
+
+def fetch_theme_data(client, con, trade_date: str) -> dict:
+    """Fetch DC theme members for a trade_date. TTL-cached; degraded on failure.
+
+    Uses same ODS tables as fetch_plate_data (source='dc_theme', idx_type='题材').
+
+    Returns dict: {n_boards, n_members, cached, error}
+    """
+    SOURCE = "dc_theme"
+    IDX_TYPE = "题材"
+    TTL_DAYS = 7  # theme classification changes slowly
+
+    result = {"n_boards": 0, "n_members": 0, "cached": False, "error": None}
+    ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # TTL gate
+    if _is_snapshot_fresh(con, trade_date, SOURCE, IDX_TYPE, ttl_days=TTL_DAYS):
+        n = _count_members_for_date(con, trade_date, SOURCE)
+        result["n_members"] = n
+        result["cached"] = True
+        logger.info(
+            "progress fetch.theme: dc_theme cache hit | members=%d", n,
+        )
+        return result
+
+    logger.info("progress fetch.theme: dc_theme cache miss | fetching...")
+    t_start = time.monotonic()
+
+    try:
+        # Step A: fetch theme list
+        boards = _fetch_theme_boards(client, trade_date)
+        result["n_boards"] = len(boards)
+        logger.info(
+            "progress fetch.theme: dc_theme boards=%d", len(boards),
+        )
+
+        # Step B: fetch members per theme
+        total_members = 0
+        for i, b in enumerate(boards):
+            try:
+                members = _fetch_theme_members_for_board(
+                    client, trade_date, b["board_ts_code"],
+                )
+                # UPSERT board (with hot column)
+                con.execute(
+                    """INSERT OR REPLACE INTO ods_plate_board
+                       (trade_date, source, board_ts_code, board_name, hot, fetched_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    [trade_date, SOURCE, b["board_ts_code"], b["board_name"],
+                     b.get("hot"), ts_now],
+                )
+                # UPSERT members (with reason + hot_num columns)
+                for m in members:
+                    con.execute(
+                        """INSERT OR REPLACE INTO ods_plate_member
+                           (trade_date, source, board_ts_code, con_code, con_name,
+                            reason, hot_num, fetched_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [trade_date, SOURCE, b["board_ts_code"],
+                         m["con_code"], m["con_name"],
+                         m.get("reason"), m.get("hot_num"), ts_now],
+                    )
+                    total_members += 1
+            except Exception as e:
+                logger.warning(
+                    "fetch.theme: dc_theme member %s failed: %s",
+                    b["board_ts_code"], e,
+                )
+                continue
+
+            # Progress heartbeat every 100 themes
+            if (i + 1) % 100 == 0:
+                logger.info(
+                    "progress fetch.theme: dc_theme %d/%d boards | members=%d",
+                    i + 1, len(boards), total_members,
+                )
+
+        result["n_members"] = total_members
+
+        # Step C: write snapshot meta record
+        con.execute(
+            """INSERT OR REPLACE INTO ods_plate_snapshot
+               (trade_date, source, idx_type, n_boards, n_members, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [trade_date, SOURCE, IDX_TYPE, len(boards), total_members, ts_now],
+        )
+
+        elapsed = time.monotonic() - t_start
+        logger.info(
+            "progress fetch.theme: dc_theme done | boards=%d members=%d | %.0fs",
+            len(boards), total_members, elapsed,
+        )
+
+    except Exception as e:
+        result["error"] = str(e)
+        logger.warning(
+            "fetch.theme: dc_theme degraded: %s", e,
+        )
+
+    return result
+
+
 def fetch_plate_data(client, con, trade_date: str) -> dict:
     """Fetch TDX + DC plate members for a trade_date. TTL-cached; degraded on failure.
 
@@ -248,5 +397,20 @@ def load_plate_enrichment(con, trade_date: str) -> dict[str, dict[str, str]]:
     ).fetchall()
     for ts_code, boards in dc_rows:
         enrichment.setdefault(ts_code, {})["dc_concept_board"] = boards
+
+    # DC theme → dc_theme_board column
+    theme_rows = con.execute(
+        """SELECT m.con_code AS ts_code,
+                  STRING_AGG(DISTINCT b.board_name, ',' ORDER BY b.board_name) AS boards
+           FROM ods_plate_member m
+           JOIN ods_plate_board b ON m.trade_date = b.trade_date
+               AND m.source = b.source
+               AND m.board_ts_code = b.board_ts_code
+           WHERE m.trade_date = ? AND m.source = 'dc_theme'
+           GROUP BY m.con_code""",
+        [trade_date],
+    ).fetchall()
+    for ts_code, boards in theme_rows:
+        enrichment.setdefault(ts_code, {})["dc_theme_board"] = boards
 
     return enrichment
