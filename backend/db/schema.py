@@ -125,6 +125,58 @@ _ODS_DDL = [
         detail         TEXT,
         PRIMARY KEY (calc_date, ts_code, indicator, freq)
     )""",
+
+    # 13.1 ods_index_basic — 指数基本信息
+    """CREATE TABLE IF NOT EXISTS ods_index_basic (
+        ts_code        TEXT PRIMARY KEY,
+        name           TEXT,
+        fullname       TEXT,
+        market         TEXT,
+        publisher      TEXT,
+        category       TEXT,
+        base_date      TEXT,
+        base_point     REAL,
+        list_date      TEXT,
+        exp_date       TEXT,
+        weight_rule    TEXT,
+        raw_json       TEXT,
+        fetched_at     TEXT DEFAULT (now())
+    )""",
+
+    # 13.2 ods_index_daily — 指数日线行情
+    """CREATE TABLE IF NOT EXISTS ods_index_daily (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        close          REAL,
+        open           REAL,
+        high           REAL,
+        low            REAL,
+        pre_close      REAL,
+        change         REAL,
+        pct_chg        REAL,
+        vol            REAL,
+        amount         REAL,
+        fetched_at     TEXT DEFAULT (now()),
+        PRIMARY KEY (ts_code, trade_date)
+    )""",
+
+    # 13.3 ods_index_dailybasic — 指数每日估值（仅六只核心指数有数据）
+    """CREATE TABLE IF NOT EXISTS ods_index_dailybasic (
+        ts_code        TEXT,
+        trade_date     TEXT,
+        total_mv       REAL,
+        float_mv       REAL,
+        total_share    REAL,
+        float_share    REAL,
+        free_share     REAL,
+        turnover_rate  REAL,
+        turnover_rate_f REAL,
+        pe             REAL,
+        pe_ttm         REAL,
+        pb             REAL,
+        fetched_at     TEXT DEFAULT (now()),
+        PRIMARY KEY (ts_code, trade_date)
+    )""",
 ]
 
 def _migrate_etl_log(con):
