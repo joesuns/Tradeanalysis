@@ -137,6 +137,10 @@ python scripts/benchmark_run.py --date 20260609 --run
 # SLA（稳态真新日，含 export）：benchmark_run --run 墙钟≤1800s + health_check；见 pipeline §1.1 / 附录 D
 # 迁移日：不卡 chunk；记录 full_by_indicator + L3 spot-check
 # P4 实施：docs/superpowers/plans/2026-06-12-p4-indicator-chunk-impl.md（Task 5 + 5b）
+
+# ===== 指数 =====
+python -m backend.cli fetch-index                  # 仅拉取指数数据
+python -m backend.cli calc-index --date 20260623   # 仅计算指数指标
 ```
 
 ## 项目结构
@@ -270,6 +274,26 @@ export（导出层）
 ├── **`EXPORT_SPEC_GATE=1`（默认 0）：** export 前检测 state/DWS spec 落后并打 WARNING（非阻断）
 └── 默认路径: exports/analysis_{date}_gen{now}.xlsx
 ```
+
+### 指数数据流（平行体系）
+
+```
+tushare index_basic/index_daily/index_dailybasic → ODS(3) → DIM(1) + DWD(2) → DWS(6) → ADS(视图) → Excel/CLI
+```
+
+- **ODS(3)：** `ods_index_basic` / `ods_index_daily` / `ods_index_dailybasic`
+- **DIM(1)：** `dim_index`
+- **DWD(2)：** `dwd_index_daily` / `dwd_index_weekly`
+  - `close_qfq = close`（指数无需复权，列名对齐计算器兼容）
+  - `is_suspended = 0`（指数无停牌，列名对齐 `load_quote_groups` 日线过滤）
+  - 周线聚合与个股同：`date_trunc('week', dt)` Monday anchor
+- **DWS(6)：** `dws_index_macd_{freq}` / `dws_index_ma_{freq}` / `dws_index_volume_{freq}`（日+周）
+  - 🚫 无 DDE（指数无资金流）、无 kpattern、无 price_position
+- **ADS 视图：** `v_ads_market_index_daily` / `v_ads_market_index_weekly`
+- **计算器复用：** `IndexMACDCalculator` / `IndexMACalculator` / `IndexVolumeCalculator` 继承个股计算器，仅覆盖 `src_table` 和 `dws_table`
+- **指数列表配置：** `config/indices.yaml`，分 core/sector 组，修改后下次 run 生效
+- **拉取策略：** 渐进式回填（首次 250 bar warmup，后续增量）; `cli run` 末尾低优先级，失败降级
+- 🚫 **指数 calc 禁止走个股 `classify_calc_mode` 路由**——必须用 `IndexMACDCalculator` 等适配器（`calc_index_pipeline` 入口）
 
 ## 关键技术细节
 
