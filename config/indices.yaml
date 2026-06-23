@@ -1,0 +1,19 @@
+# 指数列表配置 — 修改后下次 cli run 自动生效
+indices:
+  # 核心宽基指数 — 始终拉取
+  core:
+    - ts_code: "000001.SH"
+      name: "上证综指"
+    - ts_code: "399001.SZ"
+      name: "深证成指"
+    - ts_code: "000300.SH"
+      name: "沪深300"
+    - ts_code: "000905.SH"
+      name: "中证500"
+    - ts_code: "000016.SH"
+      name: "上证50"
+    - ts_code: "399006.SZ"
+      name: "创业板指"
+
+  # 申万一级行业指数 — 按需增删
+  sector: []
