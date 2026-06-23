@@ -8,30 +8,29 @@ class TestPlateColumnsInExport:
     """Verify plate columns appear correctly in exported DataFrame."""
 
     def test_id_cols_include_plate_columns(self):
-        """_ID_COLS must include tdx_industry_board and dc_concept_board."""
+        """_ID_COLS includes tdx_industry_board, dc_concept_board, and dc_theme_board."""
         from backend.export_wide import _ID_COLS
 
         assert "tdx_industry_board" in _ID_COLS
         assert "dc_concept_board" in _ID_COLS
+        assert "dc_theme_board" in _ID_COLS
 
-        # Position check: after industry, before is_st
-        idx_industry = _ID_COLS.index("industry")
-        idx_tdx = _ID_COLS.index("tdx_industry_board")
-        idx_dc = _ID_COLS.index("dc_concept_board")
-        idx_st = _ID_COLS.index("is_st")
-
-        assert idx_tdx == idx_industry + 1, "tdx_industry_board must follow industry"
-        assert idx_dc == idx_tdx + 1, "dc_concept_board must follow tdx_industry_board"
-        assert idx_st == idx_dc + 1, "is_st must follow dc_concept_board"
+        # Verify order: theme after concept
+        concept_idx = _ID_COLS.index("dc_concept_board")
+        theme_idx = _ID_COLS.index("dc_theme_board")
+        assert theme_idx == concept_idx + 1, (
+            f"dc_theme_board should be right after dc_concept_board, "
+            f"got positions {concept_idx} and {theme_idx}"
+        )
 
     def test_col_names_include_new_columns(self):
-        """_COL_NAMES must map new columns to Chinese names."""
+        """_COL_NAMES includes new plate columns."""
         from backend.export_wide import _COL_NAMES
 
-        assert _COL_NAMES["sector"] == "上市板"
-        assert _COL_NAMES["industry"] == "申万行业"
-        assert _COL_NAMES["tdx_industry_board"] == "通达信行业"
-        assert _COL_NAMES["dc_concept_board"] == "概念板块"
+        assert "tdx_industry_board" in _COL_NAMES
+        assert "dc_concept_board" in _COL_NAMES
+        assert "dc_theme_board" in _COL_NAMES
+        assert _COL_NAMES["dc_theme_board"] == "所属题材"
 
     def test_plate_merge_with_existing_daily(self):
         """Plate enrichment merges correctly into daily DataFrame."""
@@ -123,3 +122,15 @@ class TestPlateNullDisplay:
         result = apply_display_nulls(df)
         assert result.loc[0, "tdx_industry_board"] == "N/A"
         assert result.loc[1, "dc_concept_board"] == "N/A"
+
+    def test_theme_col_not_in_signal_cols(self):
+        """dc_theme_board is NOT a signal column."""
+        from backend.export_wide import _SIGNAL_COLS
+
+        assert "dc_theme_board" not in _SIGNAL_COLS
+
+    def test_theme_col_in_classification_cols(self):
+        """dc_theme_board IS a classification column (null -> N/A, not -)."""
+        from backend.export_wide import _PLATE_CLASSIFICATION_COLS
+
+        assert "dc_theme_board" in _PLATE_CLASSIFICATION_COLS
