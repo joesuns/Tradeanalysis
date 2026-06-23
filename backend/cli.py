@@ -157,6 +157,25 @@ def cmd_fetch(args):
         except Exception:
             pass  # defensive: plate fetch must never block fetch
 
+        # DC theme data — low priority, degrade on failure
+        from backend.fetch.ods_plate import fetch_theme_data
+
+        try:
+            theme_lid, theme_t0 = log_etl_start(con, "cli_fetch_theme")
+            try:
+                theme_result = fetch_theme_data(client, con, plate_date)
+                log_etl_end(
+                    con, theme_lid, "cli_fetch_theme", theme_t0, "success",
+                    row_count=theme_result.get("n_members", 0),
+                )
+            except Exception as e:
+                log_etl_end(
+                    con, theme_lid, "cli_fetch_theme", theme_t0, "degraded",
+                    error_msg=f"skipped: {e}",
+                )
+        except Exception:
+            pass  # defensive: theme fetch must never block fetch
+
         rows_written = int(n)
         completeness = {"mode": mode, "start": start, "end": end}
         if hasattr(n, "to_completeness"):
