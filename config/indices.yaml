@@ -15,5 +15,7 @@ indices:
     - ts_code: "399006.SZ"
       name: "创业板指"
 
-  # 申万一级行业指数 — 按需增删
-  sector: []
+  # 同花顺概念板块（.TI后缀）— 按需增删
+  sector:
+    - ts_code: "886054.TI"
+      name: "光刻机"

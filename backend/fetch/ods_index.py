@@ -18,7 +18,10 @@ def load_index_config() -> dict:
     result: dict = {}
     for group in ("core", "sector"):
         for item in cfg.get("indices", {}).get(group, []):
-            result[item["ts_code"]] = item["name"]
+            if isinstance(item, dict):
+                result[item["ts_code"]] = item.get("name", item["ts_code"])
+            else:
+                logger.warning("config: skipping non-dict entry in indices.%s: %s", group, item)
     return result
 
 
@@ -28,6 +31,11 @@ def _get_tracked_codes() -> list:
 
 
 # ── helpers ──────────────────────────────────────────────────
+
+def _is_ths(ts_code: str) -> bool:
+    """Detect THS (同花顺) concept board codes by .TI suffix."""
+    return ts_code.endswith(".TI")
+
 
 def _sub_calendar_days(date_str: str, days: int) -> str:
     """Subtract N calendar days from YYYYMMDD, return YYYYMMDD."""
@@ -60,7 +68,10 @@ def fetch_index_basic(client, con) -> int:
     logger.info("progress fetch.index_basic: fetching %d indices", len(codes))
     rows = 0
     for ts_code in codes:
-        recs = client.call("index_basic", ts_code=ts_code)
+        if _is_ths(ts_code):
+            recs = client.call("ths_index", ts_code=ts_code)
+        else:
+            recs = client.call("index_basic", ts_code=ts_code)
         for r in recs:
             con.execute("""INSERT OR REPLACE INTO ods_index_basic
                 (ts_code, name, fullname, market, publisher, category,
@@ -111,17 +122,31 @@ def fetch_index_daily(client, con, trade_date: str = None) -> int:
             logger.info("progress fetch.index_daily: %s incremental %s→%s",
                         ts_code, start_date, end_date)
 
-        recs = client.call("index_daily", ts_code=ts_code,
-                           start_date=start_date, end_date=end_date)
-        for r in recs:
-            con.execute("""INSERT OR REPLACE INTO ods_index_daily
-                (ts_code, trade_date, close, open, high, low, pre_close,
-                 change, pct_chg, vol, amount, fetched_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,now())""",
-                (r["ts_code"], r["trade_date"],
-                 r.get("close"), r.get("open"), r.get("high"), r.get("low"),
-                 r.get("pre_close"), r.get("change"), r.get("pct_chg"),
-                 r.get("vol"), r.get("amount")))
+        if _is_ths(ts_code):
+            recs = client.call("ths_daily", ts_code=ts_code,
+                               start_date=start_date, end_date=end_date)
+            for r in recs:
+                con.execute("""INSERT OR REPLACE INTO ods_index_daily
+                    (ts_code, trade_date, close, open, high, low, pre_close,
+                     change, pct_chg, vol, amount, turnover_rate, avg_price, fetched_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,now())""",
+                    (r["ts_code"], r["trade_date"],
+                     r.get("close"), r.get("open"), r.get("high"), r.get("low"),
+                     r.get("pre_close"), r.get("change"), r.get("pct_change"),
+                     r.get("vol"), None,
+                     r.get("turnover_rate"), r.get("avg_price")))
+        else:
+            recs = client.call("index_daily", ts_code=ts_code,
+                               start_date=start_date, end_date=end_date)
+            for r in recs:
+                con.execute("""INSERT OR REPLACE INTO ods_index_daily
+                    (ts_code, trade_date, close, open, high, low, pre_close,
+                     change, pct_chg, vol, amount, fetched_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,now())""",
+                    (r["ts_code"], r["trade_date"],
+                     r.get("close"), r.get("open"), r.get("high"), r.get("low"),
+                     r.get("pre_close"), r.get("change"), r.get("pct_chg"),
+                     r.get("vol"), r.get("amount")))
         total_rows += len(recs)
 
     logger.info("progress fetch.index_daily: done | total_rows=%d", total_rows)
@@ -140,6 +165,8 @@ def fetch_index_dailybasic(client, con, trade_date: str = None) -> int:
 
     total_rows = 0
     for ts_code in codes:
+        if _is_ths(ts_code):
+            continue  # THS concept boards have no PE/PB data
         existing = con.execute(
             "SELECT MAX(trade_date) FROM ods_index_dailybasic WHERE ts_code = ?",
             [ts_code]
