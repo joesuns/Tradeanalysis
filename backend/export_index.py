@@ -3,159 +3,164 @@ import logging
 
 import pandas as pd
 
+from backend.export_wide import (
+    _format_numbers,
+    _transform_display_values,
+    _resolve_sheet_layout,
+    _write_sheet_from_display,
+)
+import backend.export_wide as _ew  # for _COL_NAMES / _FUND_COLS injection
+
 logger = logging.getLogger(__name__)
 
-# View for index daily data
-_INDEX_VIEW = "v_ads_market_index_daily"
+# Views for index data
+_INDEX_DAILY_VIEW = "v_ads_market_index_daily"
+_INDEX_WEEKLY_VIEW = "v_ads_market_index_weekly"
 
-# Borrow Chinese column names from stock sheet + add index-specific entries
-from backend.export_wide import _COL_NAMES as _STOCK_COL_NAMES
-
-_INDEX_COL_NAMES = {
-    **_STOCK_COL_NAMES,
+# ── Index-specific Chinese column name overrides ────────────
+# Stock _COL_NAMES supplies the baseline; these 4 keys override
+# stock-specific names (e.g. ts_code "股票代码" → "指数代码").
+_INDEX_COL_NAME_OVERRIDES = {
     "ts_code": "指数代码",
     "index_name": "指数名称",
     "index_category": "分类",
     "pb": "市净率",
 }
 
-# Header styling constants — aligned with backend/export_wide.py
-_HEADER_FONT_11 = {"name": "微软雅黑", "color": "FFFFFF", "size": 11, "bold": True}
-_HEADER_FONT_10 = {"name": "微软雅黑", "color": "FFFFFF", "size": 10}
-_BASIC_FILL = "1A1A1A"
-_GROUP_FILL = "1A5276"
+# Full index column-name map (baseline + overrides) — used to
+# inject into _ew._COL_NAMES before layout build.
+_INDEX_COL_NAMES = {**_ew._COL_NAMES, **_INDEX_COL_NAME_OVERRIDES}
 
-# Indicator group colors — same palette as export_wide.py _GROUP_COLORS
-_COL_TINT = {
-    "macd_": "8E44AD", "ema_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
-    "ma_vol_": "27AE60",  # before "ma_" so ma_vol_5 gets volume green
-    "ma_": "2980B9", "bias_": "2980B9", "ma5": "2980B9", "ma10": "2980B9",
-    "vol_": "27AE60", "volume_": "27AE60", "pct_vol": "27AE60",
-}
-_DEFAULT_TINT = "7F8C8D"
+# ── Index-specific column sets ──────────────────────────────
 
-# Column order + group labels (Row 1 merge spans)
-_COL_GROUPS = [
-    ("基本信息", [
-        "ts_code", "index_name", "index_category",
-        "close", "pct_chg", "vol", "amount",
-        "pe_ttm", "pb", "total_mv",
-    ]),
-    ("MACD 指标", [
-        "ema_12", "ema_26", "dif", "dea", "macd_bar",
-        "macd_divergence", "macd_zone", "macd_turning_point",
-        "macd_trend", "macd_trend_strength", "macd_alert",
-    ]),
-    ("MA 均线", [
-        "ma_5", "ma_10", "bias_ma5", "bias_ma10",
-        "ma5_slope", "ma10_slope", "ma_alignment", "ma_turning_point",
-    ]),
-    ("量能信号", [
-        "ma_vol_5", "pct_vol_rank", "volume_ratio",
-        "vol_trend_strength", "vol_zone", "vol_trend", "vol_divergence",
-    ]),
+# 指数基本信息列（对齐综合分析基本面列语义，去掉个股专属列）
+_INDEX_BASIC_COLS = [
+    "ts_code", "index_name", "index_category",
+    "close", "pct_chg", "vol", "amount",
+    "pe_ttm", "pb", "total_mv",
+    "turnover_rate", "volume_ratio",
+]
+
+# 指数信号列（信号聚焦 —— 去掉 EMA/MA/量能原始值；保留 macd_divergence 全文）
+_INDEX_SIGNAL_COLS = [
+    "macd_divergence",
+    "macd_zone", "macd_turning_point", "macd_alert",
+    "macd_trend", "macd_trend_strength",
+    "bias_ma5", "bias_ma10",
+    "ma_alignment", "ma_turning_point",
+    "vol_zone", "vol_trend", "vol_divergence",
 ]
 
 
-def _chinese_name(col: str) -> str:
-    """Map English column key to Chinese display name."""
-    return _INDEX_COL_NAMES.get(col, col)
+def export_index_sheet(con, trade_date: str, wb) -> int:
+    """Write index overview sheet to workbook. Returns data row count.
 
-
-def _tint_for_col(col: str) -> str:
-    """Match column to indicator color prefix."""
-    for prefix, color in _COL_TINT.items():
-        if col.startswith(prefix):
-            return color
-    return _DEFAULT_TINT
-
-
-def export_index_sheet(con, trade_date: str, ws) -> int:
-    """Write index overview to an openpyxl worksheet. Returns row count.
-
-    Styling matches the stock analysis sheets:
-    - Row 1: merged group headers (blue fill, white 雅黑 11pt)
-    - Row 2: individual **Chinese** column names with indicator-colored fills
-             + hover comments from export-column-comments.yaml
-    - Data from Row 3
+    Creates a new "指数概览" sheet internally, matching the stock "综合分析" sheet
+    styling: two-row headers (Row 1 group merges, Row 2 Chinese names with indicator
+    colours), enum values translated to Chinese, proper null semantics, daily+weekly
+    horizontal merge.
     """
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from backend.export_wide import _attach_header_comment
+    # ── Load daily data ─────────────────────────────────────
+    daily = con.execute(
+        f"SELECT * FROM {_INDEX_DAILY_VIEW} WHERE trade_date = ? "
+        "ORDER BY CASE WHEN ts_code='000001.SH' THEN 0 "
+        "WHEN ts_code LIKE '%.SH' THEN 1 WHEN ts_code LIKE '%.SZ' THEN 2 ELSE 3 END, ts_code",
+        [trade_date],
+    ).df()
 
-    df = con.execute(f"""
-        SELECT * FROM {_INDEX_VIEW}
-        WHERE trade_date = ?
-        ORDER BY
-            CASE
-                WHEN ts_code = '000001.SH' THEN 0
-                WHEN ts_code LIKE '%.SH' THEN 1
-                WHEN ts_code LIKE '%.SZ' THEN 2
-                ELSE 3
-            END,
-            ts_code
-    """, [trade_date]).df()
-
-    if df.empty:
+    if daily.empty:
+        ws = wb.create_sheet("指数概览")
         ws.cell(row=1, column=1, value=f"No index data for {trade_date}")
         return 0
 
-    # Flatten column order from groups
-    all_cols = []
-    for _, cols in _COL_GROUPS:
-        for c in cols:
-            if c in df.columns and c not in all_cols:
-                all_cols.append(c)
-    df = df[all_cols]
+    daily = _format_numbers(daily)
 
-    # ── styles ────────────────────────────────────────────
-    group_font = Font(**_HEADER_FONT_11)
-    col_font = Font(**_HEADER_FONT_10)
-    group_fill = PatternFill(start_color=_GROUP_FILL, end_color=_GROUP_FILL, fill_type="solid")
-    center_align = Alignment(horizontal="center", vertical="center")
-    header_border = Border(bottom=Side(style="thin", color="5D6D7E"))
+    # ── Load weekly data ─────────────────────────────────────
+    # Index weekly uses Monday anchor (date_trunc('week', dt)), NOT week-end.
+    # Query the latest Monday ≤ trade_date directly from dwd_index_weekly.
+    week_monday = con.execute(
+        "SELECT MAX(trade_date) FROM dwd_index_weekly WHERE trade_date <= ?",
+        [trade_date],
+    ).fetchone()[0]
 
-    # ── Row 1: merged group headers ───────────────────────
-    col = 1
-    for group_name, group_cols in _COL_GROUPS:
-        present = [c for c in group_cols if c in all_cols]
-        if not present:
-            continue
-        n = len(present)
-        if n > 1:
-            ws.merge_cells(start_row=1, start_column=col,
-                           end_row=1, end_column=col + n - 1)
-        c = ws.cell(row=1, column=col, value=group_name)
-        c.fill = group_fill
-        c.font = group_font
-        c.alignment = center_align
-        c.border = header_border
-        col += n
+    weekly = pd.DataFrame()
+    if week_monday:
+        weekly = con.execute(
+            f"SELECT * FROM {_INDEX_WEEKLY_VIEW} WHERE trade_date = ?",
+            [week_monday],
+        ).df()
+        if not weekly.empty:
+            weekly = _format_numbers(weekly)
 
-    # ── Row 2: individual column names (Chinese + comments) ─
-    for j, eng_name in enumerate(all_cols, 1):
-        cn_name = _chinese_name(eng_name)
-        tint = _tint_for_col(eng_name)
-        cell = ws.cell(row=2, column=j, value=cn_name)
-        cell.font = col_font
-        cell.fill = PatternFill(start_color=tint, end_color=tint, fill_type="solid")
-        cell.alignment = center_align
-        cell.border = header_border
-        _attach_header_comment(cell, eng_name, weekly=False)
+    # ── Merge daily + weekly with __w__ prefix ────────────────
+    # Determine available columns for layout
+    daily_basic = [c for c in _INDEX_BASIC_COLS if c in daily.columns]
+    daily_signal_cols = [c for c in _INDEX_SIGNAL_COLS if c in daily.columns]
+    daily_cols = daily_basic + daily_signal_cols
 
-    # ── Data rows ─────────────────────────────────────────
-    for i, (_, row) in enumerate(df.iterrows()):
-        for j, col_name in enumerate(all_cols, 1):
-            val = row[col_name]
-            if isinstance(val, float) and pd.isna(val):
-                val = None
-            ws.cell(row=i + 3, column=j, value=val)
+    # Weekly: drop identity/identity-like columns (already in daily basic info)
+    # plus active_days (internal metric, not for display)
+    weekly_drop = {
+        "ts_code", "index_name", "index_category",
+        "close", "pct_chg", "vol", "amount",
+        "pe_ttm", "pb", "total_mv",
+        "turnover_rate", "volume_ratio",
+        "active_days", "freq", "trade_date",
+    }
+    weekly_cols = []
+    if not weekly.empty and "ts_code" in weekly.columns:
+        weekly_keep = [c for c in weekly.columns if c not in weekly_drop]
+        weekly_signal_cols = [c for c in _INDEX_SIGNAL_COLS if c in weekly_keep]
+        weekly_cols = weekly_signal_cols
 
-    # ── Column widths (based on Chinese header) ────────────
-    from openpyxl.utils import get_column_letter
-    for j, eng_name in enumerate(all_cols, 1):
-        cn_name = _chinese_name(eng_name)
-        hdr_len = sum(2.2 if "一" <= c <= "鿿" else 1.0 for c in cn_name)
-        ws.column_dimensions[get_column_letter(j)].width = min(hdr_len + 3, 22)
+        weekly_renamed = weekly[["ts_code"] + weekly_keep].rename(
+            columns={c: f"__w__{c}" for c in weekly_keep}
+        )
+        merged = daily.merge(weekly_renamed, on="ts_code", how="left")
+    else:
+        merged = daily.copy()
 
-    ws.auto_filter.ref = ws.dimensions
-    return len(df)
+    if merged.empty:
+        ws = wb.create_sheet("指数概览")
+        ws.cell(row=1, column=1, value=f"No index data for {trade_date}")
+        return 0
+
+    # ── Inject index-specific Chinese column names ────────────
+    # _resolve_sheet_layout and _write_sheet_headers look up _COL_NAMES
+    # for Chinese display names.  Inject index-only keys before layout build.
+    _orig_col_names = {}
+    for k, v in _INDEX_COL_NAMES.items():
+        _orig_col_names[k] = _ew._COL_NAMES.get(k)
+        _ew._COL_NAMES[k] = v
+
+    # ── Inject index identity columns into _FUND_COLS ─────────
+    # _resolve_sheet_layout splits daily_cols into basic (matched against
+    # _ID_COLS + _FUND_COLS) and signal (everything else).  We need
+    # index_name, index_category, pb in the basic group.
+    _extra_fund = []
+    for c in ["index_name", "index_category", "pb"]:
+        if c not in _ew._FUND_COLS:
+            _ew._FUND_COLS.append(c)
+            _extra_fund.append(c)
+
+    try:
+        # ── Build layout + transform values ───────────────────
+        layout = _resolve_sheet_layout(daily_cols, weekly_cols, merged.columns)
+
+        english = merged[layout.display_cols]
+        display = _transform_display_values(english)
+
+        # ── Write sheet ──────────────────────────────────────
+        _write_sheet_from_display(wb, "指数概览", display, layout)
+    finally:
+        # Restore _FUND_COLS
+        for c in _extra_fund:
+            _ew._FUND_COLS.remove(c)
+        # Restore _COL_NAMES
+        for k, orig_val in _orig_col_names.items():
+            if orig_val is None:
+                del _ew._COL_NAMES[k]
+            else:
+                _ew._COL_NAMES[k] = orig_val
+
+    return len(merged)
