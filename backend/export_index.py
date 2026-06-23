@@ -27,7 +27,8 @@ _GROUP_FILL = "1A5276"
 
 # Indicator group colors — same palette as export_wide.py _GROUP_COLORS
 _COL_TINT = {
-    "macd_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
+    "macd_": "8E44AD", "ema_": "8E44AD", "dif": "8E44AD", "dea": "8E44AD",
+    "ma_vol_": "27AE60",  # before "ma_" so ma_vol_5 gets volume green
     "ma_": "2980B9", "bias_": "2980B9", "ma5": "2980B9", "ma10": "2980B9",
     "vol_": "27AE60", "volume_": "27AE60", "pct_vol": "27AE60",
 }
@@ -41,14 +42,17 @@ _COL_GROUPS = [
         "pe_ttm", "pb", "total_mv",
     ]),
     ("MACD 指标", [
-        "dif", "dea", "macd_bar", "macd_zone", "macd_turning_point",
-        "macd_trend", "macd_trend_strength", "macd_divergence",
+        "ema_12", "ema_26", "dif", "dea", "macd_bar",
+        "macd_divergence", "macd_zone", "macd_turning_point",
+        "macd_trend", "macd_trend_strength", "macd_alert",
     ]),
     ("MA 均线", [
-        "ma_5", "ma_10", "bias_ma5", "ma5_slope", "ma_alignment",
+        "ma_5", "ma_10", "bias_ma5", "bias_ma10",
+        "ma5_slope", "ma10_slope", "ma_alignment", "ma_turning_point",
     ]),
     ("量能信号", [
-        "volume_ratio", "vol_trend_strength", "vol_zone", "vol_trend",
+        "ma_vol_5", "pct_vol_rank", "volume_ratio",
+        "vol_trend_strength", "vol_zone", "vol_trend", "vol_divergence",
     ]),
 ]
 
